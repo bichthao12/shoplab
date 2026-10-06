@@ -1,0 +1,69 @@
+### Tạo sản phẩm → 201
+POST http://localhost:8080/api/products
+Content-Type: application/json
+
+{
+  "sku": "AO-001",
+  "name": "Áo thun basic",
+  "description": "Cotton 100%",
+  "category": "Ao",
+  "price": 199000,
+  "stock": 50
+}
+
+### Tạo sản phẩm thứ 2
+POST http://localhost:8080/api/products
+Content-Type: application/json
+
+{
+  "sku": "QUAN-001",
+  "name": "Quần jean slim",
+  "category": "quan",
+  "price": 450000,
+  "stock": 20
+}
+
+### Tạo trùng SKU → 409
+POST http://localhost:8080/api/products
+Content-Type: application/json
+
+{ "sku": "AO-001", "name": "Trùng", "category": "ao", "price": 1, "stock": 1 }
+
+### Body sai → 400 kèm errors theo field
+POST http://localhost:8080/api/products
+Content-Type: application/json
+
+{ "sku": "", "name": "X", "category": "ao", "price": -5, "stock": -1 }
+
+### Xem 1 sản phẩm → 200
+GET http://localhost:8080/api/products/1
+
+### Không tồn tại → 404
+GET http://localhost:8080/api/products/9999
+
+### Danh sách tất cả
+GET http://localhost:8080/api/products
+
+### Lọc theo category (không phân biệt hoa thường) + sắp xếp + phân trang
+GET http://localhost:8080/api/products?category=AO&sort=price,desc&page=0&size=10
+
+### Sort theo field không tồn tại → 400
+GET http://localhost:8080/api/products?sort=abc
+
+### PATCH: chỉ đổi giá và tồn kho → 200, version tăng
+PATCH http://localhost:8080/api/products/1
+Content-Type: application/json
+
+{ "price": 179000, "stock": 45 }
+
+### PATCH sai → 400
+PATCH http://localhost:8080/api/products/1
+Content-Type: application/json
+
+{ "price": -1, "name": "   " }
+
+### Xoá → 204
+DELETE http://localhost:8080/api/products/2
+
+### Xoá lại → 404
+DELETE http://localhost:8080/api/products/2
