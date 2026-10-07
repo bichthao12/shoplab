@@ -6,36 +6,28 @@ import org.springframework.stereotype.Repository;
 import java.util.Optional;
 
 /**
- * Truy cập bảng idempotency_keys bằng JdbcClient.
+ * Truy cập bảng idempotency_keys bằng JdbcClient. Chỉ dùng trong package idempotency.
  * JdbcClient dùng chung DataSource với JPA, nên khi được gọi trong một @Transactional
  * nó chạy trên CÙNG connection / CÙNG transaction với các thao tác JPA (tạo đơn, trừ kho).
  */
 @Repository
-public class IdempotencyStore {
+class IdempotencyStore {
 
     private final JdbcClient jdbc;
 
-    public IdempotencyStore(JdbcClient jdbc) {
+    IdempotencyStore(JdbcClient jdbc) {
         this.jdbc = jdbc;
-    }
-
-    /**
-     * Giới hạn thời gian chờ khoá trong transaction hiện tại (chỉ có hiệu lực tới khi commit/rollback).
-     * Áp dụng cho cả việc chờ key và chờ khoá dòng product.
-     */
-    public void setLockTimeout(int seconds) {
-        jdbc.sql("SET LOCAL lock_timeout = '" + seconds + "s'").update();
     }
 
     /**
      * "Giành" key bằng INSERT ... ON CONFLICT DO NOTHING.
      *
-     * Nếu một transaction khác đang giữ cùng key mà CHƯA commit, Postgres sẽ CHỜ:
+     * Nếu một transaction khác đang giữ cùng key mà CHƯA commit, Postgres sẽ CHỜ (tối đa lock_timeout):
      *  - transaction kia commit   → trả về 0 (key đã có)  → đọc kết quả đã lưu để replay
      *  - transaction kia rollback → INSERT thành công      → request này được xử lý
      * @return true nếu giành được key
      */
-    public boolean tryClaim(String key, String requestHash) {
+    boolean tryClaim(String key, String requestHash) {
         int inserted = jdbc.sql("""
                         INSERT INTO idempotency_keys (idem_key, request_hash, status)
                         VALUES (:key, :hash, 'IN_PROGRESS')
@@ -47,10 +39,10 @@ public class IdempotencyStore {
         return inserted == 1;
     }
 
-    public Optional<IdempotencyRecord> find(String key) {
+    Optional<IdempotencyRecord> find(String key) {
         return jdbc.sql("""
                         SELECT idem_key, request_hash, status, response_status,
-                               response_body::text AS response_body
+                               response_headers::text AS response_headers, response_body
                         FROM idempotency_keys
                         WHERE idem_key = :key
                         """)
@@ -59,22 +51,24 @@ public class IdempotencyStore {
                 .optional();
     }
 
-    /** Lưu mã phản hồi + nội dung phản hồi (JSON) để trả lại cho các lần retry. */
-    public void complete(String key, int responseStatus, String responseBodyJson) {
+    /** Lưu nguyên văn response (status, header, body) để trả lại y hệt cho các lần retry. */
+    void complete(String key, int responseStatus, String responseHeadersJson, String responseBody) {
         jdbc.sql("""
                         UPDATE idempotency_keys
                         SET status = 'COMPLETED',
                             response_status = :st,
-                            response_body = CAST(:body AS jsonb)
+                            response_headers = CAST(:headers AS jsonb),
+                            response_body = :body
                         WHERE idem_key = :key
                         """)
                 .param("st", responseStatus)
-                .param("body", responseBodyJson)
+                .param("headers", responseHeadersJson)
+                .param("body", responseBody)
                 .param("key", key)
                 .update();
     }
 
-    public int deleteOlderThanHours(int hours) {
+    int deleteOlderThanHours(int hours) {
         return jdbc.sql("DELETE FROM idempotency_keys WHERE created_at < now() - make_interval(hours => :h)")
                 .param("h", hours)
                 .update();

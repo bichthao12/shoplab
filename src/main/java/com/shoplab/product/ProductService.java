@@ -13,7 +13,6 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.function.Function;
@@ -35,18 +34,17 @@ public class ProductService {
     // ---------- CREATE ----------
     @Transactional
     public ProductResponse create(CreateProductRequest req) {
-        String sku = req.sku().trim();
-        if (repo.existsBySku(sku)) {
-            throw new DuplicateSkuException(sku);
-        }
         Product product = new Product(
-                sku,
-                req.name().trim(),
+                req.sku(),
+                req.name(),
                 req.description(),
-                normalizeCategory(req.category()),
+                req.category(),
                 req.price(),
                 req.stock(),
                 req.active() == null || req.active());
+        if (repo.existsBySku(product.getSku())) {
+            throw new DuplicateSkuException(product.getSku());
+        }
         return ProductResponse.from(saveAndFlush(product));
     }
 
@@ -58,7 +56,7 @@ public class ProductService {
     public Page<ProductResponse> list(String category, Pageable pageable) {
         Page<Product> page = (category == null || category.isBlank())
                 ? repo.findAll(pageable)
-                : repo.findByCategory(normalizeCategory(category), pageable);
+                : repo.findByCategory(Product.normalizeCategory(category), pageable);
         return page.map(ProductResponse::from);
     }
 
@@ -68,18 +66,19 @@ public class ProductService {
         Product p = findOrThrow(id);
 
         if (req.sku() != null) {
-            String sku = req.sku().trim();
+            // Kiểm tra trùng TRƯỚC khi sửa entity: sửa trước thì Hibernate sẽ flush SKU mới ngay khi chạy query này
+            String sku = Product.normalizeSku(req.sku());
             if (repo.existsBySkuAndIdNot(sku, id)) {
                 throw new DuplicateSkuException(sku);
             }
-            p.setSku(sku);
+            p.changeSku(sku);
         }
-        if (req.name() != null)        p.setName(req.name().trim());
-        if (req.description() != null) p.setDescription(req.description());
-        if (req.category() != null)    p.setCategory(normalizeCategory(req.category()));
-        if (req.price() != null)       p.setPrice(req.price());
-        if (req.stock() != null)       p.setStock(req.stock());
-        if (req.active() != null)      p.setActive(req.active());
+        if (req.name() != null)        p.rename(req.name());
+        if (req.description() != null) p.changeDescription(req.description());
+        if (req.category() != null)    p.changeCategory(req.category());
+        if (req.price() != null)       p.changePrice(req.price());
+        if (req.stock() != null)       p.changeStock(req.stock());
+        if (req.active() != null)      p.changeActive(req.active());
 
         // flush ngay để version và updatedAt trong response là giá trị mới
         return ProductResponse.from(saveAndFlush(p));
@@ -153,10 +152,5 @@ public class ProductService {
             }
             throw ex;
         }
-    }
-
-    /** Lưu category dạng chữ thường để lọc không phân biệt hoa thường. */
-    private static String normalizeCategory(String category) {
-        return category.trim().toLowerCase(Locale.ROOT);
     }
 }

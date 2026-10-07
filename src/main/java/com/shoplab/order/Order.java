@@ -15,6 +15,7 @@ import jakarta.persistence.Table;
 import jakarta.persistence.Version;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
+import org.springframework.util.Assert;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -22,6 +23,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Entity name là "ShopOrder" vì ORDER là từ khoá trong JPQL (ORDER BY).
@@ -67,13 +69,16 @@ public class Order {
         // dành cho JPA
     }
 
-    public Order(String customerName, String customerEmail) {
-        this.customerName = customerName;
-        this.customerEmail = customerEmail;
+    /** Chỉ tạo được trong package order (qua OrderService). */
+    Order(String customerName, String customerEmail) {
+        this.customerName = normalizeCustomerName(customerName);
+        this.customerEmail = normalizeEmail(customerEmail);
+        Assert.hasText(this.customerName, "customerName không được để trống");
+        Assert.hasText(this.customerEmail, "customerEmail không được để trống");
     }
 
     /** Thêm dòng hàng từ phần đã giữ kho: chốt sku, tên, giá tại thời điểm đặt và cộng dồn tổng tiền. */
-    public void addItem(ReservedItem reserved) {
+    void addItem(ReservedItem reserved) {
         OrderItem item = new OrderItem(this, reserved);
         items.add(item);
         totalAmount = totalAmount.add(item.getLineTotal()).setScale(2, RoundingMode.HALF_UP);
@@ -88,4 +93,17 @@ public class Order {
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
     public List<OrderItem> getItems() { return Collections.unmodifiableList(items); }
+
+    // ---------- Quy tắc chuẩn hoá: định nghĩa MỘT lần, CreateOrderCommand cũng dùng ----------
+    // strip() bỏ đúng những ký tự mà @NotBlank coi là khoảng trắng.
+
+    /** Tên khách: bỏ khoảng trắng đầu/cuối. */
+    static String normalizeCustomerName(String customerName) {
+        return customerName == null ? null : customerName.strip();
+    }
+
+    /** Email: bỏ khoảng trắng đầu/cuối, đưa về chữ thường. */
+    static String normalizeEmail(String email) {
+        return email == null ? null : email.strip().toLowerCase(Locale.ROOT);
+    }
 }

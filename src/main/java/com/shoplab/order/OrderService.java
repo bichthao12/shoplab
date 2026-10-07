@@ -1,6 +1,5 @@
 package com.shoplab.order;
 
-import com.shoplab.order.dto.CreateOrderRequest;
 import com.shoplab.order.dto.OrderResponse;
 import com.shoplab.product.ProductService;
 import com.shoplab.product.ProductUnavailableException;
@@ -9,7 +8,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
-import java.util.Locale;
 
 @Service
 public class OrderService {
@@ -29,18 +27,16 @@ public class OrderService {
      * @return order vừa tạo (dạng response)
      */
     @Transactional
-    public OrderResponse create(CreateOrderRequest req) {
+    public OrderResponse create(CreateOrderCommand command) {
         List<ReservedItem> reserved;
         try {
-            reserved = productService.reserveStock(req.mergedItems());
+            reserved = productService.reserveStock(command.quantities());
         } catch (ProductUnavailableException ex) {
             // Với API đặt hàng, sản phẩm không tồn tại / ngừng bán nghĩa là đơn không hợp lệ (422 invalid-order)
             throw new InvalidOrderException(ex.getMessage());
         }
 
-        Order order = new Order(
-                req.customerName().trim(),
-                req.customerEmail().trim().toLowerCase(Locale.ROOT));
+        Order order = new Order(command.customerName(), command.customerEmail());
         reserved.forEach(order::addItem);
 
         Order saved = orderRepo.saveAndFlush(order);   // flush để có id, createdAt

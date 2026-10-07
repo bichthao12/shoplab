@@ -37,9 +37,17 @@ Chạy class `TestShoplabApplication` (trong `src/test/java`): app tự dựng P
 ```bash
 ./mvnw test                                           # toàn bộ
 ./mvnw test -Dtest=OrderIdempotencyIntegrationTests   # riêng test idempotency
+./mvnw test -Dtest=ArchitectureTests                  # riêng test kiến trúc
 ```
 
-Integration test chạy app thật trên cổng ngẫu nhiên với PostgreSQL thật (Testcontainers), gồm cả các kịch bản đồng thời và rollback.
+Test đặt theo package của từng module, gồm 4 loại:
+
+| Loại | Ví dụ | Dựng gì |
+|---|---|---|
+| Unit test | `ProductTest`, `OrderTest`, `CreateOrderCommandTest`, `RequestFingerprintTest` | Không Spring, không DB |
+| Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests` | App thật trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Test kiến trúc | `ArchitectureTests` (ArchUnit) | Đọc bytecode, kiểm tra quy tắc giữa các module |
 
 ### Test thủ công
 
@@ -56,6 +64,7 @@ Integration test chạy app thật trên cổng ngẫu nhiên với PostgreSQL t
 | `spring.jpa.hibernate.ddl-auto` | `validate` | Schema do Flyway quản lý, Hibernate chỉ kiểm tra |
 | `spring.jpa.open-in-view` | `false` | Không mở transaction kéo dài tới tầng view |
 | `spring.jpa.properties.hibernate.jdbc.time_zone` | `UTC` | Thời gian lưu và đọc theo UTC |
+| `spring.datasource.hikari.connection-init-sql` | `SET lock_timeout = '5s'` | Không request nào chờ khoá DB quá 5 giây (→ 409 + `Retry-After`), thay vì giữ connection chờ vô hạn |
 | PostgreSQL `timezone` | `UTC` | Thời gian hiển thị trong psql cũng là UTC |
 
 Mọi mốc thời gian (`createdAt`, `updatedAt`) lưu kiểu `TIMESTAMPTZ` / `Instant` và trả ra dạng ISO-8601 có `Z`, ví dụ `2026-10-06T07:04:00.123Z`.
@@ -136,7 +145,9 @@ Idempotency-Key: 3f1c2a9e-7b4d-4c1e-9a55-0d2f6b8e1a77
 
 ### Cách hoạt động của Idempotency
 
-Bảng `idempotency_keys`: `idem_key` (khoá chính), `request_hash` (SHA-256 của body đã chuẩn hoá), `status`, `response_status`, `response_body` (JSONB), `created_at`.
+Bảng `idempotency_keys`: `idem_key` (khoá chính), `request_hash`, `status`, `response_status`, `response_headers` (JSONB, vd `Location`), `response_body` (TEXT, nguyên văn chuỗi JSON đã trả), `created_at`.
+
+`request_hash` là SHA-256 của JSON dạng chuẩn hoá của request (`CreateOrderCommand`: tên, email chữ thường, các dòng đã gộp và sắp theo `productId`). Băm JSON chứ không tự ghép chuỗi, nên hai request khác nhau không thể trùng mã băm.
 
 Ghi key, tạo đơn, trừ kho và lưu response diễn ra trong **một transaction**:
 
@@ -145,12 +156,14 @@ BEGIN
   INSERT key ... ON CONFLICT DO NOTHING   -- request trùng key phải chờ ở đây
   SELECT products ... FOR UPDATE          -- khoá sản phẩm, chống bán vượt tồn kho
   trừ kho, tạo order
-  UPDATE key → COMPLETED + response_status + response_body
+  UPDATE key → COMPLETED + status, header, body của response
 COMMIT
 ```
 
 - Lỗi ở bất kỳ bước nào → rollback cả key lẫn đơn → client gửi lại với cùng key được.
 - Nhiều request cùng key đến cùng lúc → chỉ một request tạo đơn, các request còn lại nhận bản replay.
+- Bản replay dựng từ chuỗi đã lưu, giống hệt lần đầu từng ký tự. Không đọc lại vào class `OrderResponse`, nên sửa DTO sau này không làm hỏng replay của các key còn hạn.
+- Chờ khoá tối đa 5 giây, cấu hình chung cho mọi connection (xem *Cấu hình đáng chú ý*).
 - Key được xoá sau 24 giờ (job chạy mỗi giờ).
 
 ---
@@ -247,8 +260,8 @@ Phân biệt 404 và 422: `GET /api/products/999` → **404** vì tài nguyên �
 ```
 src/main/java/com/shoplab/
 ├── product/        Product, ProductController, ProductService, ProductRepository, ReservedItem, dto/
-├── order/          Order, OrderItem, OrderController, OrderService, OrderRepository, dto/
-├── idempotency/    IdempotencyService, IdempotencyStore, IdempotencyCleanupJob
+├── order/          Order, OrderItem, CreateOrderCommand, OrderController, OrderService, OrderRepository, dto/
+├── idempotency/    IdempotencyService, IdempotencyStore, RequestFingerprint, IdempotencyCleanupJob
 └── common/         ApiException, GlobalExceptionHandler, DbConstraints, SchedulingConfig
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
@@ -256,18 +269,26 @@ src/main/resources/db/migration/
 ├── V3__create_idempotency_keys.sql           bảng idempotency_keys
 ├── V4__idempotency_store_response_body.sql   lưu nội dung phản hồi (JSONB)
 ├── V5__create_users_and_accounts.sql         bảng users, accounts
-└── V6__order_items_product_snapshot.sql      chụp sku, tên sản phẩm vào dòng đơn
+├── V6__order_items_product_snapshot.sql      chụp sku, tên sản phẩm vào dòng đơn
+└── V7__idempotency_store_raw_response.sql    lưu nguyên văn response (body TEXT + header)
 src/test/java/com/shoplab/
-├── TestcontainersConfiguration.java
+├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java
-├── OrderIdempotencyIntegrationTests.java
-├── ProductOrderIntegrationTests.java
-└── product/ProductTest.java
+├── IntegrationTestBase.java                  nền chung cho integration test qua HTTP
+├── ArchitectureTests.java                    quy tắc giữa các module (ArchUnit)
+├── common/         GlobalExceptionHandlerTests
+├── idempotency/    RequestFingerprintTest
+├── order/          OrderTest, CreateOrderCommandTest, OrderApiIntegrationTests, OrderIdempotencyIntegrationTests
+└── product/        ProductTest, ProductRepositoryTests, ProductApiIntegrationTests
 ```
 
 ### Quy tắc giữa các module
 
-- Module chỉ dùng phần public của module khác. Repository và setter của entity để package-private, nên chỉ code trong cùng package mới gọi được.
+`ArchitectureTests` kiểm tra tự động các quy tắc dưới đây; vi phạm thì test đỏ và chỉ rõ chỗ vi phạm.
+
+- Không có vòng phụ thuộc giữa các module. `common` không phụ thuộc module nào; `idempotency` không biết tới `product` hay `order`.
+- Module chỉ dùng phần public của module khác. Repository và các hàm thay đổi dữ liệu của entity để package-private, nên chỉ code trong cùng package mới gọi được. Entity và DTO web không được dùng ngoài module của nó.
 - `order` giữ hàng qua `ProductService.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
+- Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`); DTO web chỉ mang dữ liệu và validation.
 - Lỗi nghiệp vụ kế thừa `common.ApiException` (tự mang status, `type`, `title`). `GlobalExceptionHandler` không import exception của module nào.
 - Lỗi ràng buộc DB do service sở hữu dữ liệu tự dịch theo tên constraint, ví dụ `uk_products_sku` → `duplicate-sku`.

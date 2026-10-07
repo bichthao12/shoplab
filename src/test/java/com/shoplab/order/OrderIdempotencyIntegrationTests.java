@@ -1,20 +1,10 @@
-package com.shoplab;
+package com.shoplab.order;
 
-import org.junit.jupiter.api.BeforeEach;
+import com.shoplab.IntegrationTestBase;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.context.annotation.Import;
-import org.springframework.jdbc.core.simple.JdbcClient;
-import tools.jackson.databind.ObjectMapper;
 
-import javax.sql.DataSource;
 import java.math.BigDecimal;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -38,27 +28,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * App chạy thật trên cổng ngẫu nhiên, DB là PostgreSQL thật trong Docker (Testcontainers),
  * Flyway chạy toàn bộ migration trước khi test.
  */
-@Import(TestcontainersConfiguration.class)
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-class OrderIdempotencyIntegrationTests {
-
-    @Value("${local.server.port}")
-    int port;
-
-    @Autowired JdbcClient jdbc;
-    @Autowired DataSource dataSource;
-    @Autowired ObjectMapper mapper;
-
-    private final HttpClient http = HttpClient.newBuilder()
-            .version(HttpClient.Version.HTTP_1_1)
-            .connectTimeout(Duration.ofSeconds(5))
-            .build();
-
-    @BeforeEach
-    void cleanDatabase() {
-        jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys RESTART IDENTITY CASCADE")
-                .update();
-    }
+class OrderIdempotencyIntegrationTests extends IntegrationTestBase {
 
     // =====================================================================
     // 1. Hành vi cơ bản
@@ -66,7 +36,7 @@ class OrderIdempotencyIntegrationTests {
 
     @Test
     @DisplayName("Thiếu header Idempotency-Key → 400 ProblemDetail")
-    void missingHeader_returns400() throws Exception {
+    void missingHeader_returns400() {
         long productId = createProduct("BASIC-001", 100_000, 10);
 
         HttpResponse<String> r = postOrder(null, orderJson(productId, 2));
@@ -78,7 +48,7 @@ class OrderIdempotencyIntegrationTests {
 
     @Test
     @DisplayName("Key sai định dạng → 400")
-    void invalidKey_returns400() throws Exception {
+    void invalidKey_returns400() {
         long productId = createProduct("BASIC-002", 100_000, 10);
 
         HttpResponse<String> r = postOrder("abc", orderJson(productId, 2));
@@ -88,8 +58,8 @@ class OrderIdempotencyIntegrationTests {
     }
 
     @Test
-    @DisplayName("Lần đầu → 201, lưu key COMPLETED + mã phản hồi + nội dung phản hồi")
-    void firstRequest_creates201_andStoresResponse() throws Exception {
+    @DisplayName("Lần đầu → 201, lưu key COMPLETED + mã phản hồi + header + nội dung phản hồi")
+    void firstRequest_creates201_andStoresResponse() {
         long productId = createProduct("BASIC-003", 100_000, 10);
         String key = newKey();
 
@@ -104,20 +74,23 @@ class OrderIdempotencyIntegrationTests {
         assertThat(body.get("status")).isEqualTo("PENDING");
 
         Map<String, Object> row = jdbc.sql("""
-                        SELECT status, response_status, response_body->>'id' AS order_id
+                        SELECT status, response_status,
+                               response_body::jsonb->>'id'      AS order_id,
+                               response_headers->'Location'->>0 AS location
                         FROM idempotency_keys WHERE idem_key = :key
                         """)
                 .param("key", key).query().singleRow();
         assertThat(row.get("status")).isEqualTo("COMPLETED");
         assertThat(row.get("response_status")).isEqualTo(201);
         assertThat(Long.parseLong(row.get("order_id").toString())).isEqualTo(idOf(body));
+        assertThat(row.get("location")).isEqualTo(r.headers().firstValue("Location").orElseThrow());
 
         assertThat(stockOf(productId)).isEqualTo(8);
     }
 
     @Test
-    @DisplayName("Gửi lại cùng key + cùng body → replay nguyên văn, chỉ trừ kho 1 lần")
-    void retrySameKey_replaysSameResponse_andDeductsStockOnce() throws Exception {
+    @DisplayName("Gửi lại cùng key + cùng body → replay nguyên văn (body, Location), chỉ trừ kho 1 lần")
+    void retrySameKey_replaysSameResponse_andDeductsStockOnce() {
         long productId = createProduct("BASIC-004", 100_000, 10);
         String key = newKey();
         String body = orderJson(productId, 2);
@@ -127,20 +100,47 @@ class OrderIdempotencyIntegrationTests {
         HttpResponse<String> third = postOrder(key, body);
 
         assertThat(first.statusCode()).isEqualTo(201);
+        assertThat(json(first).get("customerName")).isEqualTo("Nguyễn Văn A");   // body trả về đúng UTF-8
         for (HttpResponse<String> retry : List.of(second, third)) {
             assertThat(retry.statusCode()).isEqualTo(201);
             assertThat(retry.headers().firstValue("Idempotent-Replayed")).hasValue("true");
-            assertThat(json(retry)).isEqualTo(json(first));      // nội dung giống hệt lần đầu
+            assertThat(retry.body()).isEqualTo(first.body());                     // giống hệt từng ký tự
+            assertThat(retry.headers().firstValue("Location")).isEqualTo(first.headers().firstValue("Location"));
+            assertThat(retry.headers().firstValue("Content-Type")).isEqualTo(first.headers().firstValue("Content-Type"));
         }
+        assertThat(first.headers().firstValue("Content-Type")).hasValue("application/json");
         assertThat(count("orders")).isEqualTo(1);
         assertThat(stockOf(productId)).isEqualTo(8);
     }
 
     @Test
+    @DisplayName("Replay trả nguyên văn body đã lưu, kể cả khi khác cấu trúc OrderResponse hiện tại (đổi DTO không làm hỏng replay)")
+    void replayReturnsStoredBodyVerbatim_evenIfDtoChanged() {
+        long productId = createProduct("BASIC-005", 100_000, 10);
+        String key = newKey();
+        String body = orderJson(productId, 1);
+        HttpResponse<String> first = postOrder(key, body);
+        assertThat(first.statusCode()).isEqualTo(201);
+
+        // Giả lập bản lưu từ một phiên bản DTO cũ: cấu trúc khác OrderResponse hiện tại
+        String legacyBody = """
+                {"id":%d,"legacyField":"giữ nguyên"}""".formatted(idOf(json(first)));
+        jdbc.sql("UPDATE idempotency_keys SET response_body = :body WHERE idem_key = :key")
+                .param("body", legacyBody).param("key", key).update();
+
+        HttpResponse<String> retry = postOrder(key, body);
+
+        assertThat(retry.statusCode()).isEqualTo(201);
+        assertThat(retry.headers().firstValue("Idempotent-Replayed")).hasValue("true");
+        assertThat(retry.body()).isEqualTo(legacyBody);
+        assertThat(retry.headers().firstValue("Location")).isEqualTo(first.headers().firstValue("Location"));
+    }
+
+    @Test
     @DisplayName("Cùng nội dung nhưng khác thứ tự item / hoa-thường email → vẫn là replay")
-    void equivalentBody_isTreatedAsSameRequest() throws Exception {
-        long p1 = createProduct("BASIC-005A", 100_000, 10);
-        long p2 = createProduct("BASIC-005B", 50_000, 10);
+    void equivalentBody_isTreatedAsSameRequest() {
+        long p1 = createProduct("BASIC-006A", 100_000, 10);
+        long p2 = createProduct("BASIC-006B", 50_000, 10);
         String key = newKey();
 
         String original = """
@@ -163,8 +163,8 @@ class OrderIdempotencyIntegrationTests {
 
     @Test
     @DisplayName("Cùng key nhưng body khác → 422, không tạo thêm đơn")
-    void sameKeyDifferentBody_returns422() throws Exception {
-        long productId = createProduct("BASIC-006", 100_000, 10);
+    void sameKeyDifferentBody_returns422() {
+        long productId = createProduct("BASIC-007", 100_000, 10);
         String key = newKey();
 
         assertThat(postOrder(key, orderJson(productId, 2)).statusCode()).isEqualTo(201);
@@ -176,13 +176,32 @@ class OrderIdempotencyIntegrationTests {
         assertThat(stockOf(productId)).isEqualTo(8);
     }
 
+    @Test
+    @DisplayName("Cùng key, hai body khác nhau nhưng ghép chuỗi lại giống nhau (dấu | trong tên/email) → vẫn 422")
+    void sameKey_bodiesThatOnlyDifferAroundSeparator_returns422() {
+        long productId = createProduct("BASIC-008", 100_000, 10);
+        String key = newKey();
+        String first = """
+                {"customerName":"A|b","customerEmail":"c@example.com","items":[{"productId":%d,"quantity":1}]}
+                """.formatted(productId);
+        String second = """
+                {"customerName":"A","customerEmail":"b|c@example.com","items":[{"productId":%d,"quantity":1}]}
+                """.formatted(productId);
+
+        assertThat(postOrder(key, first).statusCode()).isEqualTo(201);
+        HttpResponse<String> r = postOrder(key, second);
+
+        assertProblem(r, 422, "idempotency-key-reused");
+        assertThat(count("orders")).isEqualTo(1);
+    }
+
     // =====================================================================
     // 2. Một transaction: ghi key + tạo đơn cùng commit / cùng rollback
     // =====================================================================
 
     @Test
     @DisplayName("Lỗi nghiệp vụ (hết hàng) → rollback cả key lẫn đơn; retry cùng key sau khi nhập kho → 201")
-    void businessError_rollsBackKey_andSameKeyCanRetry() throws Exception {
+    void businessError_rollsBackKey_andSameKeyCanRetry() {
         long productId = createProduct("TX-001", 100_000, 1);
         String key = newKey();
 
@@ -204,7 +223,7 @@ class OrderIdempotencyIntegrationTests {
 
     @Test
     @DisplayName("Lỗi SAU KHI đã tạo đơn (lúc lưu response) → đơn và trừ kho cũng bị rollback")
-    void failureAfterOrderCreated_rollsBackEverything() throws Exception {
+    void failureAfterOrderCreated_rollsBackEverything() {
         long productId = createProduct("TX-002", 100_000, 10);
         String key = "boom-" + UUID.randomUUID();
 
@@ -320,19 +339,8 @@ class OrderIdempotencyIntegrationTests {
     }
 
     // =====================================================================
-    // Helpers
+    // Helpers riêng của test đồng thời
     // =====================================================================
-
-    private HttpResponse<String> postOrder(String idempotencyKey, String jsonBody) throws Exception {
-        HttpRequest.Builder req = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/orders"))
-                .timeout(Duration.ofSeconds(30))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(jsonBody));
-        if (idempotencyKey != null) {
-            req.header("Idempotency-Key", idempotencyKey);
-        }
-        return http.send(req.build(), HttpResponse.BodyHandlers.ofString());
-    }
 
     @FunctionalInterface
     private interface Call {
@@ -360,58 +368,8 @@ class OrderIdempotencyIntegrationTests {
         }
     }
 
-    private long createProduct(String sku, long price, int stock) {
-        return jdbc.sql("""
-                        INSERT INTO products (sku, name, category, price, stock)
-                        VALUES (:sku, :name, 'test', :price, :stock)
-                        RETURNING id
-                        """)
-                .param("sku", sku)
-                .param("name", "Sản phẩm " + sku)
-                .param("price", BigDecimal.valueOf(price))
-                .param("stock", stock)
-                .query(Long.class)
-                .single();
-    }
-
-    private int stockOf(long productId) {
-        return jdbc.sql("SELECT stock FROM products WHERE id = :id")
-                .param("id", productId).query(Integer.class).single();
-    }
-
-    private long count(String table) {
-        return jdbc.sql("SELECT count(*) FROM " + table).query(Long.class).single();
-    }
-
     private boolean keyExists(String key) {
         return jdbc.sql("SELECT count(*) FROM idempotency_keys WHERE idem_key = :key")
                 .param("key", key).query(Long.class).single() > 0;
-    }
-
-    private static String orderJson(long productId, int quantity) {
-        return """
-                {"customerName":"Nguyễn Văn A","customerEmail":"a.nguyen@example.com",
-                 "items":[{"productId":%d,"quantity":%d}]}
-                """.formatted(productId, quantity);
-    }
-
-    private static String newKey() {
-        return UUID.randomUUID().toString();
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> json(HttpResponse<String> r) {
-        return mapper.readValue(r.body(), Map.class);
-    }
-
-    private static long idOf(Map<String, Object> body) {
-        return ((Number) body.get("id")).longValue();
-    }
-
-    private void assertProblem(HttpResponse<String> r, int status) {
-        assertThat(r.statusCode()).isEqualTo(status);
-        assertThat(r.headers().firstValue("Content-Type")).hasValueSatisfying(
-                ct -> assertThat(ct).startsWith("application/problem+json"));
-        assertThat(((Number) json(r).get("status")).intValue()).isEqualTo(status);
     }
 }
