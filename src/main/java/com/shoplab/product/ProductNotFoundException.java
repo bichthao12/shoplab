@@ -1,7 +1,11 @@
 package com.shoplab.product;
 
-public class ProductNotFoundException extends RuntimeException {
+import com.shoplab.common.ApiException;
+import org.springframework.http.HttpStatus;
+
+public class ProductNotFoundException extends ApiException {
     public ProductNotFoundException(Long id) {
-        super("Không tìm thấy sản phẩm có id = " + id);
+        super(HttpStatus.NOT_FOUND, "product-not-found", "Product Not Found",
+                "Không tìm thấy sản phẩm có id = " + id);
     }
 }

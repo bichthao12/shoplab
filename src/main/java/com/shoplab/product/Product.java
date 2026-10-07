@@ -80,11 +80,25 @@ public class Product {
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
 
-    public void setSku(String sku) { this.sku = sku; }
-    public void setName(String name) { this.name = name; }
-    public void setDescription(String description) { this.description = description; }
-    public void setCategory(String category) { this.category = category; }
-    public void setPrice(BigDecimal price) { this.price = price; }
-    public void setStock(int stock) { this.stock = stock; }
-    public void setActive(boolean active) { this.active = active; }
+    /**
+     * Trừ kho khi bán. Kho không bao giờ âm: không đủ hàng → InsufficientStockException, kho giữ nguyên.
+     */
+    void deductStock(int quantity) {
+        if (quantity <= 0) {
+            throw new IllegalArgumentException("quantity phải > 0, nhận được " + quantity);
+        }
+        if (stock < quantity) {
+            throw new InsufficientStockException(sku, quantity, stock);
+        }
+        stock -= quantity;
+    }
+
+    // Thay đổi dữ liệu chỉ làm được trong package product: module khác phải đi qua ProductService.
+    void setSku(String sku) { this.sku = sku; }
+    void setName(String name) { this.name = name; }
+    void setDescription(String description) { this.description = description; }
+    void setCategory(String category) { this.category = category; }
+    void setPrice(BigDecimal price) { this.price = price; }
+    void setStock(int stock) { this.stock = stock; }
+    void setActive(boolean active) { this.active = active; }
 }

@@ -26,7 +26,7 @@ public record OrderResponse(
             BigDecimal lineTotal
     ) {
         static Line from(OrderItem i) {
-            return new Line(i.getProduct().getId(), i.getProduct().getSku(), i.getProduct().getName(),
+            return new Line(i.getProductId(), i.getSku(), i.getProductName(),
                     i.getQuantity(), i.getUnitPrice(), i.getLineTotal());
         }
     }

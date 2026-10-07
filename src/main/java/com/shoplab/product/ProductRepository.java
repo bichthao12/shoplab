@@ -11,7 +11,8 @@ import org.springframework.data.repository.query.Param;
 import java.util.Collection;
 import java.util.List;
 
-public interface ProductRepository extends JpaRepository<Product, Long> {
+/** Chỉ dùng trong package product; module khác truy cập sản phẩm qua ProductService. */
+interface ProductRepository extends JpaRepository<Product, Long> {
 
     Page<Product> findByCategory(String category, Pageable pageable);
 

@@ -19,7 +19,7 @@ docker compose up -d          # khởi động PostgreSQL (cổng 5432)
 ./mvnw spring-boot:run        # Windows: .\mvnw spring-boot:run
 ```
 
-App chạy ở `http://localhost:8080`. Flyway tự áp dụng migration `V1` → `V4` khi khởi động.
+App chạy ở `http://localhost:8080`. Flyway tự áp dụng mọi migration trong `db/migration` khi khởi động.
 
 | Lệnh | Tác dụng |
 |---|---|
@@ -246,17 +246,28 @@ Phân biệt 404 và 422: `GET /api/products/999` → **404** vì tài nguyên �
 
 ```
 src/main/java/com/shoplab/
-├── product/        Product, ProductController, ProductService, ProductRepository, dto/
+├── product/        Product, ProductController, ProductService, ProductRepository, ReservedItem, dto/
 ├── order/          Order, OrderItem, OrderController, OrderService, OrderRepository, dto/
 ├── idempotency/    IdempotencyService, IdempotencyStore, IdempotencyCleanupJob
-└── common/         GlobalExceptionHandler, SchedulingConfig
+└── common/         ApiException, GlobalExceptionHandler, DbConstraints, SchedulingConfig
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
 ├── V2__add_product_category.sql              cột category
 ├── V3__create_idempotency_keys.sql           bảng idempotency_keys
-└── V4__idempotency_store_response_body.sql   lưu nội dung phản hồi (JSONB)
+├── V4__idempotency_store_response_body.sql   lưu nội dung phản hồi (JSONB)
+├── V5__create_users_and_accounts.sql         bảng users, accounts
+└── V6__order_items_product_snapshot.sql      chụp sku, tên sản phẩm vào dòng đơn
 src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java
 ├── TestShoplabApplication.java
-└── OrderIdempotencyIntegrationTests.java
+├── OrderIdempotencyIntegrationTests.java
+├── ProductOrderIntegrationTests.java
+└── product/ProductTest.java
 ```
+
+### Quy tắc giữa các module
+
+- Module chỉ dùng phần public của module khác. Repository và setter của entity để package-private, nên chỉ code trong cùng package mới gọi được.
+- `order` giữ hàng qua `ProductService.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
+- Lỗi nghiệp vụ kế thừa `common.ApiException` (tự mang status, `type`, `title`). `GlobalExceptionHandler` không import exception của module nào.
+- Lỗi ràng buộc DB do service sở hữu dữ liệu tự dịch theo tên constraint, ví dụ `uk_products_sku` → `duplicate-sku`.

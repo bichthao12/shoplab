@@ -1,6 +1,6 @@
 package com.shoplab.order;
 
-import com.shoplab.product.Product;
+import com.shoplab.product.ReservedItem;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
@@ -13,6 +13,10 @@ import jakarta.persistence.Table;
 
 import java.math.BigDecimal;
 
+/**
+ * Một dòng của đơn hàng. Tham chiếu sản phẩm bằng id (không giữ entity của module product)
+ * và chụp lại sku, tên, giá tại thời điểm đặt: sửa sản phẩm sau đó không làm đổi đơn cũ.
+ */
 @Entity
 @Table(name = "order_items")
 public class OrderItem {
@@ -25,9 +29,14 @@ public class OrderItem {
     @JoinColumn(name = "order_id", nullable = false)
     private Order order;
 
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "product_id", nullable = false)
-    private Product product;
+    @Column(nullable = false)
+    private Long productId;
+
+    @Column(nullable = false, length = 64)
+    private String sku;
+
+    @Column(nullable = false)
+    private String productName;
 
     @Column(nullable = false)
     private int quantity;
@@ -40,11 +49,13 @@ public class OrderItem {
         // dành cho JPA
     }
 
-    OrderItem(Order order, Product product, int quantity, BigDecimal unitPrice) {
+    OrderItem(Order order, ReservedItem reserved) {
         this.order = order;
-        this.product = product;
-        this.quantity = quantity;
-        this.unitPrice = unitPrice;
+        this.productId = reserved.productId();
+        this.sku = reserved.sku();
+        this.productName = reserved.name();
+        this.quantity = reserved.quantity();
+        this.unitPrice = reserved.unitPrice();
     }
 
     public BigDecimal getLineTotal() {
@@ -53,7 +64,9 @@ public class OrderItem {
 
     public Long getId() { return id; }
     public Order getOrder() { return order; }
-    public Product getProduct() { return product; }
+    public Long getProductId() { return productId; }
+    public String getSku() { return sku; }
+    public String getProductName() { return productName; }
     public int getQuantity() { return quantity; }
     public BigDecimal getUnitPrice() { return unitPrice; }
 }

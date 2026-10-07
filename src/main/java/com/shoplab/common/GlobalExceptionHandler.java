@@ -1,13 +1,5 @@
 package com.shoplab.common;
 
-import com.shoplab.idempotency.IdempotencyInProgressException;
-import com.shoplab.idempotency.IdempotencyKeyReusedException;
-import com.shoplab.idempotency.InvalidIdempotencyKeyException;
-import com.shoplab.order.InsufficientStockException;
-import com.shoplab.order.InvalidOrderException;
-import com.shoplab.order.OrderNotFoundException;
-import com.shoplab.product.DuplicateSkuException;
-import com.shoplab.product.ProductNotFoundException;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,74 +28,36 @@ import java.util.Map;
 /**
  * Trả MỌI lỗi theo chuẩn ProblemDetail (RFC 9457, Content-Type: application/problem+json).
  *
- *  1. Lỗi nghiệp vụ                 → @ExceptionHandler riêng
- *  2. Lỗi idempotency               → 400 / 409 / 422
- *  3. Lỗi DB / dữ liệu              → 400 / 409
- *  4. Lỗi có sẵn của Spring MVC     → kế thừa ResponseEntityExceptionHandler
+ *  1. Lỗi nghiệp vụ của các module  → ApiException (mỗi lỗi tự mang status, type, title)
+ *  2. Lỗi khoá / DB / dữ liệu       → 400 / 409
+ *  3. Lỗi có sẵn của Spring MVC     → kế thừa ResponseEntityExceptionHandler
  *     (JSON sai, thiếu header, sai kiểu tham số, 404 path, 405, 415...)
- *  5. Lỗi không lường trước (500)   → catch-all Exception
+ *  4. Lỗi không lường trước (500)   → catch-all Exception
+ *
+ * Class này không import exception của module nào: thêm lỗi mới chỉ cần kế thừa ApiException.
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
     private static final String TYPE_BASE = "https://shoplab.dev/errors/";
-    private static final String PG_LOCK_NOT_AVAILABLE = "55P03";
+    private static final String PG_LOCK_NOT_AVAILABLE = "55P03";   // lock_not_available (vượt quá lock_timeout)
 
 
     // ===================== 1. LỖI NGHIỆP VỤ =====================
 
-    @ExceptionHandler(ProductNotFoundException.class)
-    public ProblemDetail handleProductNotFound(ProductNotFoundException ex) {
-        return problem(HttpStatus.NOT_FOUND, "product-not-found", "Product Not Found", ex.getMessage());
+    /** Lỗi nghiệp vụ của mọi module (product, order, idempotency...) đều kế thừa ApiException. */
+    @ExceptionHandler(ApiException.class)
+    public ResponseEntity<ProblemDetail> handleApiException(ApiException ex) {
+        ProblemDetail pd = problem(ex.getStatus(), ex.getType(), ex.getTitle(), ex.getMessage());
+        ex.getProperties().forEach(pd::setProperty);
+
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(ex.getStatus());
+        ex.getHeaders().forEach((name, value) -> response.header(name, value));
+        return response.body(pd);
     }
 
-    @ExceptionHandler(OrderNotFoundException.class)
-    public ProblemDetail handleOrderNotFound(OrderNotFoundException ex) {
-        return problem(HttpStatus.NOT_FOUND, "order-not-found", "Order Not Found", ex.getMessage());
-    }
-
-    @ExceptionHandler(DuplicateSkuException.class)
-    public ProblemDetail handleDuplicateSku(DuplicateSkuException ex) {
-        return problem(HttpStatus.CONFLICT, "duplicate-sku", "Duplicate SKU", ex.getMessage());
-    }
-
-    @ExceptionHandler(InvalidOrderException.class)
-    public ProblemDetail handleInvalidOrder(InvalidOrderException ex) {
-        return problem(HttpStatus.UNPROCESSABLE_ENTITY, "invalid-order", "Invalid Order", ex.getMessage());
-    }
-
-    @ExceptionHandler(InsufficientStockException.class)
-    public ProblemDetail handleInsufficientStock(InsufficientStockException ex) {
-        ProblemDetail pd = problem(HttpStatus.CONFLICT, "insufficient-stock", "Insufficient Stock", ex.getMessage());
-        pd.setProperty("sku", ex.getSku());
-        pd.setProperty("requested", ex.getRequested());
-        pd.setProperty("available", ex.getAvailable());
-        return pd;
-    }
-
-    // ===================== 2. LỖI IDEMPOTENCY =====================
-
-    @ExceptionHandler(InvalidIdempotencyKeyException.class)
-    public ProblemDetail handleInvalidKey(InvalidIdempotencyKeyException ex) {
-        return problem(HttpStatus.BAD_REQUEST, "invalid-idempotency-key", "Invalid Idempotency-Key", ex.getMessage());
-    }
-
-    @ExceptionHandler(IdempotencyKeyReusedException.class)
-    public ProblemDetail handleKeyReused(IdempotencyKeyReusedException ex) {
-        return problem(HttpStatus.UNPROCESSABLE_ENTITY, "idempotency-key-reused", "Idempotency Key Reused", ex.getMessage());
-    }
-
-    /** 409 + Retry-After: báo client đợi 1 giây rồi gửi lại với CÙNG key. */
-    @ExceptionHandler(IdempotencyInProgressException.class)
-    public ResponseEntity<ProblemDetail> handleInProgress(IdempotencyInProgressException ex) {
-        ProblemDetail pd = problem(HttpStatus.CONFLICT, "idempotency-in-progress", "Request In Progress", ex.getMessage());
-        return ResponseEntity.status(HttpStatus.CONFLICT)
-                .header(HttpHeaders.RETRY_AFTER, "1")
-                .body(pd);
-    }
-
-    /** Postgres SQLState 55P03 = lock_not_available (vượt quá lock_timeout). */
+    // ===================== 2. LỖI KHOÁ / DB / DỮ LIỆU =====================
 
     /**
      * Chờ khoá quá lock_timeout: request trùng key đang chạy quá lâu,
@@ -135,13 +89,15 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
                 .body(pd);
     }
 
-    // ===================== 3. LỖI DB / DỮ LIỆU =====================
-
+    /**
+     * Vi phạm ràng buộc DB mà service sở hữu dữ liệu chưa dịch sang lỗi nghiệp vụ.
+     * Các trường hợp đã biết (trùng SKU, xoá sản phẩm đã có trong đơn...) được dịch ngay trong service.
+     */
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ProblemDetail handleDataIntegrity(DataIntegrityViolationException ex) {
         log.warn("Data integrity violation: {}", ex.getMostSpecificCause().getMessage());
         return problem(HttpStatus.CONFLICT, "data-integrity", "Data Integrity Violation",
-                "Thao tác vi phạm ràng buộc dữ liệu (ví dụ: sản phẩm đang nằm trong đơn hàng)");
+                "Thao tác vi phạm ràng buộc dữ liệu");
     }
 
     @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
@@ -168,7 +124,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return pd;
     }
 
-    // ===================== 4. LỖI CÓ SẴN CỦA SPRING MVC =====================
+    // ===================== 3. LỖI CÓ SẴN CỦA SPRING MVC =====================
 
     @Override
     protected ResponseEntity<Object> handleMethodArgumentNotValid(
@@ -203,7 +159,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return response;
     }
 
-    // ===================== 5. CATCH-ALL (500) =====================
+    // ===================== 4. CATCH-ALL (500) =====================
 
     @ExceptionHandler(Exception.class)
     public ProblemDetail handleUnexpected(Exception ex) {

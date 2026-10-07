@@ -1,7 +1,10 @@
 package com.shoplab.product;
 
-public class DuplicateSkuException extends RuntimeException {
+import com.shoplab.common.ApiException;
+import org.springframework.http.HttpStatus;
+
+public class DuplicateSkuException extends ApiException {
     public DuplicateSkuException(String sku) {
-        super("SKU '" + sku + "' đã tồn tại");
+        super(HttpStatus.CONFLICT, "duplicate-sku", "Duplicate SKU", "SKU '" + sku + "' đã tồn tại");
     }
 }

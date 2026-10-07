@@ -36,7 +36,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Integration test cho POST /api/orders + Idempotency-Key.
  * App chạy thật trên cổng ngẫu nhiên, DB là PostgreSQL thật trong Docker (Testcontainers),
- * Flyway chạy đủ migration V1..V4 trước khi test.
+ * Flyway chạy toàn bộ migration trước khi test.
  */
 @Import(TestcontainersConfiguration.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)

@@ -1,6 +1,6 @@
 package com.shoplab.order;
 
-import com.shoplab.product.Product;
+import com.shoplab.product.ReservedItem;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -72,9 +72,9 @@ public class Order {
         this.customerEmail = customerEmail;
     }
 
-    /** Thêm dòng hàng, chốt giá tại thời điểm đặt và cộng dồn tổng tiền. */
-    public void addItem(Product product, int quantity) {
-        OrderItem item = new OrderItem(this, product, quantity, product.getPrice());
+    /** Thêm dòng hàng từ phần đã giữ kho: chốt sku, tên, giá tại thời điểm đặt và cộng dồn tổng tiền. */
+    public void addItem(ReservedItem reserved) {
+        OrderItem item = new OrderItem(this, reserved);
         items.add(item);
         totalAmount = totalAmount.add(item.getLineTotal()).setScale(2, RoundingMode.HALF_UP);
     }

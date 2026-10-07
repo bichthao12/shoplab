@@ -2,61 +2,46 @@ package com.shoplab.order;
 
 import com.shoplab.order.dto.CreateOrderRequest;
 import com.shoplab.order.dto.OrderResponse;
-import com.shoplab.product.Product;
-import com.shoplab.product.ProductRepository;
+import com.shoplab.product.ProductService;
+import com.shoplab.product.ProductUnavailableException;
+import com.shoplab.product.ReservedItem;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
 import java.util.Locale;
-import java.util.Map;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 @Service
 public class OrderService {
 
     private final OrderRepository orderRepo;
-    private final ProductRepository productRepo;
+    private final ProductService productService;
 
-    public OrderService(OrderRepository orderRepo, ProductRepository productRepo) {
+    public OrderService(OrderRepository orderRepo, ProductService productService) {
         this.orderRepo = orderRepo;
-        this.productRepo = productRepo;
+        this.productService = productService;
     }
 
     /**
-     * Tạo đơn + trừ tồn kho trong 1 transaction.
-     * Khoá các dòng product (SELECT ... FOR UPDATE) để 2 đơn đồng thời không bán vượt tồn kho.
+     * Tạo đơn + giữ hàng trong 1 transaction.
+     * Khoá sản phẩm, kiểm tra và trừ kho là việc của module product (ProductService.reserveStock);
+     * khoá được giữ tới khi transaction này commit nên 2 đơn đồng thời không bán vượt tồn kho.
      * @return order vừa tạo (dạng response)
      */
     @Transactional
     public OrderResponse create(CreateOrderRequest req) {
-        Map<Long, Integer> wanted = req.mergedItems();
-
-        Map<Long, Product> products = productRepo.findAllByIdInForUpdate(wanted.keySet()).stream()
-                .collect(Collectors.toMap(Product::getId, Function.identity()));
+        List<ReservedItem> reserved;
+        try {
+            reserved = productService.reserveStock(req.mergedItems());
+        } catch (ProductUnavailableException ex) {
+            // Với API đặt hàng, sản phẩm không tồn tại / ngừng bán nghĩa là đơn không hợp lệ (422 invalid-order)
+            throw new InvalidOrderException(ex.getMessage());
+        }
 
         Order order = new Order(
                 req.customerName().trim(),
                 req.customerEmail().trim().toLowerCase(Locale.ROOT));
-
-        for (Map.Entry<Long, Integer> line : wanted.entrySet()) {
-            Long productId = line.getKey();
-            int quantity = line.getValue();
-
-            Product p = products.get(productId);
-            if (p == null) {
-                throw new InvalidOrderException("Sản phẩm id = " + productId + " không tồn tại");
-            }
-            if (!p.isActive()) {
-                throw new InvalidOrderException("Sản phẩm " + p.getSku() + " đang ngừng bán");
-            }
-            if (p.getStock() < quantity) {
-                throw new InsufficientStockException(p.getSku(), quantity, p.getStock());
-            }
-
-            p.setStock(p.getStock() - quantity);
-            order.addItem(p, quantity);
-        }
+        reserved.forEach(order::addItem);
 
         Order saved = orderRepo.saveAndFlush(order);   // flush để có id, createdAt
         return OrderResponse.from(saved);

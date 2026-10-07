@@ -6,13 +6,13 @@ import org.springframework.data.repository.query.Param;
 
 import java.util.Optional;
 
-public interface OrderRepository extends JpaRepository<Order, Long> {
+/** Chỉ dùng trong package order. */
+interface OrderRepository extends JpaRepository<Order, Long> {
 
-    /** Lấy order kèm items và product trong 1 query (tránh N+1). */
+    /** Lấy order kèm items trong 1 query (tránh N+1). */
     @Query("""
             select distinct o from ShopOrder o
-            left join fetch o.items i
-            left join fetch i.product
+            left join fetch o.items
             where o.id = :id
             """)
     Optional<Order> findWithItemsById(@Param("id") Long id);
