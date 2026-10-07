@@ -37,17 +37,18 @@ Chạy class `TestShoplabApplication` (trong `src/test/java`): app tự dựng P
 ```bash
 ./mvnw test                                           # toàn bộ
 ./mvnw test -Dtest=OrderIdempotencyIntegrationTests   # riêng test idempotency
-./mvnw test -Dtest=ArchitectureTests                  # riêng test kiến trúc
+./mvnw test -Dtest=ModularityTests                    # kiểm tra cấu trúc module + sinh tài liệu module
 ```
 
-Test đặt theo package của từng module, gồm 4 loại:
+Test đặt theo package của từng module, gồm 5 loại:
 
 | Loại | Ví dụ | Dựng gì |
 |---|---|---|
 | Unit test | `ProductTest`, `OrderTest`, `CreateOrderCommandTest`, `RequestFingerprintTest` | Không Spring, không DB |
 | Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests` | App thật trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
-| Test kiến trúc | `ArchitectureTests` (ArchUnit) | Đọc bytecode, kiểm tra quy tắc giữa các module |
+| Test riêng từng module | `ProductModuleTests`, `OrderModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit) | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module |
 
 ### Test thủ công
 
@@ -258,16 +259,88 @@ Phân biệt 404 và 422: `GET /api/products/999` → **404** vì tài nguyên �
 
 ---
 
-## 4. Cấu trúc thư mục
+## 4. Kiến trúc: modular monolith (Spring Modulith)
+
+Một ứng dụng, một database, nhưng chia thành các module có ranh giới rõ ràng. Mỗi package con trực tiếp của `com.shoplab` là một module, khai báo trong `package-info.java` của nó bằng `@ApplicationModule`.
+
+### Các module
+
+| Module | Lo việc gì | API cho module khác | Được phụ thuộc vào |
+|---|---|---|---|
+| `common` | Phần dùng chung (shared kernel) | `ApiException`, `BaseEntity`, `AuditedEntity`, `DbConstraints` | (không module nào) |
+| `product` | Danh mục sản phẩm, tồn kho | `ProductInventory` (giữ hàng), `ReservedItem`, `ProductUnavailableException`, `InsufficientStockException` | `common` |
+| `idempotency` | Chạy request ghi đúng một lần theo `Idempotency-Key` | `IdempotencyService` và các exception của nó | `common` |
+| `order` | Đơn hàng | (chưa có) | `common`, `product`, `idempotency` |
+
+```
+order ──► product ─────┐
+  │                    ├──► common
+  └────► idempotency ──┘
+```
+
+### Bố cục bên trong một module
+
+```
+product/
+├── package-info.java       @ApplicationModule(allowedDependencies = "common")
+├── ProductInventory.java   API: chỉ những gì module khác được dùng (interface, record, exception)
+├── ...
+├── internal/               nội bộ: entity, repository, service, command, cài đặt của API
+└── web/                    nội bộ: controller và DTO của REST API
+```
+
+- **Package gốc của module là API.** Module khác chỉ được dùng các kiểu ở đây.
+- **`internal/` và `web/` là nội bộ.** Module khác không được dùng, kể cả khi class là `public`.
+- Bên trong module: `web` → `internal` → API. Tầng `internal` không biết gì về HTTP hay DTO.
+
+### Quy tắc (kiểm tra tự động bởi `ModularityTests`)
+
+Vi phạm thì test đỏ và chỉ rõ chỗ vi phạm.
+
+- **Ranh giới module (Spring Modulith `verify()`):** không vòng phụ thuộc; chỉ dùng API của module khác; chỉ phụ thuộc những module khai báo trong `allowedDependencies`.
+- **Phân tầng trong module (ArchUnit):** chỉ tầng `web` dùng controller và DTO; repository không `public`, nên dữ liệu của module chỉ được truy cập từ code cùng package.
+
+Các quy ước khác:
+- `order` giữ hàng qua API `ProductInventory.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
+- Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`). Service nhận command (`CreateProductCommand`, `UpdateProductCommand`, `CreateOrderCommand`) và trả entity; controller đổi DTO web ↔ command / entity.
+- Entity kế thừa `common.BaseEntity` (id lấy từ sequence của bảng, khai báo bằng `@SequenceGenerator` trên class) hoặc `common.AuditedEntity` (thêm `version`, `createdAt`, `updatedAt` do Spring Data auditing điền).
+- Lỗi nghiệp vụ kế thừa `common.ApiException` (tự mang status, `type`, `title`). `GlobalExceptionHandler` không import exception của module nào.
+- Lỗi ràng buộc DB do service sở hữu dữ liệu tự dịch theo tên constraint, ví dụ `uk_products_sku` → `duplicate-sku`.
+
+### Giao tiếp giữa các module
+
+- **Gọi API trực tiếp** khi việc đó phải xong ngay, trong cùng transaction. Ví dụ đặt hàng phải giữ hàng thành công thì mới tạo đơn.
+- **Dùng event** cho việc phụ, chạy sau và không được làm hỏng việc chính, ví dụ gửi email xác nhận đơn. Hiện chưa có trường hợp nào như vậy. Khi cần, module phát event qua `ApplicationEventPublisher`, module nhận lắng nghe bằng `@ApplicationModuleListener`, và thêm Event Publication Registry của Spring Modulith để event không bị mất khi app dừng giữa chừng.
+
+### Dữ liệu
+
+Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`. Riêng FK `order_items.product_id → products` được giữ có chủ đích, để DB chặn xoá sản phẩm đã có trong đơn.
+
+### Tài liệu module sinh tự động
+
+`./mvnw test -Dtest=ModularityTests` sinh vào `target/spring-modulith-docs/`:
+- `components.puml`: sơ đồ C4 các module và quan hệ;
+- `module-*.puml`, `module-*.adoc`: sơ đồ và mô tả từng module.
+
+### Cấu trúc thư mục
 
 ```
 src/main/java/com/shoplab/
-├── product/        Product, CreateProductCommand, UpdateProductCommand, ReservedItem,
-│                   ProductController, ProductService, ProductRepository, dto/
-├── order/          Order, OrderItem, CreateOrderCommand, OrderController, OrderService, OrderRepository, dto/
-├── idempotency/    IdempotencyService, IdempotencyStore, IdempotencyStatus, RequestFingerprint, IdempotencyCleanupJob
-└── common/         BaseEntity, AuditedEntity, ApiException, GlobalExceptionHandler, DbConstraints,
-                    JpaAuditingConfig, SchedulingConfig
+├── ShoplabApplication.java   @Modulithic(sharedModules = "common")
+├── common/         ApiException, BaseEntity, AuditedEntity, DbConstraints
+│   ├── config/     JpaAuditingConfig, SchedulingConfig
+│   └── web/        GlobalExceptionHandler
+├── product/        ProductInventory, ReservedItem, ProductUnavailableException, InsufficientStockException
+│   ├── internal/   Product, ProductRepository, ProductService, DefaultProductInventory,
+│   │               CreateProductCommand, UpdateProductCommand, các exception nội bộ
+│   └── web/        ProductController, CreateProductRequest, PatchProductRequest, ProductResponse
+├── idempotency/    IdempotencyService, các exception của nó
+│   └── internal/   DefaultIdempotencyService, IdempotencyStore, IdempotencyRecord, IdempotencyStatus,
+│                   RequestFingerprint, IdempotencyCleanupJob
+└── order/
+    ├── internal/   Order, OrderItem, OrderStatus, OrderRepository, OrderService, CreateOrderCommand,
+    │               các exception nội bộ
+    └── web/        OrderController, CreateOrderRequest, OrderResponse
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
 ├── V2__add_product_category.sql              cột category
@@ -281,22 +354,13 @@ src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java
 ├── IntegrationTestBase.java                  nền chung cho integration test qua HTTP
-├── ArchitectureTests.java                    quy tắc giữa các module (ArchUnit)
-├── common/         GlobalExceptionHandlerTests
-├── idempotency/    RequestFingerprintTest
-├── order/          OrderTest, CreateOrderCommandTest, OrderApiIntegrationTests, OrderIdempotencyIntegrationTests
-└── product/        ProductTest, ProductRepositoryTests, ProductApiIntegrationTests
+├── ModularityTests.java                      kiểm tra cấu trúc module, sinh tài liệu module
+├── common/web/         GlobalExceptionHandlerTests
+├── idempotency/internal/ RequestFingerprintTest
+├── order/              OrderModuleTests
+│   ├── internal/       OrderTest, CreateOrderCommandTest
+│   └── web/            OrderApiIntegrationTests, OrderIdempotencyIntegrationTests
+└── product/            ProductModuleTests
+    ├── internal/       ProductTest, ProductRepositoryTests
+    └── web/            ProductApiIntegrationTests
 ```
-
-### Quy tắc giữa các module
-
-`ArchitectureTests` kiểm tra tự động các quy tắc dưới đây; vi phạm thì test đỏ và chỉ rõ chỗ vi phạm.
-
-- Không có vòng phụ thuộc giữa các module. `common` không phụ thuộc module nào; `idempotency` không biết tới `product` hay `order`.
-- Module chỉ dùng phần public của module khác. Repository và các hàm thay đổi dữ liệu của entity để package-private, nên chỉ code trong cùng package mới gọi được. Entity và DTO web không được dùng ngoài module của nó.
-- `order` giữ hàng qua `ProductService.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
-- Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`); DTO web chỉ mang dữ liệu và validation.
-- Phân tầng trong module: controller đổi DTO web ↔ command / entity; service nhận command (`CreateProductCommand`, `UpdateProductCommand`, `CreateOrderCommand`) và trả entity, không biết gì về HTTP. Chỉ controller (và chính các DTO) được dùng package `dto`.
-- Entity kế thừa `common.BaseEntity` (id lấy từ sequence của bảng, khai báo bằng `@SequenceGenerator` trên class) hoặc `common.AuditedEntity` (thêm `version`, `createdAt`, `updatedAt` do Spring Data auditing điền).
-- Lỗi nghiệp vụ kế thừa `common.ApiException` (tự mang status, `type`, `title`). `GlobalExceptionHandler` không import exception của module nào.
-- Lỗi ràng buộc DB do service sở hữu dữ liệu tự dịch theo tên constraint, ví dụ `uk_products_sku` → `duplicate-sku`.
