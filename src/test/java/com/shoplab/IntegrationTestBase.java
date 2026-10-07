@@ -42,10 +42,13 @@ public abstract class IntegrationTestBase {
             .connectTimeout(Duration.ofSeconds(5))
             .build();
 
+    /**
+     * Không dùng RESTART IDENTITY: Hibernate đang giữ sẵn một dải id lấy từ sequence (allocationSize = 50),
+     * reset sequence thì id cấp bằng SQL có thể trùng với dải đó.
+     */
     @BeforeEach
     protected void cleanDatabase() {
-        jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys RESTART IDENTITY CASCADE")
-                .update();
+        jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys CASCADE").update();
     }
 
     // ---------- HTTP ----------

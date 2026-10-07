@@ -1,18 +1,13 @@
 package com.shoplab.product;
 
+import com.shoplab.common.AuditedEntity;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
+import jakarta.persistence.SequenceGenerator;
 import jakarta.persistence.Table;
-import jakarta.persistence.Version;
-import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.UpdateTimestamp;
 import org.springframework.util.Assert;
 
 import java.math.BigDecimal;
-import java.time.Instant;
 import java.util.Locale;
 
 /**
@@ -21,11 +16,8 @@ import java.util.Locale;
  */
 @Entity
 @Table(name = "products")
-public class Product {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
+@SequenceGenerator(sequenceName = "products_id_seq", allocationSize = 50)
+public class Product extends AuditedEntity {
 
     @Column(nullable = false, length = 64, unique = true)
     private String sku;
@@ -48,34 +40,21 @@ public class Product {
     @Column(nullable = false)
     private boolean active = true;
 
-    @Version
-    private Long version;
-
-    @CreationTimestamp
-    @Column(nullable = false, updatable = false)
-    private Instant createdAt;
-
-    @UpdateTimestamp
-    @Column(nullable = false)
-    private Instant updatedAt;
-
     protected Product() {
         // dành cho JPA
     }
 
     /** Chỉ tạo được trong package product (qua ProductService). */
-    Product(String sku, String name, String description, String category,
-            BigDecimal price, int stock, boolean active) {
-        this.sku = validSku(sku);
-        this.name = validName(name);
-        this.description = description;
-        this.category = validCategory(category);
-        this.price = validPrice(price);
-        this.stock = validStock(stock);
-        this.active = active;
+    Product(CreateProductCommand command) {
+        this.sku = validSku(command.sku());
+        this.name = validName(command.name());
+        this.description = command.description();
+        this.category = validCategory(command.category());
+        this.price = validPrice(command.price());
+        this.stock = validStock(command.stock());
+        this.active = command.active();
     }
 
-    public Long getId() { return id; }
     public String getSku() { return sku; }
     public String getName() { return name; }
     public String getDescription() { return description; }
@@ -83,9 +62,6 @@ public class Product {
     public BigDecimal getPrice() { return price; }
     public int getStock() { return stock; }
     public boolean isActive() { return active; }
-    public Long getVersion() { return version; }
-    public Instant getCreatedAt() { return createdAt; }
-    public Instant getUpdatedAt() { return updatedAt; }
 
     // ---------- Thay đổi dữ liệu: chỉ gọi được trong package product ----------
 

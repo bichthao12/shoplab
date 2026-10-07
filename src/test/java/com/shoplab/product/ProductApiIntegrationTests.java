@@ -11,6 +11,7 @@ import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -49,6 +50,25 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
         assertThat(new BigDecimal(p.get("price").toString())).isEqualByComparingTo("199000");
         assertThat(p.get("stock")).isEqualTo(50);
         assertThat(p.get("active")).isEqualTo(false);
+    }
+
+    @Test
+    @DisplayName("Auditing: tạo → có createdAt, updatedAt, version 0; sửa → version tăng, updatedAt đổi, createdAt giữ nguyên")
+    void auditFields_areFilledOnCreateAndUpdate() {
+        Map<String, Object> created = json(send("POST", "/api/products", """
+                {"sku":"AUDIT-001","name":"Áo","category":"ao","price":1,"stock":1}
+                """, null));
+        assertThat(created.get("version")).isEqualTo(0);
+        Instant createdAt = Instant.parse(created.get("createdAt").toString());
+        assertThat(Instant.parse(created.get("updatedAt").toString())).isEqualTo(createdAt);
+
+        Map<String, Object> updated = json(send("PATCH", "/api/products/" + idOf(created), """
+                {"price":2}
+                """, null));
+
+        assertThat(updated.get("version")).isEqualTo(1);
+        assertThat(Instant.parse(updated.get("createdAt").toString())).isEqualTo(createdAt);
+        assertThat(Instant.parse(updated.get("updatedAt").toString())).isAfter(createdAt);
     }
 
     @Test

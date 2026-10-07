@@ -1,5 +1,6 @@
 package com.shoplab.product.dto;
 
+import com.shoplab.product.UpdateProductCommand;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Pattern;
@@ -27,4 +28,9 @@ public record PatchProductRequest(
      * (strip), nên giá trị qua được validation không bao giờ thành chuỗi rỗng. (?s): cho phép nhiều dòng.
      */
     static final String NOT_BLANK = "(?s).*[^\\p{javaWhitespace}].*";
+
+    /** Chuyển sang đầu vào của ProductService (gọi sau khi đã qua validation). */
+    public UpdateProductCommand toCommand() {
+        return new UpdateProductCommand(sku, name, description, category, price, stock, active);
+    }
 }

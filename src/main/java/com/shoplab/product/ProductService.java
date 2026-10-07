@@ -1,9 +1,6 @@
 package com.shoplab.product;
 
 import com.shoplab.common.DbConstraints;
-import com.shoplab.product.dto.CreateProductRequest;
-import com.shoplab.product.dto.PatchProductRequest;
-import com.shoplab.product.dto.ProductResponse;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -18,6 +15,10 @@ import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+/**
+ * Nghiệp vụ sản phẩm. Nhận command và trả entity: không biết gì về HTTP hay DTO web,
+ * việc đổi sang / từ JSON là của ProductController.
+ */
 @Service
 @Transactional(readOnly = true)
 public class ProductService {
@@ -33,55 +34,47 @@ public class ProductService {
 
     // ---------- CREATE ----------
     @Transactional
-    public ProductResponse create(CreateProductRequest req) {
-        Product product = new Product(
-                req.sku(),
-                req.name(),
-                req.description(),
-                req.category(),
-                req.price(),
-                req.stock(),
-                req.active() == null || req.active());
+    public Product create(CreateProductCommand command) {
+        Product product = new Product(command);
         if (repo.existsBySku(product.getSku())) {
             throw new DuplicateSkuException(product.getSku());
         }
-        return ProductResponse.from(saveAndFlush(product));
+        return saveAndFlush(product);
     }
 
     // ---------- READ ----------
-    public ProductResponse getById(Long id) {
-        return ProductResponse.from(findOrThrow(id));
+    public Product getById(Long id) {
+        return findOrThrow(id);
     }
 
-    public Page<ProductResponse> list(String category, Pageable pageable) {
-        Page<Product> page = (category == null || category.isBlank())
+    public Page<Product> list(String category, Pageable pageable) {
+        return (category == null || category.isBlank())
                 ? repo.findAll(pageable)
                 : repo.findByCategory(Product.normalizeCategory(category), pageable);
-        return page.map(ProductResponse::from);
     }
 
-    // ---------- PATCH (cập nhật một phần) ----------
+    // ---------- UPDATE (cập nhật một phần) ----------
     @Transactional
-    public ProductResponse patch(Long id, PatchProductRequest req) {
+    public Product update(Long id, UpdateProductCommand changes) {
         Product p = findOrThrow(id);
 
-        if (req.sku() != null) {
+        if (changes.sku() != null) {
             // Kiểm tra trùng TRƯỚC khi sửa entity: sửa trước thì Hibernate sẽ flush SKU mới ngay khi chạy query này
-            String sku = Product.normalizeSku(req.sku());
+            String sku = Product.normalizeSku(changes.sku());
             if (repo.existsBySkuAndIdNot(sku, id)) {
                 throw new DuplicateSkuException(sku);
             }
             p.changeSku(sku);
         }
-        if (req.name() != null)        p.rename(req.name());
-        if (req.description() != null) p.changeDescription(req.description());
-        if (req.category() != null)    p.changeCategory(req.category());
-        if (req.price() != null)       p.changePrice(req.price());
-        if (req.stock() != null)       p.changeStock(req.stock());
-        if (req.active() != null)      p.changeActive(req.active());
+        if (changes.name() != null)        p.rename(changes.name());
+        if (changes.description() != null) p.changeDescription(changes.description());
+        if (changes.category() != null)    p.changeCategory(changes.category());
+        if (changes.price() != null)       p.changePrice(changes.price());
+        if (changes.stock() != null)       p.changeStock(changes.stock());
+        if (changes.active() != null)      p.changeActive(changes.active());
 
-        // flush ngay để version và updatedAt trong response là giá trị mới
-        return ProductResponse.from(saveAndFlush(p));
+        // flush ngay để version và updatedAt trả về là giá trị mới
+        return saveAndFlush(p);
     }
 
     // ---------- DELETE ----------

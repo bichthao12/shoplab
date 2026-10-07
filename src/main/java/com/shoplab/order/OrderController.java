@@ -43,9 +43,9 @@ public class OrderController {
             @RequestHeader(IdempotencyService.HEADER) String idempotencyKey,
             @Valid @RequestBody CreateOrderRequest req) {
 
-        CreateOrderCommand command = CreateOrderCommand.from(req);
+        CreateOrderCommand command = req.toCommand();
         return idempotency.execute(idempotencyKey, command, () -> {
-            OrderResponse created = orderService.create(command);
+            OrderResponse created = OrderResponse.from(orderService.create(command));
             URI location = ServletUriComponentsBuilder.fromCurrentRequestUri()
                     .path("/{id}")
                     .buildAndExpand(created.id())
@@ -56,6 +56,6 @@ public class OrderController {
 
     @GetMapping("/{id}")
     public OrderResponse get(@PathVariable Long id) {
-        return orderService.getById(id);
+        return OrderResponse.from(orderService.getById(id));
     }
 }

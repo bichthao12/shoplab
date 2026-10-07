@@ -30,11 +30,12 @@ class IdempotencyStore {
     boolean tryClaim(String key, String requestHash) {
         int inserted = jdbc.sql("""
                         INSERT INTO idempotency_keys (idem_key, request_hash, status)
-                        VALUES (:key, :hash, 'IN_PROGRESS')
+                        VALUES (:key, :hash, :status)
                         ON CONFLICT (idem_key) DO NOTHING
                         """)
                 .param("key", key)
                 .param("hash", requestHash)
+                .param("status", IdempotencyStatus.IN_PROGRESS.name())
                 .update();
         return inserted == 1;
     }
@@ -55,12 +56,13 @@ class IdempotencyStore {
     void complete(String key, int responseStatus, String responseHeadersJson, String responseBody) {
         jdbc.sql("""
                         UPDATE idempotency_keys
-                        SET status = 'COMPLETED',
+                        SET status = :status,
                             response_status = :st,
                             response_headers = CAST(:headers AS jsonb),
                             response_body = :body
                         WHERE idem_key = :key
                         """)
+                .param("status", IdempotencyStatus.COMPLETED.name())
                 .param("st", responseStatus)
                 .param("headers", responseHeadersJson)
                 .param("body", responseBody)

@@ -24,6 +24,7 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import java.net.URI;
 
+/** Tầng HTTP của sản phẩm: đổi DTO web ↔ command / entity, còn nghiệp vụ nằm ở ProductService. */
 @RestController
 @RequestMapping("/api/products")
 public class ProductController {
@@ -37,7 +38,7 @@ public class ProductController {
     /** POST /api/products → 201 Created + header Location */
     @PostMapping
     public ResponseEntity<ProductResponse> create(@Valid @RequestBody CreateProductRequest req) {
-        ProductResponse created = service.create(req);
+        ProductResponse created = ProductResponse.from(service.create(req.toCommand()));
         URI location = ServletUriComponentsBuilder.fromCurrentRequest()
                 .path("/{id}")
                 .buildAndExpand(created.id())
@@ -48,7 +49,7 @@ public class ProductController {
     /** GET /api/products/{id} → 200 hoặc 404 */
     @GetMapping("/{id}")
     public ProductResponse get(@PathVariable Long id) {
-        return service.getById(id);
+        return ProductResponse.from(service.getById(id));
     }
 
     /** GET /api/products?category=ao&page=0&size=20&sort=price,asc */
@@ -56,13 +57,13 @@ public class ProductController {
     public PagedModel<ProductResponse> list(
             @RequestParam(required = false) String category,
             @PageableDefault(size = 20, sort = "id", direction = Sort.Direction.ASC) Pageable pageable) {
-        return new PagedModel<>(service.list(category, pageable));
+        return new PagedModel<>(service.list(category, pageable).map(ProductResponse::from));
     }
 
     /** PATCH /api/products/{id} → 200 với dữ liệu mới */
     @PatchMapping("/{id}")
     public ProductResponse patch(@PathVariable Long id, @Valid @RequestBody PatchProductRequest req) {
-        return service.patch(id, req);
+        return ProductResponse.from(service.update(id, req.toCommand()));
     }
 
     /** DELETE /api/products/{id} → 204 No Content */

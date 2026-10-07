@@ -1,5 +1,6 @@
 package com.shoplab.product.dto;
 
+import com.shoplab.product.CreateProductCommand;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.NotBlank;
@@ -17,4 +18,10 @@ public record CreateProductRequest(
         @NotNull @DecimalMin("0.00") @Digits(integer = 10, fraction = 2) BigDecimal price,
         @NotNull @PositiveOrZero Integer stock,
         Boolean active          // không gửi → mặc định true
-) {}
+) {
+
+    /** Chuyển sang đầu vào của ProductService (gọi sau khi đã qua validation). */
+    public CreateProductCommand toCommand() {
+        return new CreateProductCommand(sku, name, description, category, price, stock, active == null || active);
+    }
+}

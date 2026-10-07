@@ -1,5 +1,6 @@
 package com.shoplab.order;
 
+import com.shoplab.order.CreateOrderCommand.Line;
 import com.shoplab.order.dto.CreateOrderRequest;
 import com.shoplab.order.dto.CreateOrderRequest.Item;
 import org.junit.jupiter.api.DisplayName;
@@ -15,11 +16,9 @@ class CreateOrderCommandTest {
 
     @Test
     @DisplayName("Gộp các dòng trùng sản phẩm, sắp theo productId; chuẩn hoá tên và email")
-    void from_mergesLinesAndNormalizes() {
-        CreateOrderRequest req = new CreateOrderRequest(" Nguyễn Văn A ", "A.Nguyen@Example.com ",
-                List.of(new Item(2L, 1), new Item(1L, 2), new Item(2L, 3)));
-
-        CreateOrderCommand command = CreateOrderCommand.from(req);
+    void of_mergesLinesAndNormalizes() {
+        CreateOrderCommand command = CreateOrderCommand.of(" Nguyễn Văn A ", "A.Nguyen@Example.com ",
+                List.of(new Line(2L, 1), new Line(1L, 2), new Line(2L, 3)));
 
         assertThat(command.customerName()).isEqualTo("Nguyễn Văn A");
         assertThat(command.customerEmail()).isEqualTo("a.nguyen@example.com");
@@ -34,6 +33,6 @@ class CreateOrderCommandTest {
         CreateOrderRequest equivalent = new CreateOrderRequest("Nguyễn Văn A ", "A.NGUYEN@example.com",
                 List.of(new Item(2L, 1), new Item(1L, 1), new Item(1L, 1)));
 
-        assertThat(CreateOrderCommand.from(equivalent)).isEqualTo(CreateOrderCommand.from(original));
+        assertThat(equivalent.toCommand()).isEqualTo(original.toCommand());
     }
 }

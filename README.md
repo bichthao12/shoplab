@@ -65,9 +65,12 @@ Test đặt theo package của từng module, gồm 4 loại:
 | `spring.jpa.open-in-view` | `false` | Không mở transaction kéo dài tới tầng view |
 | `spring.jpa.properties.hibernate.jdbc.time_zone` | `UTC` | Thời gian lưu và đọc theo UTC |
 | `spring.datasource.hikari.connection-init-sql` | `SET lock_timeout = '5s'` | Không request nào chờ khoá DB quá 5 giây (→ 409 + `Retry-After`), thay vì giữ connection chờ vô hạn |
+| `spring.jpa.properties.hibernate.jdbc.batch_size` (+ `order_inserts`, `order_updates`) | `50` | Gộp các câu INSERT / UPDATE cùng loại thành một lượt gửi, vd mọi dòng của một đơn hàng |
 | PostgreSQL `timezone` | `UTC` | Thời gian hiển thị trong psql cũng là UTC |
 
-Mọi mốc thời gian (`createdAt`, `updatedAt`) lưu kiểu `TIMESTAMPTZ` / `Instant` và trả ra dạng ISO-8601 có `Z`, ví dụ `2026-10-06T07:04:00.123Z`.
+Mọi mốc thời gian (`createdAt`, `updatedAt`) lưu kiểu `TIMESTAMPTZ` / `Instant` và trả ra dạng ISO-8601 có `Z`, ví dụ `2026-10-06T07:04:00.123456Z`. Chúng do Spring Data JPA auditing điền và được cắt về micro giây, đúng độ chính xác của `TIMESTAMPTZ`.
+
+Id lấy từ sequence riêng của từng bảng (`products_id_seq`...), mỗi lần Hibernate xin trước 50 id. Vì vậy id tăng dần nhưng không liền nhau (có khoảng trống, nhất là sau khi app khởi động lại).
 
 ---
 
@@ -259,10 +262,12 @@ Phân biệt 404 và 422: `GET /api/products/999` → **404** vì tài nguyên �
 
 ```
 src/main/java/com/shoplab/
-├── product/        Product, ProductController, ProductService, ProductRepository, ReservedItem, dto/
+├── product/        Product, CreateProductCommand, UpdateProductCommand, ReservedItem,
+│                   ProductController, ProductService, ProductRepository, dto/
 ├── order/          Order, OrderItem, CreateOrderCommand, OrderController, OrderService, OrderRepository, dto/
-├── idempotency/    IdempotencyService, IdempotencyStore, RequestFingerprint, IdempotencyCleanupJob
-└── common/         ApiException, GlobalExceptionHandler, DbConstraints, SchedulingConfig
+├── idempotency/    IdempotencyService, IdempotencyStore, IdempotencyStatus, RequestFingerprint, IdempotencyCleanupJob
+└── common/         BaseEntity, AuditedEntity, ApiException, GlobalExceptionHandler, DbConstraints,
+                    JpaAuditingConfig, SchedulingConfig
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
 ├── V2__add_product_category.sql              cột category
@@ -270,7 +275,8 @@ src/main/resources/db/migration/
 ├── V4__idempotency_store_response_body.sql   lưu nội dung phản hồi (JSONB)
 ├── V5__create_users_and_accounts.sql         bảng users, accounts
 ├── V6__order_items_product_snapshot.sql      chụp sku, tên sản phẩm vào dòng đơn
-└── V7__idempotency_store_raw_response.sql    lưu nguyên văn response (body TEXT + header)
+├── V7__idempotency_store_raw_response.sql    lưu nguyên văn response (body TEXT + header)
+└── V8__ids_from_sequence.sql                 id lấy từ sequence (bước 50) thay vì IDENTITY
 src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java
@@ -290,5 +296,7 @@ src/test/java/com/shoplab/
 - Module chỉ dùng phần public của module khác. Repository và các hàm thay đổi dữ liệu của entity để package-private, nên chỉ code trong cùng package mới gọi được. Entity và DTO web không được dùng ngoài module của nó.
 - `order` giữ hàng qua `ProductService.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
 - Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`); DTO web chỉ mang dữ liệu và validation.
+- Phân tầng trong module: controller đổi DTO web ↔ command / entity; service nhận command (`CreateProductCommand`, `UpdateProductCommand`, `CreateOrderCommand`) và trả entity, không biết gì về HTTP. Chỉ controller (và chính các DTO) được dùng package `dto`.
+- Entity kế thừa `common.BaseEntity` (id lấy từ sequence của bảng, khai báo bằng `@SequenceGenerator` trên class) hoặc `common.AuditedEntity` (thêm `version`, `createdAt`, `updatedAt` do Spring Data auditing điền).
 - Lỗi nghiệp vụ kế thừa `common.ApiException` (tự mang status, `type`, `title`). `GlobalExceptionHandler` không import exception của module nào.
 - Lỗi ràng buộc DB do service sở hữu dữ liệu tự dịch theo tên constraint, ví dụ `uk_products_sku` → `duplicate-sku`.

@@ -1,5 +1,6 @@
 package com.shoplab.order.dto;
 
+import com.shoplab.order.CreateOrderCommand;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.Max;
@@ -12,7 +13,7 @@ import jakarta.validation.constraints.Size;
 
 import java.util.List;
 
-/** Body của POST /api/orders. Chỉ mang dữ liệu + validation; chuẩn hoá nằm ở CreateOrderCommand. */
+/** Body của POST /api/orders. Chỉ mang dữ liệu + validation; gộp dòng và chuẩn hoá nằm ở CreateOrderCommand. */
 public record CreateOrderRequest(
         @NotBlank @Size(max = 255) String customerName,
         @NotBlank @Email @Size(max = 255) String customerEmail,
@@ -23,4 +24,12 @@ public record CreateOrderRequest(
             @NotNull @Positive Long productId,
             @NotNull @Min(1) @Max(1000) Integer quantity
     ) {}
+
+    /** Chuyển sang đầu vào của OrderService (gọi sau khi đã qua validation). */
+    public CreateOrderCommand toCommand() {
+        List<CreateOrderCommand.Line> lines = items.stream()
+                .map(item -> new CreateOrderCommand.Line(item.productId(), item.quantity()))
+                .toList();
+        return CreateOrderCommand.of(customerName, customerEmail, lines);
+    }
 }

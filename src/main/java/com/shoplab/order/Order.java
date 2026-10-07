@@ -1,25 +1,20 @@
 package com.shoplab.order;
 
+import com.shoplab.common.AuditedEntity;
 import com.shoplab.product.ReservedItem;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.OrderBy;
+import jakarta.persistence.SequenceGenerator;
 import jakarta.persistence.Table;
-import jakarta.persistence.Version;
-import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.UpdateTimestamp;
 import org.springframework.util.Assert;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -31,11 +26,8 @@ import java.util.Locale;
  */
 @Entity(name = "ShopOrder")
 @Table(name = "orders")
-public class Order {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
+@SequenceGenerator(sequenceName = "orders_id_seq", allocationSize = 50)
+public class Order extends AuditedEntity {
 
     @Column(nullable = false)
     private String customerName;
@@ -49,17 +41,6 @@ public class Order {
 
     @Column(nullable = false, precision = 14, scale = 2)
     private BigDecimal totalAmount = BigDecimal.ZERO.setScale(2);
-
-    @Version
-    private Long version;
-
-    @CreationTimestamp
-    @Column(nullable = false, updatable = false)
-    private Instant createdAt;
-
-    @UpdateTimestamp
-    @Column(nullable = false)
-    private Instant updatedAt;
 
     @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
     @OrderBy("id")
@@ -84,14 +65,10 @@ public class Order {
         totalAmount = totalAmount.add(item.getLineTotal()).setScale(2, RoundingMode.HALF_UP);
     }
 
-    public Long getId() { return id; }
     public String getCustomerName() { return customerName; }
     public String getCustomerEmail() { return customerEmail; }
     public OrderStatus getStatus() { return status; }
     public BigDecimal getTotalAmount() { return totalAmount; }
-    public Long getVersion() { return version; }
-    public Instant getCreatedAt() { return createdAt; }
-    public Instant getUpdatedAt() { return updatedAt; }
     public List<OrderItem> getItems() { return Collections.unmodifiableList(items); }
 
     // ---------- Quy tắc chuẩn hoá: định nghĩa MỘT lần, CreateOrderCommand cũng dùng ----------

@@ -4,12 +4,12 @@ package com.shoplab.idempotency;
 record IdempotencyRecord(
         String idemKey,
         String requestHash,
-        String status,
+        IdempotencyStatus status,
         Integer responseStatus,
         String responseHeaders,  // JSON: tên header → danh sách giá trị
         String responseBody      // nguyên văn body đã trả lần đầu
 ) {
     boolean isCompleted() {
-        return "COMPLETED".equals(status);
+        return status == IdempotencyStatus.COMPLETED;
     }
 }

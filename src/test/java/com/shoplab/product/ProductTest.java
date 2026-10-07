@@ -14,7 +14,8 @@ class ProductTest {
     @Test
     @DisplayName("Tạo sản phẩm: sku, tên bỏ khoảng trắng đầu/cuối; category về chữ thường")
     void constructor_normalizesInput() {
-        Product p = new Product("  AO-1 ", " Áo thun ", "Cotton", " AO ", new BigDecimal("1.00"), 3, true);
+        Product p = new Product(
+                new CreateProductCommand("  AO-1 ", " Áo thun ", "Cotton", " AO ", new BigDecimal("1.00"), 3, true));
 
         assertThat(p.getSku()).isEqualTo("AO-1");
         assertThat(p.getName()).isEqualTo("Áo thun");
@@ -26,7 +27,8 @@ class ProductTest {
     @Test
     @DisplayName("Không cho giá âm, kho âm hay trường bắt buộc để trống")
     void invariants_areEnforced() {
-        assertThatThrownBy(() -> new Product("AO-1", "Áo", null, "ao", new BigDecimal("-1"), 1, true))
+        assertThatThrownBy(() -> new Product(
+                new CreateProductCommand("AO-1", "Áo", null, "ao", new BigDecimal("-1"), 1, true)))
                 .isInstanceOf(IllegalArgumentException.class);
 
         Product p = product(5);
@@ -69,6 +71,7 @@ class ProductTest {
     }
 
     private static Product product(int stock) {
-        return new Product("SKU-1", "Áo thun", null, "ao", new BigDecimal("100000.00"), stock, true);
+        return new Product(
+                new CreateProductCommand("SKU-1", "Áo thun", null, "ao", new BigDecimal("100000.00"), stock, true));
     }
 }

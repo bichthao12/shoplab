@@ -7,6 +7,7 @@ import jakarta.persistence.Entity;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.repository.Repository;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 
@@ -70,6 +71,15 @@ class ArchitectureTests {
                     .should().dependOnClassesThat().resideInAPackage("com.shoplab." + module + ".dto..")
                     .check(APP);
         }
+    }
+
+    @Test
+    @DisplayName("DTO web chỉ dùng ở controller: service, entity, command không phụ thuộc DTO")
+    void onlyControllersUseWebDtos() {
+        noClasses().that().resideOutsideOfPackage("com.shoplab..dto..")
+                .and().areNotAnnotatedWith(RestController.class)
+                .should().dependOnClassesThat().resideInAPackage("com.shoplab..dto..")
+                .check(APP);
     }
 
     @Test
