@@ -3,7 +3,10 @@ package com.shoplab.common.web;
 import com.shoplab.common.ApiException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.dao.CannotAcquireLockException;
@@ -17,6 +20,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.sql.SQLException;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -61,13 +65,15 @@ class GlobalExceptionHandlerTests {
     }
 
     @Test
-    @DisplayName("Deadlock (40P01) → 409 deadlock + Retry-After; lỗi khoá khác vẫn là 409 lock-timeout")
-    void deadlock_isReportedSeparatelyFromLockTimeout() throws Exception {
+    @DisplayName("Deadlock (40P01) → 409 deadlock + Retry-After, log ghi mã 40P01; lỗi khoá khác vẫn là 409 lock-timeout")
+    @ExtendWith(OutputCaptureExtension.class)
+    void deadlock_isReportedSeparatelyFromLockTimeout(CapturedOutput output) throws Exception {
         mvc.perform(get("/test/deadlock"))
                 .andExpect(status().isConflict())
                 .andExpect(header().string(HttpHeaders.RETRY_AFTER, "1"))
                 .andExpect(jsonPath("$.type").value("https://shoplab.dev/errors/deadlock"))
                 .andExpect(jsonPath("$.title").value("Deadlock Detected"));
+        assertThat(output).contains("Deadlock detected (SQLState 40P01): ERROR: deadlock detected");
 
         mvc.perform(get("/test/lock-timeout"))
                 .andExpect(status().isConflict())

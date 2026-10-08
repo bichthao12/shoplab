@@ -73,7 +73,8 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(PessimisticLockingFailureException.class)
     public ResponseEntity<ProblemDetail> handleLockTimeout(PessimisticLockingFailureException ex) {
         if (hasSqlState(ex, PG_DEADLOCK_DETECTED)) {
-            log.warn("Deadlock detected: {}", ex.getMostSpecificCause().getMessage());
+            // Ghi kèm mã 40P01: log của Hibernate có mã này, nhưng truy vấn qua JdbcClient thì không
+            log.warn("Deadlock detected (SQLState {}): {}", PG_DEADLOCK_DETECTED, ex.getMostSpecificCause().getMessage());
             ProblemDetail pd = problem(HttpStatus.CONFLICT, "deadlock", "Deadlock Detected",
                     "Thao tác bị huỷ vì tranh chấp khoá với một thao tác khác (deadlock), hãy thử lại");
             return ResponseEntity.status(HttpStatus.CONFLICT)

@@ -76,7 +76,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 | `spring.jpa.hibernate.ddl-auto` | `validate` | Schema do Flyway quản lý, Hibernate chỉ kiểm tra |
 | `spring.jpa.open-in-view` | `false` | Không mở transaction kéo dài tới tầng view |
 | `spring.jpa.properties.hibernate.jdbc.time_zone` | `UTC` | Thời gian lưu và đọc theo UTC |
-| `spring.datasource.hikari.connection-init-sql` | `SET lock_timeout = '5s'` | Không request nào chờ khoá DB quá 5 giây (→ 409 + `Retry-After`), thay vì giữ connection chờ vô hạn |
+| `spring.datasource.hikari.connection-init-sql` | `SET lock_timeout = '5s'` | Không request nào chờ khoá DB quá 5 giây (→ 409 + `Retry-After`), thay vì giữ connection chờ vô hạn. Chạy mỗi khi Hikari mở connection mới, nên áp dụng cho mọi connection trong pool. Test: `OrderIdempotencyIntegrationTests.keyHeldByAnotherTransaction_returns409AfterLockTimeout` (bỏ dòng này thì request chờ mãi tới khi client hết giờ) |
 | `spring.jpa.properties.hibernate.jdbc.batch_size` (+ `order_inserts`, `order_updates`) | `50` | Gộp các câu INSERT / UPDATE cùng loại thành một lượt gửi, vd mọi dòng của một đơn hàng |
 | PostgreSQL `timezone` | `UTC` | Thời gian hiển thị trong psql cũng là UTC |
 | `logging.level.sql` | `DEBUG` | Log từng câu SQL, của cả Hibernate (`org.hibernate.SQL`) lẫn `JdbcClient` (`org.springframework.jdbc.core`) |
@@ -688,7 +688,8 @@ Mỗi bên giữ một khoá và chờ khoá bên kia: không bên nào đi ti�
 
 - PostgreSQL chỉ đi tìm deadlock khi một bên đã chờ khoá quá `deadlock_timeout` (mặc định **1 giây**), rồi huỷ một transaction với lỗi `40P01`. Bên còn lại lấy được khoá và chạy xong. Bên nào bị huỷ là ngẫu nhiên.
 - Không mất tiền: lượt bị huỷ rollback toàn bộ, tổng số dư hai ví không đổi. Nhưng cả hai lượt đều bị treo khoảng 1 giây, và một lượt thất bại dù hợp lệ.
-- Phía Spring nhận `CannotAcquireLockException` (một `PessimisticLockingFailureException`). `GlobalExceptionHandler` đọc mã `40P01` và trả `409 deadlock` + `Retry-After`, tách riêng khỏi `409 lock-timeout`.
+- Phía Spring nhận `CannotAcquireLockException` (một `PessimisticLockingFailureException`). `GlobalExceptionHandler` đọc mã `40P01` và trả `409 deadlock` + `Retry-After`, tách riêng khỏi `409 lock-timeout`. Log ghi rõ mã lỗi: Hibernate ghi `HHH000247: ErrorCode: 0, SQLState: 40P01`, và `GlobalExceptionHandler` tự ghi `WARN ... Deadlock detected (SQLState 40P01): ERROR: deadlock detected` (có cả khi lỗi đi qua `JdbcClient`, nơi Hibernate không ghi gì). `GlobalExceptionHandlerTests` kiểm tra dòng log này.
+- `lock_timeout` (5 giây, xem *Cấu hình đáng chú ý*) dài hơn `deadlock_timeout` (1 giây), nên deadlock luôn được phát hiện và báo là `deadlock` trước khi lượt chờ hết `lock_timeout`.
 - `sleep(50)` để chắc chắn cả hai bên đã giữ khoá đầu tiên trước khi xin khoá thứ hai. Bỏ đi thì trên máy dev vẫn deadlock 10/10 lần, nhưng không đảm bảo trên máy khác.
 
 #### Sửa: khoá hai ví theo thứ tự id tăng dần
@@ -713,6 +714,8 @@ A→B và B→A đều xin khoá ví A trước. Lượt đến sau chờ ngay �
 | Theo thứ tự id tăng dần | Cả 2 lượt chuyển xong: A = 120, B = 80 | ~0,2–0,5 giây |
 
 Quy tắc chung: chỗ nào khoá nhiều dòng trong cùng một transaction thì mọi nơi phải khoá theo **cùng một thứ tự** (ở đây là id tăng dần). Trừ kho cho đơn nhiều sản phẩm cũng theo quy tắc này (theo `productId`).
+
+Qua API, `WalletApiIntegrationTests.oppositeTransfersAtOnce_noDeadlock` gửi **cùng lúc 100 lượt A→B 1 và 100 lượt B→A 2** (mỗi ví 1000): cả 200 lượt trả `200`, A = 1100, B = 900, và **tổng số dư mọi ví vẫn 2000** (test cộng bằng `SELECT sum(balance) FROM wallets`, `TransferDeadlockTests` cũng vậy). Thử đổi `WalletService` sang khoá theo thứ tự tham số: log ghi **87 lần** `Deadlock detected (SQLState 40P01)`, mỗi lần một lượt chờ ~1 giây, request xếp hàng chờ connection quá 30 giây và test đỏ.
 
 #### Tự chạy với app thật: `scripts/transfer-deadlock.ps1`
 

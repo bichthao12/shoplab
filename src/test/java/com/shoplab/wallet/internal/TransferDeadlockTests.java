@@ -65,7 +65,7 @@ class TransferDeadlockTests extends IntegrationTestBase {
             assertThat(balanceOf(a)).isEqualByComparingTo("130.00");   // B→A 30
             assertThat(balanceOf(b)).isEqualByComparingTo("70.00");
         }
-        assertThat(balanceOf(a).add(balanceOf(b))).isEqualByComparingTo("200.00");
+        assertThat(totalBalance()).isEqualByComparingTo("200.00");   // tổng mọi ví không đổi
         // PostgreSQL chỉ đi tìm deadlock sau khi một bên đã chờ khoá deadlock_timeout (mặc định 1 giây)
         assertThat(took).isGreaterThanOrEqualTo(Duration.ofMillis(900));
     }
@@ -87,6 +87,7 @@ class TransferDeadlockTests extends IntegrationTestBase {
         assertThat(outcomes).containsExactly(Outcome.TRANSFERRED, Outcome.TRANSFERRED);
         assertThat(balanceOf(a)).isEqualByComparingTo("120.00");   // 100 - 10 + 30
         assertThat(balanceOf(b)).isEqualByComparingTo("80.00");    // 100 + 10 - 30
+        assertThat(totalBalance()).isEqualByComparingTo("200.00");
         // Lượt đến sau chỉ chờ lượt trước chạy xong (vài trăm ms), không chờ PostgreSQL đi tìm deadlock (1 giây)
         assertThat(took).isLessThan(Duration.ofMillis(900));
     }
@@ -147,5 +148,10 @@ class TransferDeadlockTests extends IntegrationTestBase {
     private BigDecimal balanceOf(long walletId) {
         return jdbc.sql("SELECT balance FROM wallets WHERE id = :id").param("id", walletId)
                 .query(BigDecimal.class).single();
+    }
+
+    /** Tổng số dư mọi ví trong DB (mỗi test bắt đầu với bảng rỗng). */
+    private BigDecimal totalBalance() {
+        return jdbc.sql("SELECT coalesce(sum(balance), 0) FROM wallets").query(BigDecimal.class).single();
     }
 }

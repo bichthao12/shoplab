@@ -108,6 +108,7 @@ class WalletApiIntegrationTests extends IntegrationTestBase {
         assertThat(outcomes).containsExactly(Map.entry("200", (long) 2 * pairs));
         assertThat(balanceOf(a)).isEqualByComparingTo("1100.00");   // 1000 - 100×1 + 100×2
         assertThat(balanceOf(b)).isEqualByComparingTo("900.00");    // 1000 + 100×1 - 100×2
+        assertThat(totalBalance()).isEqualByComparingTo("2000.00");  // tổng mọi ví: chuyển qua lại không tạo / mất tiền
     }
 
     // =====================================================================
@@ -135,6 +136,11 @@ class WalletApiIntegrationTests extends IntegrationTestBase {
 
     private BigDecimal balanceOf(long walletId) {
         return jdbc.sql("SELECT balance FROM wallets WHERE id = :id").param("id", walletId).query(BigDecimal.class).single();
+    }
+
+    /** Tổng số dư mọi ví trong DB (mỗi test bắt đầu với bảng rỗng). */
+    private BigDecimal totalBalance() {
+        return jdbc.sql("SELECT coalesce(sum(balance), 0) FROM wallets").query(BigDecimal.class).single();
     }
 
     @SuppressWarnings("unchecked")
