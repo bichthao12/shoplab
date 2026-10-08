@@ -1,6 +1,7 @@
 package com.shoplab.product;
 
 import com.shoplab.TestcontainersConfiguration;
+import com.shoplab.common.ApiException;
 import com.shoplab.product.internal.CreateProductCommand;
 import com.shoplab.product.internal.Product;
 import com.shoplab.product.internal.ProductService;
@@ -9,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
 import org.springframework.modulith.test.ApplicationModuleTest;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -17,16 +19,20 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.when;
 
 /**
  * Test riêng module product: Spring Modulith chỉ dựng module này (kèm module dùng chung common),
- * không có order hay idempotency. Kiểm tra API ProductInventory mà module khác dùng.
+ * không có order hay idempotency. Kiểm tra API ProductInventory mà module khác dùng, và API ProductReferences
+ * mà module khác cài đặt (ở đây là mock thay cho module order).
  * Mỗi test chạy trong một transaction và rollback ở cuối (reserveStock bắt buộc có transaction).
  */
 @ApplicationModuleTest
 @Import(TestcontainersConfiguration.class)
 @Transactional
 class ProductModuleTests {
+
+    @MockitoBean ProductReferences references;
 
     @Autowired ProductInventory inventory;
     @Autowired ProductService products;
@@ -65,5 +71,32 @@ class ProductModuleTests {
         assertThatThrownBy(() -> inventory.reserveStock(Map.of(p.getId(), 3)))
                 .isInstanceOf(InsufficientStockException.class);
         assertThat(products.getById(p.getId()).getStock()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("Module khác còn tham chiếu tới sản phẩm → không xoá, 409 nêu rõ bị dùng ở đâu")
+    void delete_referencedProduct_isRejected() {
+        Product p = products.create(new CreateProductCommand(
+                "MODULE-004", "Áo", null, "ao", BigDecimal.ONE, 1, true));
+        when(references.isReferenced(p.getId())).thenReturn(true);
+        when(references.referencedBy()).thenReturn("đơn hàng");
+
+        assertThatThrownBy(() -> products.delete(p.getId()))
+                .isInstanceOfSatisfying(ApiException.class, ex -> {
+                    assertThat(ex.getType()).isEqualTo("data-integrity");
+                    assertThat(ex.getMessage()).contains("MODULE-004").contains("đơn hàng");
+                });
+        assertThat(products.getById(p.getId()).getSku()).isEqualTo("MODULE-004");
+    }
+
+    @Test
+    @DisplayName("Không module nào tham chiếu → xoá được")
+    void delete_unreferencedProduct_isDeleted() {
+        Product p = products.create(new CreateProductCommand(
+                "MODULE-005", "Áo", null, "ao", BigDecimal.ONE, 1, true));
+
+        products.delete(p.getId());
+
+        assertThatThrownBy(() -> products.getById(p.getId())).isInstanceOf(ApiException.class);
     }
 }

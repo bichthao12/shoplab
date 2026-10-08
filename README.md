@@ -38,6 +38,7 @@ Chạy class `TestShoplabApplication` (trong `src/test/java`): app tự dựng P
 ./mvnw test                                           # toàn bộ
 ./mvnw test -Dtest=OrderIdempotencyIntegrationTests   # riêng test idempotency
 ./mvnw test -Dtest=ModularityTests                    # kiểm tra cấu trúc module + sinh tài liệu module
+./mvnw test -Dtest=DatabaseModularityTests            # kiểm tra ranh giới module ở tầng DB
 ```
 
 Test đặt theo package của từng module, gồm 5 loại:
@@ -48,7 +49,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
 | Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
-| Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit) | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module |
+| Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
 
 ### Test thủ công
 
@@ -278,7 +279,7 @@ Tiền tố: `https://shoplab.dev/errors/`
 | `account-disabled` | 409 | Tài khoản đã vô hiệu hoá, không khoá / mở được |
 | `insufficient-stock` | 409 | Không đủ hàng |
 | `concurrent-modification` | 409 | Bản ghi vừa bị request khác sửa (`@Version`) |
-| `data-integrity` | 409 | Vi phạm ràng buộc DB (vd xoá sản phẩm đã có trong đơn) |
+| `data-integrity` | 409 | Vi phạm ràng buộc dữ liệu (vd xoá sản phẩm đã có trong đơn) |
 | `lock-timeout` / `idempotency-in-progress` | 409 | Đang có request khác xử lý cùng dữ liệu, kèm `Retry-After` |
 | `idempotency-key-reused` | 422 | Key đã dùng với nội dung khác |
 | `invalid-order` | 422 | Đơn hàng không xử lý được (sản phẩm không tồn tại / ngừng bán) |
@@ -318,7 +319,7 @@ Một ứng dụng, một database, nhưng chia thành các module có ranh gi�
 | Module | Lo việc gì | API cho module khác | Được phụ thuộc vào |
 |---|---|---|---|
 | `common` | Phần dùng chung (shared kernel) | `ApiException`, `BaseEntity`, `AuditedEntity`, `DbConstraints`, `ValidationPatterns` | (không module nào) |
-| `product` | Danh mục sản phẩm, tồn kho | `ProductInventory` (giữ hàng), `ReservedItem`, `ProductUnavailableException`, `InsufficientStockException` | `common` |
+| `product` | Danh mục sản phẩm, tồn kho | `ProductInventory` (giữ hàng), `ReservedItem`, `ProductUnavailableException`, `InsufficientStockException`; `ProductReferences` (module khác cài đặt) | `common` |
 | `idempotency` | Chạy request ghi đúng một lần theo `Idempotency-Key` | `IdempotencyService` và các exception của nó | `common` |
 | `order` | Đơn hàng | (chưa có) | `common`, `product`, `idempotency` |
 | `user` | Người dùng: hồ sơ + tài khoản đăng nhập | (chưa có) | `common` |
@@ -347,12 +348,13 @@ product/
 - **`internal/` và `web/` là nội bộ.** Module khác không được dùng, kể cả khi class là `public`.
 - Bên trong module: `web` → `internal` → API. Tầng `internal` không biết gì về HTTP hay DTO.
 
-### Quy tắc (kiểm tra tự động bởi `ModularityTests`)
+### Quy tắc (kiểm tra tự động bởi `ModularityTests`, `DatabaseModularityTests`)
 
 Vi phạm thì test đỏ và chỉ rõ chỗ vi phạm.
 
 - **Ranh giới module (Spring Modulith `verify()`):** không vòng phụ thuộc; chỉ dùng API của module khác; chỉ phụ thuộc những module khai báo trong `allowedDependencies`.
 - **Phân tầng trong module (ArchUnit):** chỉ tầng `web` dùng controller và DTO; repository không `public`, nên dữ liệu của module chỉ được truy cập từ code cùng package.
+- **Ranh giới module ở DB:** mỗi bảng khai báo thuộc đúng một module; không có khoá ngoại nối bảng của hai module khác nhau.
 
 Các quy ước khác:
 - `order` giữ hàng qua API `ProductInventory.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
@@ -365,11 +367,16 @@ Các quy ước khác:
 ### Giao tiếp giữa các module
 
 - **Gọi API trực tiếp** khi việc đó phải xong ngay, trong cùng transaction. Ví dụ đặt hàng phải giữ hàng thành công thì mới tạo đơn.
+- **Đảo chiều phụ thuộc** khi module được dùng cần hỏi ngược module dùng nó. Ví dụ trước khi xoá sản phẩm, `product` cần biết sản phẩm đã có trong đơn chưa, nhưng `product` không được phụ thuộc `order` (sẽ thành vòng). Vì vậy `product` định nghĩa interface `ProductReferences` trong API của mình, `order` cài đặt nó (`OrderProductReferences`), Spring đưa mọi cài đặt vào `ProductService`. Phụ thuộc vẫn một chiều `order → product`.
 - **Dùng event** cho việc phụ, chạy sau và không được làm hỏng việc chính, ví dụ gửi email xác nhận đơn. Hiện chưa có trường hợp nào như vậy. Khi cần, module phát event qua `ApplicationEventPublisher`, module nhận lắng nghe bằng `@ApplicationModuleListener`, và thêm Event Publication Registry của Spring Modulith để event không bị mất khi app dừng giữa chừng.
 
 ### Dữ liệu
 
-Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`; `user` → `users`, `accounts`. Riêng FK `order_items.product_id → products` được giữ có chủ đích, để DB chặn xoá sản phẩm đã có trong đơn.
+Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`; `user` → `users`, `accounts`.
+
+Khoá ngoại chỉ nối các bảng **trong cùng một module** (`order_items → orders`, `accounts → users`). Giữa hai module chỉ lưu id (vd `order_items.product_id`), không có khoá ngoại (V10 bỏ `fk_order_items_product`). Nhờ vậy mỗi module có thể đổi bảng, tách schema hay tách DB riêng mà không kéo module khác theo. Toàn vẹn dữ liệu giữa các module do code giữ:
+- Dòng đơn đã chụp `sku`, tên, giá nên không cần đọc lại `products`.
+- Không xoá được sản phẩm đã có trong đơn: `ProductService.delete` khoá dòng sản phẩm (`FOR UPDATE`), rồi hỏi các module qua `ProductReferences`. Tạo đơn cũng khoá dòng này khi giữ hàng, nên đơn đang tạo dở không lọt qua được: lệnh xoá chờ đơn commit rồi mới kiểm tra (→ 409); còn nếu lệnh xoá đến trước thì đơn đến sau không còn thấy sản phẩm (→ 422 `invalid-order`).
 
 ### Tài liệu module sinh tự động
 
@@ -385,7 +392,8 @@ src/main/java/com/shoplab/
 ├── common/         ApiException, BaseEntity, AuditedEntity, DbConstraints, ValidationPatterns
 │   ├── config/     JpaAuditingConfig, SchedulingConfig
 │   └── web/        GlobalExceptionHandler
-├── product/        ProductInventory, ReservedItem, ProductUnavailableException, InsufficientStockException
+├── product/        ProductInventory, ReservedItem, ProductUnavailableException, InsufficientStockException,
+│   │               ProductReferences
 │   ├── internal/   Product, ProductRepository, ProductService, DefaultProductInventory,
 │   │               CreateProductCommand, UpdateProductCommand, các exception nội bộ
 │   └── web/        ProductController, CreateProductRequest, PatchProductRequest, ProductResponse
@@ -394,7 +402,7 @@ src/main/java/com/shoplab/
 │                   RequestFingerprint, IdempotencyCleanupJob
 ├── order/
 │   ├── internal/   Order, OrderItem, OrderStatus, OrderRepository, OrderService, CreateOrderCommand,
-│   │               các exception nội bộ
+│   │               OrderProductReferences, các exception nội bộ
 │   └── web/        OrderController, CreateOrderRequest, OrderResponse
 └── user/
     ├── internal/   User, Account, AccountStatus, UserRepository, UserService, PasswordConfig,
@@ -409,12 +417,14 @@ src/main/resources/db/migration/
 ├── V6__order_items_product_snapshot.sql      chụp sku, tên sản phẩm vào dòng đơn
 ├── V7__idempotency_store_raw_response.sql    lưu nguyên văn response (body TEXT + header)
 ├── V8__ids_from_sequence.sql                 id lấy từ sequence (bước 50) thay vì IDENTITY
-└── V9__user_ids_from_sequence.sql            như V8, cho users, accounts
+├── V9__user_ids_from_sequence.sql            như V8, cho users, accounts
+└── V10__drop_cross_module_fk.sql             bỏ khoá ngoại chéo module order_items → products
 src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java
 ├── IntegrationTestBase.java                  nền chung cho integration test qua HTTP
 ├── ModularityTests.java                      kiểm tra cấu trúc module, sinh tài liệu module
+├── DatabaseModularityTests.java              bảng thuộc module nào, không có khoá ngoại chéo module
 ├── common/web/         GlobalExceptionHandlerTests
 ├── idempotency/internal/ RequestFingerprintTest
 ├── order/              OrderModuleTests

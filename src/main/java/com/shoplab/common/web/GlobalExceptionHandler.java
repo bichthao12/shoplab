@@ -92,7 +92,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     /**
      * Vi phạm ràng buộc DB mà service sở hữu dữ liệu chưa dịch sang lỗi nghiệp vụ.
-     * Các trường hợp đã biết (trùng SKU, xoá sản phẩm đã có trong đơn...) được dịch ngay trong service.
+     * Các trường hợp đã biết (trùng SKU, trùng email...) được dịch ngay trong service.
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ProblemDetail handleDataIntegrity(DataIntegrityViolationException ex) {

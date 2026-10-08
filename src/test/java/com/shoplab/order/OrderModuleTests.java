@@ -8,13 +8,13 @@ import com.shoplab.order.internal.CreateOrderCommand.Line;
 import com.shoplab.order.internal.Order;
 import com.shoplab.order.internal.OrderService;
 import com.shoplab.product.ProductInventory;
+import com.shoplab.product.ProductReferences;
 import com.shoplab.product.ProductUnavailableException;
 import com.shoplab.product.ReservedItem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
-import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.modulith.test.ApplicationModuleTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.transaction.annotation.Transactional;
@@ -43,12 +43,12 @@ class OrderModuleTests {
     @MockitoBean IdempotencyService idempotency;   // OrderController cần bean này; test không đi qua HTTP
 
     @Autowired OrderService orders;
-    @Autowired JdbcClient jdbc;
+    @Autowired ProductReferences productReferences;   // cài đặt của module order cho API của product
 
     @Test
     @DisplayName("Tạo đơn từ phần hàng module product giữ được: gộp dòng trùng, chụp sku/tên/giá, cộng tổng tiền")
     void create_buildsOrderFromReservedItems() {
-        long productId = insertProductRow("MODULE-ORDER-1");
+        long productId = 900_001L;   // không cần sản phẩm thật trong DB: không có khoá ngoại sang products
         when(inventory.reserveStock(Map.of(productId, 3))).thenReturn(List.of(
                 new ReservedItem(productId, "MODULE-ORDER-1", "Áo thun", new BigDecimal("100.00"), 3)));
 
@@ -79,15 +79,17 @@ class OrderModuleTests {
                 });
     }
 
-    /** order_items vẫn có FK tới products (giữ FK theo thiết kế), nên dòng đơn cần một sản phẩm có thật trong DB. */
-    private long insertProductRow(String sku) {
-        return jdbc.sql("""
-                        INSERT INTO products (sku, name, category, price, stock)
-                        VALUES (:sku, 'Áo thun', 'ao', 100, 10)
-                        RETURNING id
-                        """)
-                .param("sku", sku)
-                .query(Long.class)
-                .single();
+    @Test
+    @DisplayName("Báo cho module product: sản phẩm đã có trong đơn thì đang được tham chiếu, chưa có thì không")
+    void productReferences_reportProductsInOrders() {
+        long ordered = 900_002L;
+        long neverOrdered = 900_003L;
+        when(inventory.reserveStock(Map.of(ordered, 1))).thenReturn(List.of(
+                new ReservedItem(ordered, "MODULE-ORDER-2", "Áo", BigDecimal.ONE, 1)));
+        orders.create(CreateOrderCommand.of("Nguyễn Văn A", "a@example.com", List.of(new Line(ordered, 1))));
+
+        assertThat(productReferences.isReferenced(ordered)).isTrue();
+        assertThat(productReferences.isReferenced(neverOrdered)).isFalse();
+        assertThat(productReferences.referencedBy()).isEqualTo("đơn hàng");
     }
 }

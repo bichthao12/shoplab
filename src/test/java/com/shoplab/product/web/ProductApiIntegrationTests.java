@@ -102,11 +102,11 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
     }
 
     // =====================================================================
-    // 2. Lỗi ràng buộc DB được dịch sang lỗi có nghĩa
+    // 2. Ràng buộc dữ liệu: trùng SKU (DB chặn), xoá sản phẩm đã có trong đơn (code chặn)
     // =====================================================================
 
     @Test
-    @DisplayName("Xoá sản phẩm đã có trong đơn → 409 data-integrity kèm lý do rõ ràng, sản phẩm vẫn còn")
+    @DisplayName("Xoá sản phẩm đã có trong đơn → 409 data-integrity kèm lý do rõ ràng, sản phẩm vẫn còn (không cần khoá ngoại)")
     void deleteProductInOrder_returns409WithReason() {
         long productId = createProduct("DEL-001", 100_000, 10);
         assertThat(postOrder(newKey(), orderJson(productId, 1)).statusCode()).isEqualTo(201);
@@ -115,6 +115,39 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
 
         assertProblem(r, 409, "data-integrity");
         assertThat(json(r).get("detail").toString()).contains("DEL-001").contains("đơn hàng");
+        assertThat(count("products")).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("Đơn đang tạo dở cùng lúc với lệnh xoá → lệnh xoá chờ đơn commit rồi mới kiểm tra, vẫn trả 409")
+    void deleteWhileOrderInProgress_waitsAndReturns409() throws Exception {
+        long productId = createProduct("RACE-DEL-001", 100_000, 10);
+
+        try (Connection other = dataSource.getConnection()) {
+            other.setAutoCommit(false);
+            // Giống một đơn đang tạo: đã khoá sản phẩm (reserveStock), đã ghi dòng đơn, chưa commit
+            try (PreparedStatement lock = other.prepareStatement("SELECT id FROM products WHERE id = ? FOR UPDATE")) {
+                lock.setLong(1, productId);
+                lock.executeQuery().close();
+            }
+            try (PreparedStatement order = other.prepareStatement("""
+                    WITH o AS (
+                        INSERT INTO orders (customer_name, customer_email) VALUES ('A', 'a@example.com') RETURNING id
+                    )
+                    INSERT INTO order_items (order_id, product_id, quantity, unit_price, sku, product_name)
+                    SELECT o.id, ?, 1, 100000, 'RACE-DEL-001', 'Sản phẩm RACE-DEL-001' FROM o
+                    """)) {
+                order.setLong(1, productId);
+                order.executeUpdate();
+            }
+
+            CompletableFuture<HttpResponse<String>> pending = CompletableFuture.supplyAsync(() ->
+                    send("DELETE", "/api/products/" + productId, null, null));
+            awaitSessionWaitingForLock();   // lệnh xoá đang chờ khoá sản phẩm, chưa kiểm tra đơn
+            other.commit();
+
+            assertProblem(pending.get(30, TimeUnit.SECONDS), 409, "data-integrity");
+        }
         assertThat(count("products")).isEqualTo(1);
     }
 

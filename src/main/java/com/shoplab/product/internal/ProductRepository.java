@@ -10,6 +10,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 
 /** Chỉ dùng trong package product; module khác truy cập sản phẩm qua ProductService. */
 interface ProductRepository extends JpaRepository<Product, Long> {
@@ -27,4 +28,9 @@ interface ProductRepository extends JpaRepository<Product, Long> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select p from Product p where p.id in :ids order by p.id")
     List<Product> findAllByIdInForUpdate(@Param("ids") Collection<Long> ids);
+
+    /** SELECT ... FOR UPDATE một sản phẩm: khoá dòng tới hết transaction. */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select p from Product p where p.id = :id")
+    Optional<Product> findByIdForUpdate(@Param("id") Long id);
 }

@@ -1,11 +1,14 @@
 package com.shoplab.product.internal;
 
 import com.shoplab.common.DbConstraints;
+import com.shoplab.product.ProductReferences;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
 
 /**
  * Quản lý sản phẩm (tạo, đọc, sửa, xoá) cho API của chính module product.
@@ -17,12 +20,14 @@ import org.springframework.transaction.annotation.Transactional;
 public class ProductService {
 
     private static final String UK_PRODUCTS_SKU = "uk_products_sku";
-    private static final String FK_ORDER_ITEMS_PRODUCT = "fk_order_items_product";
 
     private final ProductRepository repo;
+    private final List<ProductReferences> references;
 
-    public ProductService(ProductRepository repo) {
+    /** references: cài đặt của các module còn tham chiếu tới sản phẩm (vd order); không có thì danh sách rỗng. */
+    public ProductService(ProductRepository repo, List<ProductReferences> references) {
         this.repo = repo;
+        this.references = references;
     }
 
     // ---------- CREATE ----------
@@ -71,18 +76,21 @@ public class ProductService {
     }
 
     // ---------- DELETE ----------
+    /**
+     * Không xoá sản phẩm còn được module khác tham chiếu (DB không có khoá ngoại chéo module để chặn).
+     * Khoá dòng sản phẩm TRƯỚC khi hỏi: giữ hàng cho đơn (reserveStock) cũng khoá dòng này, nên
+     *  - đơn đang tạo dở → lệnh xoá chờ đơn commit rồi mới hỏi, thấy đơn mới → 409;
+     *  - lệnh xoá đến trước → đơn chờ, sau đó không còn thấy sản phẩm → 422 invalid-order.
+     */
     @Transactional
     public void delete(Long id) {
-        Product p = findOrThrow(id);
-        try {
-            repo.delete(p);
-            repo.flush();
-        } catch (DataIntegrityViolationException ex) {
-            if (DbConstraints.isViolated(ex, FK_ORDER_ITEMS_PRODUCT)) {
-                throw new ProductInUseException(p.getSku());
+        Product p = repo.findByIdForUpdate(id).orElseThrow(() -> new ProductNotFoundException(id));
+        for (ProductReferences ref : references) {
+            if (ref.isReferenced(p.getId())) {
+                throw new ProductInUseException(p.getSku(), ref.referencedBy());
             }
-            throw ex;
         }
+        repo.delete(p);
     }
 
     private Product findOrThrow(Long id) {

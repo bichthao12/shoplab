@@ -16,4 +16,7 @@ interface OrderRepository extends JpaRepository<Order, Long> {
             where o.id = :id
             """)
     Optional<Order> findWithItemsById(@Param("id") Long id);
+
+    /** Có đơn nào chứa sản phẩm này không (dùng index idx_order_items_product_id). */
+    boolean existsByItemsProductId(Long productId);
 }
