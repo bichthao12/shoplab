@@ -112,6 +112,40 @@ class UserApiIntegrationTests extends IntegrationTestBase {
         assertThat(count("accounts")).isZero();
     }
 
+    /*
+     * Hai test dưới: nhiều request đăng ký trùng gửi cùng lúc. Khoảng 10 request (bằng số connection của pool)
+     * cùng qua bước existsBy... trước khi request đầu tiên commit; chỉ unique constraint của DB chặn được chúng.
+     * Bỏ constraint thì bản thử nghiệm tạo ra 10 người dùng cùng một email.
+     */
+
+    @Test
+    @DisplayName("20 request đăng ký cùng email, cùng lúc → đúng 1 lượt 201, 19 lượt 409 duplicate-email, chỉ 1 người dùng")
+    void sameEmailAtOnce_registersExactlyOne() throws Exception {
+        List<HttpResponse<String>> responses = Concurrently.run(20, i -> register("same@example.com", "user" + i));
+
+        assertThat(responses).filteredOn(r -> r.statusCode() == 201).hasSize(1);
+        assertThat(responses).filteredOn(r -> r.statusCode() != 201)
+                .hasSize(19)
+                .allSatisfy(r -> assertProblem(r, 409, "duplicate-email"));
+        assertThat(count("users")).isEqualTo(1);
+        assertThat(count("accounts")).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("20 request đăng ký cùng username, cùng lúc → đúng 1 lượt 201, 19 lượt 409 duplicate-username, "
+            + "hồ sơ của lượt thua cũng không được tạo")
+    void sameUsernameAtOnce_registersExactlyOne() throws Exception {
+        List<HttpResponse<String>> responses = Concurrently.run(20, i -> register("user" + i + "@example.com", "same"));
+
+        assertThat(responses).filteredOn(r -> r.statusCode() == 201).hasSize(1);
+        assertThat(responses).filteredOn(r -> r.statusCode() != 201)
+                .hasSize(19)
+                .allSatisfy(r -> assertProblem(r, 409, "duplicate-username"));
+        // users được INSERT trước accounts: lượt thua đã ghi dòng users rồi mới gặp lỗi ở accounts, dòng đó phải rollback
+        assertThat(count("users")).isEqualTo(1);
+        assertThat(count("accounts")).isEqualTo(1);
+    }
+
     // =====================================================================
     // 2. Hồ sơ
     // =====================================================================

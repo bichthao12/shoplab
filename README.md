@@ -60,6 +60,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 - **Bán chớp nhoáng với app đang chạy:** `scripts\flash-sale.ps1` (xem mục *Test bán chớp nhoáng*).
 - **Deadlock chuyển tiền:** `scripts\transfer-deadlock.ps1` (xem mục *Deadlock*).
 - **Lost update khi sửa hồ sơ:** `scripts\profile-lost-update.ps1` (xem mục *Sửa hồ sơ: bắt buộc gửi `version`*).
+- **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -327,6 +328,88 @@ SAI: case 1, case 2, case 3 không như mong đợi
 ```
 
 Chỉ có `@Version` thì vẫn có 17 request bị chặn, nhưng 3 request vẫn thắng: mỗi request đọc lại hồ sơ ở version mới nhất rồi mới sửa, nên request đọc sau khi một request khác đã commit vẫn ghi đè được.
+
+#### Đăng ký trùng gửi cùng lúc
+
+Đăng ký kiểm tra trùng theo hai lớp:
+
+1. **Kiểm tra trước:** `existsByEmail`, `existsByAccountUsername`. Trùng thì trả 409 ngay, không tốn công băm mật khẩu.
+2. **Unique constraint của DB:** `uk_users_email`, `uk_accounts_username`. `UserService` bắt lỗi vi phạm (`DbConstraints.isViolated`) và trả **cùng** 409 `duplicate-email` / `duplicate-username` như lớp 1, thay vì 409 `data-integrity` chung chung.
+
+Chỉ có lớp 1 thì không đủ. Nhiều request gửi cùng lúc đều chạy `existsByEmail` trước khi request đầu tiên commit, nên cùng thấy "chưa có" và cùng INSERT. Có lớp 2 thì INSERT thứ hai phải chờ INSERT đầu tiên commit, rồi bị DB từ chối.
+
+50 request đăng ký cùng email, gửi cùng lúc, với app thật:
+
+| | `201` | `409 duplicate-email` | Người dùng có email này |
+|---|---|---|---|
+| Hiện tại (cả 2 lớp) | **1** | 49 (40 chặn ở lớp 1, 9 do DB chặn) | **1** |
+| Bỏ `uk_users_email` (chỉ lớp 1) | **10** | 40 | **10** |
+| Bỏ phần dịch lỗi DB (chỉ còn constraint) | 1 | 40; 9 request còn lại nhận `409 data-integrity` | 1 |
+| Bỏ lớp 1 (chỉ còn constraint) | 1 | 49 | 1 |
+
+- **Tạo trùng tối đa bằng số connection của pool** (Hikari mặc định 10), giống bản ngây thơ của *Test bán chớp nhoáng*: mỗi request giữ một connection suốt transaction, nên chỉ 10 request cùng qua được lớp 1 trước khi request đầu tiên commit.
+- **Đảm bảo không trùng là nhờ constraint, không phải nhờ lớp 1.** Bỏ lớp 1, mọi test vẫn qua. Lớp 1 chỉ để trả lỗi sớm trong trường hợp thường gặp (đăng ký lại email đã có), không phải băm mật khẩu và không ghi lỗi vào log của PostgreSQL.
+- Trùng username thì lỗi xảy ra ở `INSERT INTO accounts`, **sau khi** đã `INSERT INTO users`. Transaction rollback nên dòng `users` đó cũng mất, không để lại hồ sơ không có tài khoản.
+
+Test: `duplicateEmailCaughtByDatabase_returnsDuplicateEmail` (ép đúng 1 request lọt qua lớp 1), `sameEmailAtOnce_registersExactlyOne`, `sameUsernameAtOnce_registersExactlyOne` (20 request cùng lúc).
+
+#### Tự chạy với app thật: `scripts/duplicate-email.ps1`
+
+Gửi cùng lúc `-Count` request đăng ký (mặc định 50) cùng một email, rồi `-Count` request cùng một username. Mong đợi mỗi case: đúng 1 request `201`, còn lại `409 duplicate-email` / `duplicate-username`.
+
+```powershell
+# cần app đang chạy (.\mvnw spring-boot:run)
+powershell -ExecutionPolicy Bypass -File .\scripts\duplicate-email.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\duplicate-email.ps1 -Count 100
+```
+
+```
+== Case 1: 50 request đăng ký cùng email dup1791447325@example.com, username khác nhau, gửi cùng lúc
+   xong sau 358 ms
+   201: 1
+        Người 6 (id 20013, email dup1791447325@example.com, username dup1791447325-6)
+   409 duplicate-email: 49   ví dụ: Email 'dup1791447325@example.com' đã được đăng ký
+   ĐÚNG: chỉ 1 người dùng được tạo, 49 request còn lại nhận 409 duplicate-email
+
+== Case 2: 50 request đăng ký cùng username dup1791447325, email khác nhau, gửi cùng lúc
+   xong sau 470 ms
+   201: 1
+        Người 18 (id 20022, email dup1791447325-18@example.com, username dup1791447325)
+   409 duplicate-username: 49   ví dụ: Username 'dup1791447325' đã có người dùng
+   ĐÚNG: chỉ 1 người dùng được tạo, 49 request còn lại nhận 409 duplicate-username
+
+ĐÚNG (2/2 case): đăng ký trùng gửi cùng lúc chỉ tạo đúng 1 người dùng, các request còn lại nhận 409
+```
+
+Mã thoát `0` nếu cả 2 case đều đúng; `1` nếu có case sai; `2` nếu không chạy được (app chưa chạy).
+
+**Muốn thấy lỗi khi thiếu constraint** (chỉ làm trên DB thử nghiệm): bỏ `uk_users_email`, chạy script, rồi dọn dữ liệu trùng và thêm lại constraint.
+
+```powershell
+docker compose exec postgres psql -U shoplab -d shoplab -c 'ALTER TABLE users DROP CONSTRAINT uk_users_email'
+powershell -ExecutionPolicy Bypass -File .\scripts\duplicate-email.ps1
+```
+
+```
+== Case 1: 50 request đăng ký cùng email dup1791447327@example.com, username khác nhau, gửi cùng lúc
+   xong sau 382 ms
+   201: 10
+        Người 1 (id 12, email dup1791447327@example.com, username dup1791447327-1)
+        Người 2 (id 15, email dup1791447327@example.com, username dup1791447327-2)
+        ...
+   409 duplicate-email: 40   ví dụ: Email 'dup1791447327@example.com' đã được đăng ký
+   SAI: 10 người dùng được tạo, mong đợi đúng 1
+...
+SAI: Case 1 không như mong đợi
+```
+
+```powershell
+# giữ người dùng có id nhỏ nhất của mỗi email, xoá phần trùng, rồi thêm lại constraint
+docker compose exec postgres psql -U shoplab -d shoplab `
+  -c 'DELETE FROM accounts a USING users u WHERE a.user_id = u.id AND EXISTS (SELECT 1 FROM users o WHERE o.email = u.email AND o.id < u.id)' `
+  -c 'DELETE FROM users u WHERE EXISTS (SELECT 1 FROM users o WHERE o.email = u.email AND o.id < u.id)' `
+  -c 'ALTER TABLE users ADD CONSTRAINT uk_users_email UNIQUE (email)'
+```
 
 ### Ví – `/api/wallets`
 
