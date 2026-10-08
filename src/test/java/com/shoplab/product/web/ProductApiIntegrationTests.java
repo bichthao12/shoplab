@@ -1,5 +1,6 @@
 package com.shoplab.product.web;
 
+import com.shoplab.Concurrently;
 import com.shoplab.IntegrationTestBase;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.junit.jupiter.api.DisplayName;
@@ -22,7 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Integration test cho API sản phẩm:
  *  - dữ liệu được chuẩn hoá một chỗ (entity) và lưu đúng từng trường,
  *  - validation khớp với cách chuẩn hoá,
- *  - lỗi ràng buộc DB được ProductService dịch sang lỗi có nghĩa.
+ *  - lỗi ràng buộc DB được ProductService dịch sang lỗi có nghĩa,
+ *  - PATCH bắt buộc gửi version đã đọc: không ai ghi đè được thay đổi (hay lượt giữ hàng) xảy ra sau lần mình đọc.
  */
 class ProductApiIntegrationTests extends IntegrationTestBase {
 
@@ -62,7 +64,7 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
         assertThat(Instant.parse(created.get("updatedAt").toString())).isEqualTo(createdAt);
 
         Map<String, Object> updated = json(send("PATCH", "/api/products/" + idOf(created), """
-                {"price":2}
+                {"price":2,"version":0}
                 """, null));
 
         assertThat(updated.get("version")).isEqualTo(1);
@@ -89,13 +91,13 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
         long productId = createProduct("PATCH-001", 100_000, 10);
 
         HttpResponse<String> blank = send("PATCH", "/api/products/" + productId, """
-                {"name":" \\u001F\\t "}
+                {"name":" \\u001F\\t ","version":0}
                 """, null);
         assertProblem(blank, 400, "validation");
         assertThat(json(blank).get("errors")).asInstanceOf(InstanceOfAssertFactories.MAP).containsKey("name");
 
         HttpResponse<String> multiline = send("PATCH", "/api/products/" + productId, """
-                {"name":"Áo thun\\nbasic"}
+                {"name":"Áo thun\\nbasic","version":0}
                 """, null);
         assertThat(multiline.statusCode()).isEqualTo(200);
         assertThat(json(multiline).get("name")).isEqualTo("Áo thun\nbasic");
@@ -173,6 +175,72 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
             assertProblem(pending.get(30, TimeUnit.SECONDS), 409, "duplicate-sku");
         }
         assertThat(count("products")).isEqualTo(1);
+    }
+
+    // =====================================================================
+    // 3. Sửa đồng thời: PATCH bắt buộc gửi version đã đọc
+    // =====================================================================
+
+    @Test
+    @DisplayName("PATCH không có version → 400 validation với errors.version, sản phẩm giữ nguyên")
+    void patch_withoutVersion_returns400() {
+        long productId = createProduct("VER-001", 100_000, 10);
+
+        HttpResponse<String> r = send("PATCH", "/api/products/" + productId, """
+                {"price":1}
+                """, null);
+
+        assertProblem(r, 400, "validation");
+        assertThat(json(r).get("errors")).asInstanceOf(InstanceOfAssertFactories.MAP).containsOnlyKeys("version");
+        assertThat(json(send("GET", "/api/products/" + productId, null, null)).get("version")).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("Admin sửa tồn kho theo con số đọc trước khi có đơn → 409, không xoá mất số đã giữ cho đơn; tải lại rồi sửa thì được")
+    void patchStockReadBeforeOrder_returns409AndKeepsReservedStock() {
+        long productId = createProduct("VER-002", 100_000, 10);
+        Map<String, Object> adminView = json(send("GET", "/api/products/" + productId, null, null));
+        assertThat(adminView).containsEntry("stock", 10).containsEntry("version", 0);
+
+        // Có đơn mua 3 cái sau lần admin đọc: stock 10 → 7, version 0 → 1
+        assertThat(postOrder(newKey(), orderJson(productId, 3)).statusCode()).isEqualTo(201);
+
+        // Admin nhập thêm 5 cái, tính trên con số đã đọc: 10 + 5 = 15. Không kiểm tra version thì kho thành 15,
+        // mất 3 cái đã bán → bán vượt 3 cái.
+        HttpResponse<String> stale = send("PATCH", "/api/products/" + productId, """
+                {"stock":15,"version":0}
+                """, null);
+
+        assertProblem(stale, 409, "concurrent-modification");
+        assertThat(json(stale)).containsEntry("expectedVersion", 0).containsEntry("currentVersion", 1);
+        assertThat(stockOf(productId)).isEqualTo(7);
+
+        // Tải lại (stock 7, version 1) rồi nhập thêm 5 cái
+        Map<String, Object> reloaded = json(send("GET", "/api/products/" + productId, null, null));
+        Map<String, Object> restocked = json(send("PATCH", "/api/products/" + productId, """
+                {"stock":%d,"version":%d}
+                """.formatted((int) reloaded.get("stock") + 5, (int) reloaded.get("version")), null));
+        assertThat(restocked).containsEntry("stock", 12).containsEntry("version", 2);
+    }
+
+    @Test
+    @DisplayName("20 PATCH cùng lúc, cùng đọc version 0 → đúng 1 lượt thành công, 19 lượt 409, không lượt nào ghi đè lượt khác")
+    void concurrentPatchesWithSameVersion_onlyOneWins() throws Exception {
+        long productId = createProduct("VER-003", 100_000, 10);
+
+        List<HttpResponse<String>> responses = Concurrently.run(20, i -> send("PATCH", "/api/products/" + productId, """
+                {"price":%d,"version":0}
+                """.formatted(1_000 + i), null));
+
+        List<HttpResponse<String>> won = responses.stream().filter(r -> r.statusCode() == 200).toList();
+        assertThat(won).hasSize(1);
+        assertThat(responses).filteredOn(r -> r.statusCode() != 200)
+                .hasSize(19)
+                .allSatisfy(r -> assertProblem(r, 409, "concurrent-modification"));
+        Map<String, Object> product = json(send("GET", "/api/products/" + productId, null, null));
+        assertThat(new BigDecimal(product.get("price").toString()))
+                .isEqualByComparingTo(json(won.getFirst()).get("price").toString());
+        assertThat(product.get("version")).isEqualTo(1);
     }
 
     // =====================================================================

@@ -115,8 +115,10 @@ class ProductModuleTests {
 
         inventory.reserveStock(Map.of(p.getId(), 3));                        // DB: stock = 7, version + 1
 
+        // p vẫn là entity trong transaction này (version 0), nên bước so version với client qua được;
+        // @Version chặn lúc ghi: UPDATE ... WHERE version = 0 không khớp dòng nào
         assertThatThrownBy(() -> products.update(p.getId(),
-                new UpdateProductCommand(null, "Tên mới", null, null, null, null, null)))
+                new UpdateProductCommand(null, "Tên mới", null, null, null, null, null, p.getVersion())))
                 .isInstanceOf(OptimisticLockingFailureException.class);
         assertThat(stockInDb(p.getId())).isEqualTo(7);
     }

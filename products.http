@@ -50,13 +50,20 @@ GET http://localhost:8080/api/products?category=AO&sort=price,desc&page=0&size=1
 ### Sort theo field không tồn tại → 400
 GET http://localhost:8080/api/products?sort=abc
 
-### PATCH: chỉ đổi giá và tồn kho → 200, version tăng
+### PATCH: chỉ đổi giá và tồn kho → 200, version tăng (version = version vừa đọc từ GET, bắt buộc)
 PATCH http://localhost:8080/api/products/1
 Content-Type: application/json
 
-{ "price": 179000, "stock": 45 }
+{ "price": 179000, "stock": 45, "version": 0 }
 
-### PATCH sai → 400
+### PATCH lại với version cũ → 409 concurrent-modification kèm currentVersion, không ghi đè gì
+# (đặt hàng sản phẩm này cũng tăng version: tồn kho đã đọc trước đó không còn đúng)
+PATCH http://localhost:8080/api/products/1
+Content-Type: application/json
+
+{ "stock": 100, "version": 0 }
+
+### PATCH sai → 400 (thiếu version cũng là 400, errors.version)
 PATCH http://localhost:8080/api/products/1
 Content-Type: application/json
 

@@ -28,8 +28,9 @@ class OrderApiIntegrationTests extends IntegrationTestBase {
         HttpResponse<String> created = postOrder(newKey(), orderJson(productId, 2));
         assertThat(created.statusCode()).isEqualTo(201);
 
+        // version 1: lượt giữ hàng cho đơn vừa tạo đã tăng version của sản phẩm
         HttpResponse<String> patched = send("PATCH", "/api/products/" + productId, """
-                {"sku":"SNAP-001-NEW","name":"Tên mới","price":1}
+                {"sku":"SNAP-001-NEW","name":"Tên mới","price":1,"version":1}
                 """, null);
         assertThat(patched.statusCode()).isEqualTo(200);
 

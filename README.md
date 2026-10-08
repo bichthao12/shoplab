@@ -60,6 +60,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 - **Bán chớp nhoáng với app đang chạy:** `scripts\flash-sale.ps1` (xem mục *Test bán chớp nhoáng*).
 - **Deadlock chuyển tiền:** `scripts\transfer-deadlock.ps1` (xem mục *Deadlock*).
 - **Lost update khi sửa hồ sơ:** `scripts\profile-lost-update.ps1` (xem mục *Sửa hồ sơ: bắt buộc gửi `version`*).
+- **Lost update khi sửa sản phẩm / tồn kho:** `scripts\product-lost-update.ps1` (xem mục *Sửa sản phẩm: bắt buộc gửi `version`*).
 - **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
@@ -116,7 +117,7 @@ Mọi request có body dùng `Content-Type: application/json`. Mọi response l�
 | `POST` | `/api/products` | **201** + header `Location` | 400 dữ liệu không hợp lệ · 409 trùng SKU |
 | `GET` | `/api/products/{id}` | **200** | 400 `id` sai kiểu · 404 không tồn tại |
 | `GET` | `/api/products?category=AO&page=0&size=20&sort=price,desc` | **200** (có phân trang) | 400 `sort` theo trường không tồn tại |
-| `PATCH` | `/api/products/{id}` | **200** (chỉ sửa trường được gửi) | 400 dữ liệu không hợp lệ · 404 · 409 trùng SKU / bị sửa đồng thời |
+| `PATCH` | `/api/products/{id}` | **200** (chỉ sửa trường được gửi; bắt buộc gửi `version` đã đọc) | 400 dữ liệu không hợp lệ / thiếu `version` · 404 · 409 trùng SKU / sản phẩm đã bị sửa sau lần đọc |
 | `DELETE` | `/api/products/{id}` | **204** (không có body) | 404 · 409 sản phẩm đã nằm trong đơn hàng |
 
 Ví dụ body tạo sản phẩm:
@@ -131,6 +132,71 @@ Ví dụ body tạo sản phẩm:
   "stock": 50
 }
 ```
+
+#### Sửa sản phẩm: bắt buộc gửi `version`
+
+Giống sửa hồ sơ người dùng (xem *Sửa hồ sơ: bắt buộc gửi `version`*): `PATCH` phải kèm `version` mà client đã đọc. Thiếu thì trả 400. Version khác version hiện tại thì trả 409 `concurrent-modification` kèm `expectedVersion`, `currentVersion`, và không sửa gì.
+
+```http
+PATCH /api/products/1
+Content-Type: application/json
+
+{ "price": 179000, "stock": 45, "version": 0 }
+```
+
+Với sản phẩm, lỗi ghi đè còn làm **sai tồn kho**, vì `stock` được gửi lên là con số tuyệt đối:
+
+```
+Admin GET        → stock 10, version 0
+Khách đặt 3 cái  → stock 7, version 1   (giữ hàng cũng tăng version)
+Admin nhập thêm 5 cái, tính trên con số đã đọc: PATCH {"stock": 15, "version": 0}
+  → không kiểm tra version: 200, stock = 15, mất 3 cái đã bán → có thể bán vượt 3 cái
+  → hiện tại: 409, stock vẫn 7. Admin tải lại (stock 7, version 1) rồi gửi {"stock": 12, "version": 1} → 200
+```
+
+Đánh đổi: version tính cho **cả dòng** sản phẩm, và mỗi đơn giữ hàng đều tăng version. Sản phẩm đang bán chạy thì sửa tên hay giá cũng dễ gặp 409, dù không đụng tới tồn kho; client chỉ cần tải lại rồi gửi lại. Nếu chuyện này hay xảy ra, có thể tách tồn kho ra API riêng nhận số **tăng / giảm** (`+5`) thay vì con số tuyệt đối.
+
+Test: `patchStockReadBeforeOrder_returns409AndKeepsReservedStock`, `concurrentPatchesWithSameVersion_onlyOneWins`, `patch_withoutVersion_returns400` (`ProductApiIntegrationTests`).
+
+#### Tự chạy với app thật: `scripts/product-lost-update.ps1`
+
+Gọi API của app đang chạy, kiểm tra 3 case, mỗi case một sản phẩm mới: (1) admin sửa tồn kho theo con số đọc trước khi có đơn → 409, kho giữ nguyên; (2) `-Concurrent` PATCH (mặc định 20) cùng gửi version 0, gửi cùng lúc → đúng 1 request 200; (3) PATCH không có `version` → 400.
+
+```powershell
+# cần app đang chạy (.\mvnw spring-boot:run)
+powershell -ExecutionPolicy Bypass -File .\scripts\product-lost-update.ps1
+```
+
+```
+== Case 1: admin sửa tồn kho theo con số đọc trước khi có đơn (lost update)
+   tạo sản phẩm id 29202: version 0, stock 10, price 100000; người mua id 24402
+   1. Admin GET          → version 0, stock 10, price 100000
+   2. Khách POST /api/orders {"userId":24402,"items":[{"productId":29202,"quantity":3}]}
+            → 201, đơn id 6302; sản phẩm lúc này: version 1, stock 7, price 100000
+   3. Admin nhập thêm 5 cái, tính trên số đã đọc: PATCH {"stock":15,"version":0}
+            → 409 concurrent-modification: Sản phẩm id = 29202 đã bị sửa sau lần bạn đọc (bạn gửi version 0, hiện tại là 1), hãy tải lại rồi sửa lại (expectedVersion 0, currentVersion 1)
+   4. GET lại            → version 1, stock 7, price 100000
+   5. Admin tải lại rồi nhập thêm 5 cái: PATCH {"stock":12,"version":1}
+            → 200, version 2, stock 12, price 100000
+   ĐÚNG: kho không bị ghi đè bằng con số cũ; admin nhận 409, tải lại rồi sửa được
+...
+ĐÚNG (3/3 case): client gửi version cũ nhận 409, không ai ghi đè tồn kho hay thay đổi của người khác
+```
+
+Cùng script với bản app **trước khi** bắt buộc `version`:
+
+```
+   3. Admin nhập thêm 5 cái, tính trên số đã đọc: PATCH {"stock":15,"version":0}
+            → 200, version 2, stock 15, price 100000
+   SAI: admin gửi version cũ mà vẫn 200: kho thành 15, mất 3 cái đã bán (lost update)
+   ...
+   200: 4 (price 1002, price 1006, price 1011, price 1016)
+   SAI: 4 request cùng gửi version 0 đều thành công, mong đợi đúng 1: request sau ghi đè request trước
+   ...
+SAI: case 1, case 2, case 3 không như mong đợi
+```
+
+Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nếu không chạy được (app chưa chạy).
 
 ### Đơn hàng – `/api/orders`
 

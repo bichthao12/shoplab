@@ -1,6 +1,7 @@
 package com.shoplab.user.internal;
 
 import com.shoplab.common.DbConstraints;
+import com.shoplab.common.StaleVersionException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -58,16 +59,14 @@ public class UserService {
     /**
      * Sửa hồ sơ, chỉ khi client đang sửa đúng version hiện tại (optimistic locking qua @Version).
      * Hai lớp chặn, cùng trả 409 concurrent-modification:
-     *  - client gửi version cũ (đã có người sửa sau lần client đọc) → ProfileVersionConflictException;
+     *  - client gửi version cũ (đã có người sửa sau lần client đọc) → StaleVersionException;
      *  - có người sửa xen vào giữa lúc kiểm tra và lúc ghi → UPDATE ... WHERE version = ? không khớp dòng nào,
      *    Hibernate báo ObjectOptimisticLockingFailureException.
      */
     @Transactional
     public User updateProfile(Long id, UpdateProfileCommand changes) {
         User user = findOrThrow(id);
-        if (user.getVersion() != changes.expectedVersion()) {
-            throw new ProfileVersionConflictException(id, changes.expectedVersion(), user.getVersion());
-        }
+        StaleVersionException.check("Hồ sơ người dùng", user, changes.expectedVersion());
         if (changes.fullName() != null) user.changeFullName(changes.fullName());
         if (changes.phone() != null)    user.changePhone(changes.phone());
 

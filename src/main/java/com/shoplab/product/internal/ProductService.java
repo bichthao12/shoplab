@@ -1,6 +1,7 @@
 package com.shoplab.product.internal;
 
 import com.shoplab.common.DbConstraints;
+import com.shoplab.common.StaleVersionException;
 import com.shoplab.product.ProductReferences;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -52,9 +53,16 @@ public class ProductService {
     }
 
     // ---------- UPDATE (cập nhật một phần) ----------
+    /**
+     * Sửa sản phẩm, chỉ khi client đang sửa đúng version hiện tại. Hai lớp chặn, cùng trả 409 concurrent-modification:
+     *  - client gửi version cũ (đã có người sửa, hoặc đã có đơn giữ hàng, sau lần client đọc) → StaleVersionException;
+     *  - có người sửa xen vào giữa lúc kiểm tra và lúc ghi → UPDATE ... WHERE version = ? không khớp dòng nào,
+     *    Hibernate báo ObjectOptimisticLockingFailureException.
+     */
     @Transactional
     public Product update(Long id, UpdateProductCommand changes) {
         Product p = findOrThrow(id);
+        StaleVersionException.check("Sản phẩm", p, changes.expectedVersion());
 
         if (changes.sku() != null) {
             // Kiểm tra trùng TRƯỚC khi sửa entity: sửa trước thì Hibernate sẽ flush SKU mới ngay khi chạy query này
