@@ -59,6 +59,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 - **File `.http`** (IntelliJ / VS Code REST Client): `products.http`, `users.http`.
 - **Bán chớp nhoáng với app đang chạy:** `scripts\flash-sale.ps1` (xem mục *Test bán chớp nhoáng*).
 - **Deadlock chuyển tiền:** `scripts\transfer-deadlock.ps1` (xem mục *Deadlock*).
+- **Lost update khi sửa hồ sơ:** `scripts\profile-lost-update.ps1` (xem mục *Sửa hồ sơ: bắt buộc gửi `version`*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -256,6 +257,76 @@ Vì vậy server so `version` client gửi với version hiện tại trước k
   "currentVersion": 1
 }
 ```
+
+#### Tự chạy với app thật: `scripts/profile-lost-update.ps1`
+
+Gọi API của app đang chạy, kiểm tra 3 case, mỗi case một người dùng mới:
+
+1. **Client sửa dựa trên dữ liệu đã cũ:** An và Bình cùng `GET` (version 0). An đổi `phone`. Bình lưu form đang mở (tên mới, `phone` cũ, version 0) → mong đợi 409, số của An còn nguyên. Bình tải lại rồi sửa → 200.
+2. **`-Concurrent` PATCH (mặc định 20) cùng gửi version 0, gửi cùng lúc** → mong đợi đúng 1 request 200, còn lại 409. Script đếm riêng 409 do bước so version và 409 do `@Version` khi ghi.
+3. **PATCH không có `version`** → mong đợi 400 `validation`, hồ sơ giữ nguyên.
+
+```powershell
+# cần app đang chạy (.\mvnw spring-boot:run)
+powershell -ExecutionPolicy Bypass -File .\scripts\profile-lost-update.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\profile-lost-update.ps1 -Concurrent 50
+```
+
+```
+== Case 1: client sửa dựa trên dữ liệu đã cũ (lost update)
+   tạo người dùng id 19902: version 0, fullName "Nguyễn Văn An", phone 0900000000
+   1. An   GET   → version 0, fullName "Nguyễn Văn An", phone 0900000000
+   2. Bình GET   → version 0, fullName "Nguyễn Văn An", phone 0900000000
+   3. An   PATCH {"phone":"0911111111","version":0}
+            → 200, version 1, fullName "Nguyễn Văn An", phone 0911111111
+   4. Bình PATCH {"fullName":"Trần Thị Bình","phone":"0900000000","version":0}   (form cũ)
+            → 409 concurrent-modification: Hồ sơ người dùng id = 19902 đã bị sửa sau lần bạn đọc (bạn gửi version 0, hiện tại là 1), hãy tải lại rồi sửa lại (expectedVersion 0, currentVersion 1)
+   5. GET lại    → version 1, fullName "Nguyễn Văn An", phone 0911111111
+   6. Bình tải lại rồi PATCH {"fullName":"Trần Thị Bình","phone":"0911111111","version":1}
+            → 200, version 2, fullName "Trần Thị Bình", phone 0911111111
+   ĐÚNG: thay đổi của An không bị ghi đè; Bình nhận 409, tải lại rồi sửa được
+
+== Case 2: 20 PATCH cùng gửi version 0, gửi cùng lúc
+   tạo người dùng id 19903: version 0, fullName "Tên gốc", phone 0900000000
+   PATCH {"fullName":"Người <i>","version":0}, i = 1..20
+   xong sau 58 ms
+   200: 1 (Người 1)
+   409 concurrent-modification: 19
+        17 chặn ở bước so version (lúc đọc thì hồ sơ đã lên version mới)
+         2 chặn bởi @Version khi ghi (đọc lúc còn version 0, có request khác ghi xen vào)
+   hồ sơ sau cùng: version 1, fullName "Người 1", phone 0900000000
+   ĐÚNG: chỉ Người 1 thành công, 19 request còn lại nhận 409, không ai bị ghi đè
+
+== Case 3: PATCH không có version
+   PATCH {"fullName":"Không gửi version"}
+            → 400 validation: Dữ liệu gửi lên không hợp lệ [errors: version = must not be null]
+   ĐÚNG: bị từ chối với 400, hồ sơ giữ nguyên
+
+ĐÚNG (3/3 case): client gửi version cũ nhận 409, không ai ghi đè thay đổi của người khác
+```
+
+Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nếu không chạy được (app chưa chạy). Số request bị chặn ở mỗi lớp trong case 2 thay đổi theo từng lần chạy; chỉ cần tổng là `-Concurrent` − 1.
+
+Chạy cùng script với bản app **trước khi** bắt buộc `version` (server bỏ qua `version` trong body):
+
+```
+   4. Bình PATCH {"fullName":"Trần Thị Bình","phone":"0900000000","version":0}   (form cũ)
+            → 200, version 2, fullName "Trần Thị Bình", phone 0900000000
+   SAI: Bình gửi version cũ mà vẫn 200: phone bị ghi đè về 0900000000, mất số An vừa đổi (lost update)
+   ...
+   200: 3 (Người 1, Người 12, Người 14)
+   409 concurrent-modification: 17
+         0 chặn ở bước so version (lúc đọc thì hồ sơ đã lên version mới)
+        17 chặn bởi @Version khi ghi (đọc lúc còn version 0, có request khác ghi xen vào)
+   SAI: 3 request cùng gửi version 0 đều thành công, mong đợi đúng 1: request sau ghi đè request trước
+   ...
+            → 200, version 4, fullName "Không gửi version", phone 0900000000
+   SAI: mong đợi 400 validation có errors.version: không gửi version thì server không biết client đọc từ lúc nào
+
+SAI: case 1, case 2, case 3 không như mong đợi
+```
+
+Chỉ có `@Version` thì vẫn có 17 request bị chặn, nhưng 3 request vẫn thắng: mỗi request đọc lại hồ sơ ở version mới nhất rồi mới sửa, nên request đọc sau khi một request khác đã commit vẫn ghi đè được.
 
 ### Ví – `/api/wallets`
 
