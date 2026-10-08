@@ -48,7 +48,7 @@ public abstract class IntegrationTestBase {
      */
     @BeforeEach
     protected void cleanDatabase() {
-        jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys CASCADE").update();
+        jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys, accounts, users CASCADE").update();
     }
 
     // ---------- HTTP ----------
@@ -94,6 +94,25 @@ public abstract class IntegrationTestBase {
     protected void assertProblem(HttpResponse<String> r, int status, String type) {
         assertProblem(r, status);
         assertThat(json(r).get("type")).isEqualTo("https://shoplab.dev/errors/" + type);
+    }
+
+    // ---------- DB ----------
+
+    /**
+     * Chờ tới khi có một session trong DB đang chờ khoá (tối đa 10 giây).
+     * Dùng để dựng tình huống 2 request cùng lúc: request đang chờ transaction khác commit.
+     */
+    protected void awaitSessionWaitingForLock() throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (System.nanoTime() < deadline) {
+            long waiting = jdbc.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'")
+                    .query(Long.class).single();
+            if (waiting > 0) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        throw new AssertionError("Request không dừng ở bước INSERT như mong đợi");
     }
 
     // ---------- Dữ liệu ----------

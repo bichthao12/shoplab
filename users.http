@@ -1,0 +1,53 @@
+### Đăng ký → 201 (email, username lưu chữ thường; response không có mật khẩu)
+POST http://localhost:8080/api/users
+Content-Type: application/json
+
+{
+  "email": "A.Nguyen@Example.com",
+  "fullName": "Nguyễn Văn A",
+  "phone": "0912345678",
+  "username": "Alice.N",
+  "password": "matkhau-bi-mat"
+}
+
+### Trùng email (khác hoa/thường) → 409 duplicate-email
+POST http://localhost:8080/api/users
+Content-Type: application/json
+
+{ "email": "a.nguyen@example.com", "fullName": "Trùng", "username": "khac", "password": "matkhau123" }
+
+### Trùng username → 409 duplicate-username
+POST http://localhost:8080/api/users
+Content-Type: application/json
+
+{ "email": "khac@example.com", "fullName": "Trùng", "username": "ALICE.N", "password": "matkhau123" }
+
+### Body sai → 400 kèm errors theo field
+POST http://localhost:8080/api/users
+Content-Type: application/json
+
+{ "email": "sai", "fullName": " ", "phone": "12-34", "username": "có dấu", "password": "ngan" }
+
+### Xem hồ sơ → 200
+GET http://localhost:8080/api/users/1
+
+### Không tồn tại → 404
+GET http://localhost:8080/api/users/9999
+
+### PATCH: đổi tên → 200, version tăng
+PATCH http://localhost:8080/api/users/1
+Content-Type: application/json
+
+{ "fullName": "Nguyễn Văn An" }
+
+### PATCH: phone rỗng = xoá số điện thoại
+PATCH http://localhost:8080/api/users/1
+Content-Type: application/json
+
+{ "phone": "" }
+
+### Khoá tài khoản → 200, account.status = LOCKED (gọi lại vẫn 200)
+POST http://localhost:8080/api/users/1/lock
+
+### Mở khoá → 200, account.status = ACTIVE
+POST http://localhost:8080/api/users/1/unlock

@@ -52,6 +52,11 @@
 			<artifactId>spring-modulith-api</artifactId>
 		</dependency>
 		<dependency>
+			<!-- Chỉ phần băm mật khẩu (BCrypt) của Spring Security, chưa bật xác thực -->
+			<groupId>org.springframework.security</groupId>
+			<artifactId>spring-security-crypto</artifactId>
+		</dependency>
+		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-flyway</artifactId>
 		</dependency>

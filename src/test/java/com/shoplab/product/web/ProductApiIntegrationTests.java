@@ -10,7 +10,6 @@ import java.net.URI;
 import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -146,20 +145,6 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
     // =====================================================================
     // Helpers
     // =====================================================================
-
-    /** Chờ tới khi có một session trong DB đang chờ khoá (tối đa 10 giây). */
-    private void awaitSessionWaitingForLock() throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (System.nanoTime() < deadline) {
-            long waiting = jdbc.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'")
-                    .query(Long.class).single();
-            if (waiting > 0) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        throw new AssertionError("Request không dừng ở bước INSERT như mong đợi");
-    }
 
     @SuppressWarnings("unchecked")
     private static List<String> skus(Map<String, Object> page) {

@@ -1,8 +1,8 @@
 # ShopLab
 
-REST API bán hàng tối giản dùng để luyện thiết kế API: CRUD sản phẩm, đặt hàng có **Idempotency-Key**, trả mọi lỗi theo chuẩn **ProblemDetail (RFC 9457)**.
+REST API bán hàng tối giản dùng để luyện thiết kế API: CRUD sản phẩm, đặt hàng có **Idempotency-Key**, đăng ký người dùng (mật khẩu băm BCrypt), trả mọi lỗi theo chuẩn **ProblemDetail (RFC 9457)**.
 
-**Công nghệ:** Java 21 · Spring Boot 4 (Web MVC, Data JPA, Validation) · PostgreSQL 17 · Flyway · Testcontainers
+**Công nghệ:** Java 21 · Spring Boot 4 (Web MVC, Data JPA, Validation) · Spring Modulith · Spring Security Crypto (chỉ BCrypt) · PostgreSQL 17 · Flyway · Testcontainers
 
 ---
 
@@ -44,15 +44,16 @@ Test đặt theo package của từng module, gồm 5 loại:
 
 | Loại | Ví dụ | Dựng gì |
 |---|---|---|
-| Unit test | `ProductTest`, `OrderTest`, `CreateOrderCommandTest`, `RequestFingerprintTest` | Không Spring, không DB |
+| Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest` | Không Spring, không DB |
 | Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
-| Test riêng từng module | `ProductModuleTests`, `OrderModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit) | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module |
 
 ### Test thủ công
 
 - **Postman:** import `shoplab.postman_collection.json` → *Run collection* (chạy đúng thứ tự). Biến `baseUrl` mặc định `http://localhost:8080`.
+- **File `.http`** (IntelliJ / VS Code REST Client): `products.http`, `users.http`.
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -136,6 +137,52 @@ Idempotency-Key: 3f1c2a9e-7b4d-4c1e-9a55-0d2f6b8e1a77
 | Sản phẩm không tồn tại / ngừng bán | **422** | `invalid-order` |
 | Không đủ hàng | **409** | Kèm `sku`, `requested`, `available` |
 | Request khác cùng key đang chạy quá 5 giây | **409** | Header `Retry-After: 1`, gửi lại với **cùng** key |
+
+### Người dùng – `/api/users`
+
+Mỗi người dùng có hồ sơ (bảng `users`) và đúng một tài khoản đăng nhập (bảng `accounts`). Chưa có đăng nhập; các API khác vẫn mở.
+
+| Method | Đường dẫn | Thành công | Lỗi có thể gặp |
+|---|---|---|---|
+| `POST` | `/api/users` | **201** + header `Location` | 400 dữ liệu không hợp lệ · 409 trùng email / username |
+| `GET` | `/api/users/{id}` | **200** | 404 |
+| `PATCH` | `/api/users/{id}` | **200** (sửa `fullName`, `phone`; `"phone": ""` để xoá) | 400 · 404 · 409 bị sửa đồng thời |
+| `POST` | `/api/users/{id}/lock` | **200**, `account.status` = `LOCKED` (đã khoá thì giữ nguyên) | 404 · 409 tài khoản đã vô hiệu hoá |
+| `POST` | `/api/users/{id}/unlock` | **200**, `account.status` = `ACTIVE` (đang mở thì giữ nguyên) | 404 · 409 tài khoản đã vô hiệu hoá |
+
+Ví dụ:
+
+```http
+POST /api/users
+Content-Type: application/json
+
+{
+  "email": "A.Nguyen@Example.com",
+  "fullName": "Nguyễn Văn A",
+  "phone": "0912345678",
+  "username": "Alice.N",
+  "password": "matkhau-bi-mat"
+}
+```
+
+```json
+{
+  "id": 1,
+  "email": "a.nguyen@example.com",
+  "fullName": "Nguyễn Văn A",
+  "phone": "0912345678",
+  "account": { "username": "alice.n", "status": "ACTIVE" },
+  "version": 0,
+  "createdAt": "2026-10-08T03:00:00.123456Z",
+  "updatedAt": "2026-10-08T03:00:00.123456Z"
+}
+```
+
+- Email và username lưu chữ thường, nên trùng không phân biệt hoa/thường. Username chỉ gồm `A-Z a-z 0-9 . _ -`, dài 3–50.
+- Mật khẩu 8–72 ký tự, lưu dạng hash `{bcrypt}$2a$10$...`. Response không bao giờ chứa mật khẩu hay hash. BCrypt chỉ dùng được 72 **byte** đầu, nên mật khẩu quá 72 byte UTF-8 (chữ có dấu chiếm 2–3 byte) cũng trả 400 `validation` với `errors.password`.
+- `version`, `createdAt`, `updatedAt` là của hồ sơ; khoá / mở khoá chỉ đổi `account.status`.
+- Trạng thái `DISABLED` (vô hiệu hoá hẳn) chưa đặt được qua API; tài khoản ở trạng thái này không khoá / mở được.
+- Chưa đổi được email / username qua API (đổi email cần bước xác minh).
 
 ### Lỗi chung cho mọi endpoint
 
@@ -225,7 +272,10 @@ Tiền tố: `https://shoplab.dev/errors/`
 | `invalid-idempotency-key` | 400 | Key sai định dạng |
 | `product-not-found` | 404 | Không tìm thấy sản phẩm |
 | `order-not-found` | 404 | Không tìm thấy đơn hàng |
+| `user-not-found` | 404 | Không tìm thấy người dùng |
 | `duplicate-sku` | 409 | SKU đã tồn tại |
+| `duplicate-email` / `duplicate-username` | 409 | Email / username đã được đăng ký |
+| `account-disabled` | 409 | Tài khoản đã vô hiệu hoá, không khoá / mở được |
 | `insufficient-stock` | 409 | Không đủ hàng |
 | `concurrent-modification` | 409 | Bản ghi vừa bị request khác sửa (`@Version`) |
 | `data-integrity` | 409 | Vi phạm ràng buộc DB (vd xoá sản phẩm đã có trong đơn) |
@@ -267,16 +317,20 @@ Một ứng dụng, một database, nhưng chia thành các module có ranh gi�
 
 | Module | Lo việc gì | API cho module khác | Được phụ thuộc vào |
 |---|---|---|---|
-| `common` | Phần dùng chung (shared kernel) | `ApiException`, `BaseEntity`, `AuditedEntity`, `DbConstraints` | (không module nào) |
+| `common` | Phần dùng chung (shared kernel) | `ApiException`, `BaseEntity`, `AuditedEntity`, `DbConstraints`, `ValidationPatterns` | (không module nào) |
 | `product` | Danh mục sản phẩm, tồn kho | `ProductInventory` (giữ hàng), `ReservedItem`, `ProductUnavailableException`, `InsufficientStockException` | `common` |
 | `idempotency` | Chạy request ghi đúng một lần theo `Idempotency-Key` | `IdempotencyService` và các exception của nó | `common` |
 | `order` | Đơn hàng | (chưa có) | `common`, `product`, `idempotency` |
+| `user` | Người dùng: hồ sơ + tài khoản đăng nhập | (chưa có) | `common` |
 
 ```
 order ──► product ─────┐
   │                    ├──► common
-  └────► idempotency ──┘
+  └────► idempotency ──┘     ▲
+user ────────────────────────┘
 ```
+
+Đơn hàng chưa gắn với người dùng: vẫn lưu `customerName`, `customerEmail` như cũ. Khi cần gắn, module `user` thêm API ở package gốc (giống `ProductInventory`) và `order` khai báo phụ thuộc vào `user`.
 
 ### Bố cục bên trong một module
 
@@ -302,10 +356,11 @@ Vi phạm thì test đỏ và chỉ rõ chỗ vi phạm.
 
 Các quy ước khác:
 - `order` giữ hàng qua API `ProductInventory.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
-- Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`). Service nhận command (`CreateProductCommand`, `UpdateProductCommand`, `CreateOrderCommand`) và trả entity; controller đổi DTO web ↔ command / entity.
+- Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`, `User`, `Account`). Service nhận command (`CreateProductCommand`, `CreateOrderCommand`, `RegisterUserCommand`...) và trả entity; controller đổi DTO web ↔ command / entity.
 - Entity kế thừa `common.BaseEntity` (id lấy từ sequence của bảng, khai báo bằng `@SequenceGenerator` trên class) hoặc `common.AuditedEntity` (thêm `version`, `createdAt`, `updatedAt` do Spring Data auditing điền).
 - Lỗi nghiệp vụ kế thừa `common.ApiException` (tự mang status, `type`, `title`). `GlobalExceptionHandler` không import exception của module nào.
-- Lỗi ràng buộc DB do service sở hữu dữ liệu tự dịch theo tên constraint, ví dụ `uk_products_sku` → `duplicate-sku`.
+- Lỗi ràng buộc DB do service sở hữu dữ liệu tự dịch theo tên constraint, ví dụ `uk_products_sku` → `duplicate-sku`, `uk_users_email` → `duplicate-email`.
+- `User` là gốc của `Account`: tạo, lưu, nạp cùng nhau (cascade), chỉ có `UserRepository`.
 
 ### Giao tiếp giữa các module
 
@@ -314,7 +369,7 @@ Các quy ước khác:
 
 ### Dữ liệu
 
-Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`. Riêng FK `order_items.product_id → products` được giữ có chủ đích, để DB chặn xoá sản phẩm đã có trong đơn.
+Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`; `user` → `users`, `accounts`. Riêng FK `order_items.product_id → products` được giữ có chủ đích, để DB chặn xoá sản phẩm đã có trong đơn.
 
 ### Tài liệu module sinh tự động
 
@@ -327,7 +382,7 @@ Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của
 ```
 src/main/java/com/shoplab/
 ├── ShoplabApplication.java   @Modulithic(sharedModules = "common")
-├── common/         ApiException, BaseEntity, AuditedEntity, DbConstraints
+├── common/         ApiException, BaseEntity, AuditedEntity, DbConstraints, ValidationPatterns
 │   ├── config/     JpaAuditingConfig, SchedulingConfig
 │   └── web/        GlobalExceptionHandler
 ├── product/        ProductInventory, ReservedItem, ProductUnavailableException, InsufficientStockException
@@ -337,10 +392,14 @@ src/main/java/com/shoplab/
 ├── idempotency/    IdempotencyService, các exception của nó
 │   └── internal/   DefaultIdempotencyService, IdempotencyStore, IdempotencyRecord, IdempotencyStatus,
 │                   RequestFingerprint, IdempotencyCleanupJob
-└── order/
-    ├── internal/   Order, OrderItem, OrderStatus, OrderRepository, OrderService, CreateOrderCommand,
-    │               các exception nội bộ
-    └── web/        OrderController, CreateOrderRequest, OrderResponse
+├── order/
+│   ├── internal/   Order, OrderItem, OrderStatus, OrderRepository, OrderService, CreateOrderCommand,
+│   │               các exception nội bộ
+│   └── web/        OrderController, CreateOrderRequest, OrderResponse
+└── user/
+    ├── internal/   User, Account, AccountStatus, UserRepository, UserService, PasswordConfig,
+    │               RegisterUserCommand, UpdateProfileCommand, các exception nội bộ
+    └── web/        UserController, RegisterUserRequest, UpdateProfileRequest, UserResponse
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
 ├── V2__add_product_category.sql              cột category
@@ -349,7 +408,8 @@ src/main/resources/db/migration/
 ├── V5__create_users_and_accounts.sql         bảng users, accounts
 ├── V6__order_items_product_snapshot.sql      chụp sku, tên sản phẩm vào dòng đơn
 ├── V7__idempotency_store_raw_response.sql    lưu nguyên văn response (body TEXT + header)
-└── V8__ids_from_sequence.sql                 id lấy từ sequence (bước 50) thay vì IDENTITY
+├── V8__ids_from_sequence.sql                 id lấy từ sequence (bước 50) thay vì IDENTITY
+└── V9__user_ids_from_sequence.sql            như V8, cho users, accounts
 src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java
@@ -360,7 +420,10 @@ src/test/java/com/shoplab/
 ├── order/              OrderModuleTests
 │   ├── internal/       OrderTest, CreateOrderCommandTest
 │   └── web/            OrderApiIntegrationTests, OrderIdempotencyIntegrationTests
-└── product/            ProductModuleTests
-    ├── internal/       ProductTest, ProductRepositoryTests
-    └── web/            ProductApiIntegrationTests
+├── product/            ProductModuleTests
+│   ├── internal/       ProductTest, ProductRepositoryTests
+│   └── web/            ProductApiIntegrationTests
+└── user/               UserModuleTests
+    ├── internal/       UserTest
+    └── web/            UserApiIntegrationTests
 ```
