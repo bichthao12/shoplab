@@ -65,6 +65,21 @@ class UserApiIntegrationTests extends IntegrationTestBase {
     }
 
     @Test
+    @DisplayName("Email có khoảng trắng đầu/cuối (vd copy-paste) → bỏ khoảng trắng như fullName, vẫn phát hiện trùng; chỉ có khoảng trắng → 400")
+    void register_emailWithSurroundingWhitespace_isStripped() {
+        HttpResponse<String> created = register(" \\t A.Nguyen@Example.com \\n", "alice");   // JSON: " \t ... \n"
+        assertThat(created.statusCode()).isEqualTo(201);
+        assertThat(json(created).get("email")).isEqualTo("a.nguyen@example.com");
+
+        assertProblem(register("  a.nguyen@example.com  ", "bob"), 409, "duplicate-email");
+
+        HttpResponse<String> blank = register("   ", "carol");
+        assertProblem(blank, 400, "validation");
+        assertThat(json(blank).get("errors")).asInstanceOf(InstanceOfAssertFactories.MAP).containsOnlyKeys("email");
+        assertThat(count("users")).isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("Body sai → 400 kèm lỗi theo từng trường")
     void register_invalidBody_returns400WithFieldErrors() {
         HttpResponse<String> r = send("POST", "/api/users", """

@@ -10,11 +10,11 @@ Content-Type: application/json
   "password": "matkhau-bi-mat"
 }
 
-### Trùng email (khác hoa/thường) → 409 duplicate-email
+### Trùng email (khác hoa/thường, có khoảng trắng đầu/cuối) → 409 duplicate-email
 POST http://localhost:8080/api/users
 Content-Type: application/json
 
-{ "email": "a.nguyen@example.com", "fullName": "Trùng", "username": "khac", "password": "matkhau123" }
+{ "email": "  a.nguyen@example.com ", "fullName": "Trùng", "username": "khac", "password": "matkhau123" }
 
 ### Trùng username → 409 duplicate-username
 POST http://localhost:8080/api/users

@@ -10,6 +10,7 @@ import jakarta.validation.constraints.Size;
 /**
  * Đăng ký: tạo người dùng kèm tài khoản đăng nhập.
  * password tối đa 72 ký tự ở đây; giới hạn 72 byte của BCrypt (chữ có dấu chiếm 2–3 byte) do UserService kiểm tra.
+ * email, fullName được nhận kèm khoảng trắng đầu/cuối (vd copy-paste) và lưu sau khi bỏ khoảng trắng.
  */
 public record RegisterUserRequest(
         @NotBlank @Email @Size(max = 255) String email,
@@ -21,6 +22,15 @@ public record RegisterUserRequest(
         String username,
         @NotBlank @Size(min = 8, max = 72) String password
 ) {
+
+    /**
+     * Bỏ khoảng trắng đầu/cuối của email ngay khi đọc request, TRƯỚC validation. fullName để entity bỏ là đủ,
+     * nhưng @Email không nhận khoảng trắng: để tới entity thì " a@example.com " đã bị 400 từ trước.
+     * Đưa về chữ thường vẫn ở entity (User.normalizeEmail), cùng chỗ với kiểm tra trùng.
+     */
+    public RegisterUserRequest {
+        email = email == null ? null : email.strip();
+    }
 
     /** Chuyển sang đầu vào của UserService (gọi sau khi đã qua validation). */
     public RegisterUserCommand toCommand() {

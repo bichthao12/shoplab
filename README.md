@@ -342,7 +342,7 @@ Content-Type: application/json
 }
 ```
 
-- Email và username lưu chữ thường, nên trùng không phân biệt hoa/thường. Username chỉ gồm `A-Z a-z 0-9 . _ -`, dài 3–50.
+- Email và username lưu chữ thường, nên trùng không phân biệt hoa/thường. Email và `fullName` được nhận kèm khoảng trắng đầu/cuối (vd copy-paste) và lưu sau khi bỏ khoảng trắng; email bỏ khoảng trắng trước khi kiểm tra định dạng, nên `" a@example.com "` hợp lệ. Username chỉ gồm `A-Z a-z 0-9 . _ -`, dài 3–50.
 - Mật khẩu 8–72 ký tự, lưu dạng hash `{bcrypt}$2a$10$...`. Response không bao giờ chứa mật khẩu hay hash. BCrypt chỉ dùng được 72 **byte** đầu, nên mật khẩu quá 72 byte UTF-8 (chữ có dấu chiếm 2–3 byte) cũng trả 400 `validation` với `errors.password`.
 - `version`, `createdAt`, `updatedAt` là của hồ sơ; khoá / mở khoá chỉ đổi `account.status`.
 - Trạng thái `DISABLED` (vô hiệu hoá hẳn) chưa đặt được qua API; tài khoản ở trạng thái này không khoá / mở được.
