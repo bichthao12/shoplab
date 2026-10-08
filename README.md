@@ -48,7 +48,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
@@ -72,6 +72,29 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 | `spring.datasource.hikari.connection-init-sql` | `SET lock_timeout = '5s'` | Không request nào chờ khoá DB quá 5 giây (→ 409 + `Retry-After`), thay vì giữ connection chờ vô hạn |
 | `spring.jpa.properties.hibernate.jdbc.batch_size` (+ `order_inserts`, `order_updates`) | `50` | Gộp các câu INSERT / UPDATE cùng loại thành một lượt gửi, vd mọi dòng của một đơn hàng |
 | PostgreSQL `timezone` | `UTC` | Thời gian hiển thị trong psql cũng là UTC |
+| `logging.level.sql` | `DEBUG` | Log từng câu SQL, của cả Hibernate (`org.hibernate.SQL`) lẫn `JdbcClient` (`org.springframework.jdbc.core`) |
+| `logging.level.tx` | `DEBUG` | Log `BEGIN` / `COMMIT` / `ROLLBACK` của mỗi transaction mới (`common.config.TransactionLogging`) |
+
+#### Đọc log SQL
+
+Mỗi dòng có thời điểm (ms) và tên luồng, nên lọc theo luồng là thấy trọn một request:
+
+```
+04:12:01.293 [exec-1] TransactionLogging : BEGIN    DefaultIdempotencyService.execute
+04:12:01.303 [exec-1] JdbcTemplate       : Executing prepared SQL statement [INSERT INTO idempotency_keys ...]
+04:12:01.344 [exec-1] org.hibernate.SQL  : select ... from users u1_0 join accounts a1_0 ...
+04:12:01.452 [exec-1] org.hibernate.SQL  : select ... from products p1_0 where p1_0.id in (?) order by p1_0.id for no key update of p1_0
+04:12:01.510 [exec-1] org.hibernate.SQL  : insert into orders ...
+04:12:01.516 [exec-1] org.hibernate.SQL  : insert into order_items ...
+04:12:01.521 [exec-1] org.hibernate.SQL  : update products set ... stock=? ...
+04:12:01.550 [exec-1] JdbcTemplate       : Executing prepared SQL statement [UPDATE idempotency_keys SET status = ? ...]
+04:12:01.558 [exec-1] TransactionLogging : COMMIT   DefaultIdempotencyService.execute
+```
+
+- `COMMIT` / `ROLLBACK` được ghi **sau** khi connection đã commit / rollback xong, nên mọi câu đứng trước nó trên cùng luồng đã nằm trong DB (khoá cũng được nhả lúc này).
+- Chỉ transaction **mới** có dòng `BEGIN` / `COMMIT`. Service hay repository gọi bên trong (vd `UserDirectory`, `ProductInventory` khi đặt hàng) chạy chung transaction ngoài nên không có dòng riêng.
+- Giá trị các tham số `?` không được log (có cả email, hash mật khẩu). Cần thì bỏ comment 2 dòng cuối phần log trong `application.properties`, chỉ trên máy mình.
+- Tắt log: `--logging.level.sql=INFO --logging.level.tx=INFO`.
 
 Mọi mốc thời gian (`createdAt`, `updatedAt`) lưu kiểu `TIMESTAMPTZ` / `Instant` và trả ra dạng ISO-8601 có `Z`, ví dụ `2026-10-06T07:04:00.123456Z`. Chúng do Spring Data JPA auditing điền và được cắt về micro giây, đúng độ chính xác của `TIMESTAMPTZ`.
 
@@ -394,7 +417,7 @@ Khoá ngoại chỉ nối các bảng **trong cùng một module** (`order_items
 src/main/java/com/shoplab/
 ├── ShoplabApplication.java   @Modulithic(sharedModules = "common")
 ├── common/         ApiException, BaseEntity, AuditedEntity, DbConstraints, ValidationPatterns
-│   ├── config/     JpaAuditingConfig, SchedulingConfig
+│   ├── config/     JpaAuditingConfig, SchedulingConfig, TransactionLogging
 │   └── web/        GlobalExceptionHandler
 ├── product/        ProductInventory, ReservedItem, ProductUnavailableException, InsufficientStockException,
 │   │               ProductReferences
@@ -429,6 +452,7 @@ src/test/java/com/shoplab/
 ├── TestShoplabApplication.java
 ├── IntegrationTestBase.java                  nền chung cho integration test qua HTTP
 ├── Concurrently.java                         chạy N tác vụ cùng lúc (virtual thread + CountDownLatch)
+├── SqlLoggingTests.java                      log SQL và BEGIN / COMMIT / ROLLBACK in đúng thứ tự
 ├── ModularityTests.java                      kiểm tra cấu trúc module, sinh tài liệu module
 ├── DatabaseModularityTests.java              bảng thuộc module nào, không có khoá ngoại chéo module
 ├── common/web/         GlobalExceptionHandlerTests
