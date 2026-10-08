@@ -55,9 +55,19 @@ public class UserService {
         return findOrThrow(id);
     }
 
+    /**
+     * Sửa hồ sơ, chỉ khi client đang sửa đúng version hiện tại (optimistic locking qua @Version).
+     * Hai lớp chặn, cùng trả 409 concurrent-modification:
+     *  - client gửi version cũ (đã có người sửa sau lần client đọc) → ProfileVersionConflictException;
+     *  - có người sửa xen vào giữa lúc kiểm tra và lúc ghi → UPDATE ... WHERE version = ? không khớp dòng nào,
+     *    Hibernate báo ObjectOptimisticLockingFailureException.
+     */
     @Transactional
     public User updateProfile(Long id, UpdateProfileCommand changes) {
         User user = findOrThrow(id);
+        if (user.getVersion() != changes.expectedVersion()) {
+            throw new ProfileVersionConflictException(id, changes.expectedVersion(), user.getVersion());
+        }
         if (changes.fullName() != null) user.changeFullName(changes.fullName());
         if (changes.phone() != null)    user.changePhone(changes.phone());
 

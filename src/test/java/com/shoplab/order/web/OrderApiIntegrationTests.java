@@ -84,7 +84,7 @@ class OrderApiIntegrationTests extends IntegrationTestBase {
         assertThat(((Number) json(created).get("userId")).longValue()).isEqualTo(customerId());
 
         assertThat(send("PATCH", "/api/users/" + customerId(), """
-                {"fullName":"Tên mới"}
+                {"fullName":"Tên mới","version":0}
                 """, null).statusCode()).isEqualTo(200);
 
         Map<String, Object> order = json(send("GET", "/api/orders/" + idOf(json(created)), null, null));

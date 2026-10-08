@@ -1,5 +1,6 @@
 package com.shoplab.user.web;
 
+import com.shoplab.Concurrently;
 import com.shoplab.IntegrationTestBase;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.junit.jupiter.api.DisplayName;
@@ -10,6 +11,7 @@ import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -125,7 +127,7 @@ class UserApiIntegrationTests extends IntegrationTestBase {
         Instant createdAt = Instant.parse(created.get("createdAt").toString());
 
         Map<String, Object> renamed = json(send("PATCH", "/api/users/" + id, """
-                {"fullName":"  Nguyễn Văn An "}
+                {"fullName":"  Nguyễn Văn An ","version":0}
                 """, null));
         assertThat(renamed.get("fullName")).isEqualTo("Nguyễn Văn An");
         assertThat(renamed.get("phone")).isEqualTo("0912345678");
@@ -133,14 +135,14 @@ class UserApiIntegrationTests extends IntegrationTestBase {
         assertThat(Instant.parse(renamed.get("updatedAt").toString())).isAfter(createdAt);
 
         Map<String, Object> phoneCleared = json(send("PATCH", "/api/users/" + id, """
-                {"phone":""}
+                {"phone":"","version":1}
                 """, null));
         assertThat(phoneCleared.get("phone")).isNull();
         assertThat(phoneCleared.get("fullName")).isEqualTo("Nguyễn Văn An");
     }
 
     @Test
-    @DisplayName("PATCH tên chỉ có khoảng trắng hoặc phone sai → 400; id không tồn tại → 404")
+    @DisplayName("PATCH tên chỉ có khoảng trắng, phone sai hoặc thiếu version → 400; id không tồn tại → 404")
     void updateProfile_invalidOrUnknown_isRejected() {
         long id = idOf(json(register("a@example.com", "alice")));
 
@@ -149,12 +151,51 @@ class UserApiIntegrationTests extends IntegrationTestBase {
                 """, null);
         assertProblem(blank, 400, "validation");
         assertThat(json(blank).get("errors")).asInstanceOf(InstanceOfAssertFactories.MAP)
-                .containsOnlyKeys("fullName", "phone");
+                .containsOnlyKeys("fullName", "phone", "version");
 
         assertProblem(send("PATCH", "/api/users/999999999", """
-                {"fullName":"X"}
+                {"fullName":"X","version":0}
                 """, null), 404, "user-not-found");
         assertProblem(send("GET", "/api/users/999999999", null, null), 404, "user-not-found");
+    }
+
+    @Test
+    @DisplayName("Sửa dựa trên version cũ (người khác đã sửa sau lần mình đọc) → 409 concurrent-modification, không ghi đè")
+    void updateProfile_staleVersion_returns409() {
+        long id = idOf(json(register("a@example.com", "alice")));
+        // An và Bình cùng đọc hồ sơ ở version 0; An sửa trước
+        assertThat(send("PATCH", "/api/users/" + id, """
+                {"phone":"0911111111","version":0}
+                """, null).statusCode()).isEqualTo(200);
+
+        HttpResponse<String> stale = send("PATCH", "/api/users/" + id, """
+                {"phone":"0922222222","version":0}
+                """, null);
+
+        assertProblem(stale, 409, "concurrent-modification");
+        assertThat(json(stale)).containsEntry("expectedVersion", 0).containsEntry("currentVersion", 1);
+        Map<String, Object> user = json(send("GET", "/api/users/" + id, null, null));
+        assertThat(user.get("phone")).isEqualTo("0911111111");   // thay đổi của An còn nguyên
+        assertThat(user.get("version")).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("20 PATCH cùng lúc, cùng đọc version 0 → đúng 1 lượt thành công, 19 lượt 409, không lượt nào ghi đè lượt khác")
+    void concurrentUpdatesWithSameVersion_onlyOneWins() throws Exception {
+        long id = idOf(json(register("a@example.com", "alice")));
+
+        List<HttpResponse<String>> responses = Concurrently.run(20, i -> send("PATCH", "/api/users/" + id, """
+                {"fullName":"Tên %d","version":0}
+                """.formatted(i), null));
+
+        List<HttpResponse<String>> won = responses.stream().filter(r -> r.statusCode() == 200).toList();
+        assertThat(won).hasSize(1);
+        assertThat(responses).filteredOn(r -> r.statusCode() != 200)
+                .hasSize(19)
+                .allSatisfy(r -> assertProblem(r, 409, "concurrent-modification"));
+        Map<String, Object> user = json(send("GET", "/api/users/" + id, null, null));
+        assertThat(user.get("fullName")).isEqualTo(json(won.getFirst()).get("fullName"));
+        assertThat(user.get("version")).isEqualTo(1);
     }
 
     // =====================================================================

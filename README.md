@@ -176,7 +176,7 @@ Mỗi người dùng có hồ sơ (bảng `users`) và đúng một tài khoản
 |---|---|---|---|
 | `POST` | `/api/users` | **201** + header `Location` | 400 dữ liệu không hợp lệ · 409 trùng email / username |
 | `GET` | `/api/users/{id}` | **200** | 404 |
-| `PATCH` | `/api/users/{id}` | **200** (sửa `fullName`, `phone`; `"phone": ""` để xoá) | 400 · 404 · 409 bị sửa đồng thời |
+| `PATCH` | `/api/users/{id}` | **200** (sửa `fullName`, `phone`; `"phone": ""` để xoá; bắt buộc gửi `version` đã đọc) | 400 (thiếu `version`) · 404 · 409 hồ sơ đã bị sửa sau lần đọc |
 | `POST` | `/api/users/{id}/lock` | **200**, `account.status` = `LOCKED` (đã khoá thì giữ nguyên) | 404 · 409 tài khoản đã vô hiệu hoá |
 | `POST` | `/api/users/{id}/unlock` | **200**, `account.status` = `ACTIVE` (đang mở thì giữ nguyên) | 404 · 409 tài khoản đã vô hiệu hoá |
 
@@ -213,6 +213,49 @@ Content-Type: application/json
 - `version`, `createdAt`, `updatedAt` là của hồ sơ; khoá / mở khoá chỉ đổi `account.status`.
 - Trạng thái `DISABLED` (vô hiệu hoá hẳn) chưa đặt được qua API; tài khoản ở trạng thái này không khoá / mở được.
 - Chưa đổi được email / username qua API (đổi email cần bước xác minh).
+
+#### Sửa hồ sơ: bắt buộc gửi `version`
+
+`PATCH /api/users/{id}` phải kèm `version` mà client đã đọc (từ `GET` hoặc response trước đó):
+
+```http
+PATCH /api/users/1
+Content-Type: application/json
+
+{ "fullName": "Nguyễn Văn An", "version": 0 }
+```
+
+Nếu không có `version`, hai người cùng mở form sửa hồ sơ sẽ ghi đè lên nhau mà không ai biết (lost update):
+
+```
+An   GET  → version 0, phone 0900000000
+Bình GET  → version 0
+An   PATCH phone = 0911111111             → 200, version 1
+Bình PATCH fullName = ... (form cũ của Bình vẫn hiện phone 0900000000)
+     → nếu không kiểm tra version: 200, Bình ghi đè mà không biết An vừa sửa
+```
+
+`@Version` của entity không chặn được trường hợp này. Nó chỉ thêm `AND version = ?` vào câu UPDATE với version mà
+**transaction đang chạy** vừa đọc. Request của Bình đọc lại hồ sơ (version 1) rồi mới sửa, nên câu UPDATE vẫn khớp.
+Vì vậy server so `version` client gửi với version hiện tại trước khi sửa. Có hai lớp kiểm tra:
+
+1. **Client đọc từ trước** (`version` gửi lên ≠ version hiện tại) → **409** `concurrent-modification`, không sửa gì.
+   Response có `expectedVersion` và `currentVersion`; client tải lại hồ sơ rồi sửa lại.
+2. **Hai request cùng version chạy cùng lúc**: cả hai qua được bước 1. `@Version` vẫn chặn khi flush
+   (`UPDATE ... WHERE version = ?` → 0 dòng) → **409** `concurrent-modification`. Chỉ một request thắng.
+
+```json
+{
+  "type": "https://shoplab.dev/errors/concurrent-modification",
+  "title": "Concurrent Modification",
+  "status": 409,
+  "detail": "Hồ sơ người dùng id = 1 đã bị sửa sau lần bạn đọc (bạn gửi version 0, hiện tại là 1), hãy tải lại rồi sửa lại",
+  "instance": "/api/users/1",
+  "timestamp": "2026-10-08T03:05:00.123Z",
+  "expectedVersion": 0,
+  "currentVersion": 1
+}
+```
 
 ### Ví – `/api/wallets`
 
@@ -504,7 +547,7 @@ Tiền tố: `https://shoplab.dev/errors/`
 | `duplicate-wallet` | 409 | Người dùng đã có ví |
 | `insufficient-balance` | 409 | Ví không đủ tiền |
 | `insufficient-stock` | 409 | Không đủ hàng |
-| `concurrent-modification` | 409 | Bản ghi vừa bị request khác sửa (`@Version`) |
+| `concurrent-modification` | 409 | Bản ghi vừa bị request khác sửa (`@Version`), hoặc `version` client gửi đã cũ (kèm `expectedVersion`, `currentVersion`) |
 | `data-integrity` | 409 | Vi phạm ràng buộc dữ liệu (vd xoá sản phẩm đã có trong đơn) |
 | `lock-timeout` / `idempotency-in-progress` | 409 | Đang có request khác xử lý cùng dữ liệu, kèm `Retry-After` |
 | `deadlock` | 409 | PostgreSQL huỷ thao tác vì deadlock với thao tác khác (`40P01`), kèm `Retry-After`, gửi lại được |

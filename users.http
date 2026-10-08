@@ -34,17 +34,29 @@ GET http://localhost:8080/api/users/1
 ### Không tồn tại → 404
 GET http://localhost:8080/api/users/9999
 
-### PATCH: đổi tên → 200, version tăng
+### PATCH: đổi tên → 200, version 0 → 1 (version = version vừa đọc từ GET, bắt buộc)
 PATCH http://localhost:8080/api/users/1
 Content-Type: application/json
 
-{ "fullName": "Nguyễn Văn An" }
+{ "fullName": "Nguyễn Văn An", "version": 0 }
 
-### PATCH: phone rỗng = xoá số điện thoại
+### PATCH lại với version cũ (0) → 409 concurrent-modification, currentVersion = 1, không ghi đè gì
 PATCH http://localhost:8080/api/users/1
 Content-Type: application/json
 
-{ "phone": "" }
+{ "fullName": "Tên của client đọc từ trước", "version": 0 }
+
+### PATCH: phone rỗng = xoá số điện thoại (version hiện tại = 1)
+PATCH http://localhost:8080/api/users/1
+Content-Type: application/json
+
+{ "phone": "", "version": 1 }
+
+### PATCH thiếu version → 400, errors.version
+PATCH http://localhost:8080/api/users/1
+Content-Type: application/json
+
+{ "fullName": "Không gửi version" }
 
 ### Khoá tài khoản → 200, account.status = LOCKED (gọi lại vẫn 200)
 POST http://localhost:8080/api/users/1/lock
