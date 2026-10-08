@@ -196,31 +196,39 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
     }
 
     @Test
-    @DisplayName("Admin sửa tồn kho theo con số đọc trước khi có đơn → 409, không xoá mất số đã giữ cho đơn; tải lại rồi sửa thì được")
-    void patchStockReadBeforeOrder_returns409AndKeepsReservedStock() {
+    @DisplayName("PATCH có stock → 400, chỉ đường sang stock-adjustments; tồn kho giữ nguyên")
+    void patchStock_returns400PointingToStockAdjustments() {
         long productId = createProduct("VER-002", 100_000, 10);
-        Map<String, Object> adminView = json(send("GET", "/api/products/" + productId, null, null));
-        assertThat(adminView).containsEntry("stock", 10).containsEntry("version", 0);
 
-        // Có đơn mua 3 cái sau lần admin đọc: stock 10 → 7, version 0 → 1
-        assertThat(postOrder(newKey(), orderJson(productId, 3)).statusCode()).isEqualTo(201);
-
-        // Admin nhập thêm 5 cái, tính trên con số đã đọc: 10 + 5 = 15. Không kiểm tra version thì kho thành 15,
-        // mất 3 cái đã bán → bán vượt 3 cái.
-        HttpResponse<String> stale = send("PATCH", "/api/products/" + productId, """
+        HttpResponse<String> r = send("PATCH", "/api/products/" + productId, """
                 {"stock":15,"version":0}
                 """, null);
 
-        assertProblem(stale, 409, "concurrent-modification");
-        assertThat(json(stale)).containsEntry("expectedVersion", 0).containsEntry("currentVersion", 1);
-        assertThat(stockOf(productId)).isEqualTo(7);
+        assertProblem(r, 400, "validation");
+        assertThat(json(r).get("errors")).asInstanceOf(InstanceOfAssertFactories.MAP)
+                .containsOnlyKeys("stock")
+                .extractingByKey("stock").asString().contains("stock-adjustments");
+        assertThat(stockOf(productId)).isEqualTo(10);
+    }
 
-        // Tải lại (stock 7, version 1) rồi nhập thêm 5 cái
-        Map<String, Object> reloaded = json(send("GET", "/api/products/" + productId, null, null));
-        Map<String, Object> restocked = json(send("PATCH", "/api/products/" + productId, """
-                {"stock":%d,"version":%d}
-                """.formatted((int) reloaded.get("stock") + 5, (int) reloaded.get("version")), null));
-        assertThat(restocked).containsEntry("stock", 12).containsEntry("version", 2);
+    @Test
+    @DisplayName("Đơn hàng không đổi version: admin sửa giá theo version đọc trước khi có đơn vẫn được, kho giữ đúng số sau đơn")
+    void orderDoesNotChangeVersion_adminEditReadBeforeOrderSucceeds() {
+        long productId = createProduct("VER-004", 100_000, 10);
+        Map<String, Object> adminView = json(send("GET", "/api/products/" + productId, null, null));
+        assertThat(adminView).containsEntry("stock", 10).containsEntry("version", 0);
+
+        // Có đơn mua 3 cái sau lần admin đọc: stock 10 → 7, version vẫn 0
+        assertThat(postOrder(newKey(), orderJson(productId, 3)).statusCode()).isEqualTo(201);
+        assertThat(json(send("GET", "/api/products/" + productId, null, null)))
+                .containsEntry("stock", 7).containsEntry("version", 0);
+
+        Map<String, Object> repriced = json(send("PATCH", "/api/products/" + productId, """
+                {"price":90000,"version":0}
+                """, null));
+
+        assertThat(repriced).containsEntry("stock", 7).containsEntry("version", 1);
+        assertThat(stockOf(productId)).isEqualTo(7);
     }
 
     @Test
@@ -244,8 +252,100 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
     }
 
     // =====================================================================
+    // 4. Điều chỉnh tồn kho: POST /api/products/{id}/stock-adjustments (cộng / trừ, bắt buộc Idempotency-Key)
+    // =====================================================================
+
+    @Test
+    @DisplayName("delta +5 rồi -3 → kho 10 → 15 → 12; version không đổi (tồn kho không thuộc version)")
+    void stockAdjustment_addsAndSubtracts() {
+        long productId = createProduct("ADJ-001", 100_000, 10);
+
+        HttpResponse<String> added = adjustStock(productId, 5, newKey());
+        assertThat(added.statusCode()).isEqualTo(200);
+        assertThat(json(added)).containsEntry("stock", 15).containsEntry("version", 0);
+
+        assertThat(json(adjustStock(productId, -3, newKey()))).containsEntry("stock", 12).containsEntry("version", 0);
+        assertThat(stockOf(productId)).isEqualTo(12);
+    }
+
+    @Test
+    @DisplayName("Trừ quá tồn kho → 409 insufficient-stock (requested, available), kho giữ nguyên")
+    void stockAdjustment_belowZero_returns409() {
+        long productId = createProduct("ADJ-002", 100_000, 10);
+
+        HttpResponse<String> r = adjustStock(productId, -11, newKey());
+
+        assertProblem(r, 409, "insufficient-stock");
+        assertThat(json(r)).containsEntry("sku", "ADJ-002").containsEntry("requested", 11).containsEntry("available", 10);
+        assertThat(stockOf(productId)).isEqualTo(10);
+    }
+
+    @Test
+    @DisplayName("Gửi lại cùng Idempotency-Key → nhận lại response lần đầu, kho chỉ cộng 1 lần; cùng key khác delta → 422")
+    void stockAdjustment_sameKey_appliedOnce() {
+        long productId = createProduct("ADJ-003", 100_000, 10);
+        String key = newKey();
+
+        HttpResponse<String> first = adjustStock(productId, 5, key);
+        HttpResponse<String> retry = adjustStock(productId, 5, key);
+
+        assertThat(first.statusCode()).isEqualTo(200);
+        assertThat(retry.statusCode()).isEqualTo(200);
+        assertThat(retry.body()).isEqualTo(first.body());
+        assertThat(retry.headers().firstValue("Idempotent-Replayed")).hasValue("true");
+        assertThat(stockOf(productId)).isEqualTo(15);
+
+        assertProblem(adjustStock(productId, 6, key), 422, "idempotency-key-reused");
+        assertThat(stockOf(productId)).isEqualTo(15);
+    }
+
+    @Test
+    @DisplayName("Thiếu Idempotency-Key, delta thiếu / bằng 0 / quá lớn → 400; sản phẩm không tồn tại → 404")
+    void stockAdjustment_invalidRequests() {
+        long productId = createProduct("ADJ-004", 100_000, 10);
+
+        assertProblem(send("POST", "/api/products/" + productId + "/stock-adjustments", """
+                {"delta":5}
+                """, null), 400);
+        assertThat(errorKeys(send("POST", "/api/products/" + productId + "/stock-adjustments", "{}", newKey())))
+                .containsOnlyKeys("delta");
+        assertThat(errorKeys(adjustStock(productId, 0, newKey()))).containsOnlyKeys("deltaNonZero");
+        assertThat(errorKeys(adjustStock(productId, 1_000_001, newKey()))).containsOnlyKeys("delta");
+        assertProblem(adjustStock(999_999_999L, 5, newKey()), 404, "product-not-found");
+        assertThat(stockOf(productId)).isEqualTo(10);
+    }
+
+    @Test
+    @DisplayName("20 lượt nhập +1 và 10 đơn mua 1 cái chạy cùng lúc → đều thành công, kho = 10 + 20 - 10, không mất lượt nào")
+    void restocksAndOrdersAtOnce_loseNoUpdate() throws Exception {
+        long productId = createProduct("ADJ-005", 100_000, 10);
+        String order = orderJson(productId, 1);
+
+        List<HttpResponse<String>> responses = Concurrently.run(30, i -> i < 20
+                ? adjustStock(productId, 1, newKey())
+                : postOrder(newKey(), order));
+
+        assertThat(responses.subList(0, 20)).allSatisfy(r -> assertThat(r.statusCode()).isEqualTo(200));
+        assertThat(responses.subList(20, 30)).allSatisfy(r -> assertThat(r.statusCode()).isEqualTo(201));
+        assertThat(stockOf(productId)).isEqualTo(20);
+        assertThat(count("orders")).isEqualTo(10);
+    }
+
+    // =====================================================================
     // Helpers
     // =====================================================================
+
+    private HttpResponse<String> adjustStock(long productId, int delta, String idempotencyKey) {
+        return send("POST", "/api/products/" + productId + "/stock-adjustments", """
+                {"delta":%d}
+                """.formatted(delta), idempotencyKey);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> errorKeys(HttpResponse<String> r) {
+        assertProblem(r, 400, "validation");
+        return (Map<String, Object>) json(r).get("errors");
+    }
 
     @SuppressWarnings("unchecked")
     private static List<String> skus(Map<String, Object> page) {

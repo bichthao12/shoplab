@@ -4,6 +4,7 @@ import com.shoplab.product.InsufficientStockException;
 import com.shoplab.product.ProductInventory;
 import com.shoplab.product.ProductUnavailableException;
 import com.shoplab.product.ReservedItem;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 
 import java.util.ArrayList;
@@ -28,14 +29,15 @@ import java.util.TreeMap;
  * <ul>
  *   <li>PLAIN_UPDATE: {@code UPDATE products SET stock = ? WHERE id = ?}. Lần ghi sau đè lên lần ghi trước
  *       (lost update): ai cũng mua được, kho chỉ giảm như thể có một người mua.</li>
- *   <li>ENTITY_WITH_VERSION: lưu qua entity Product. {@code @Version} thêm {@code AND version = ?} vào câu UPDATE,
- *       nên lần ghi sau không khớp version → lỗi xung đột, rollback. Không bán vượt, nhưng chỉ người ghi đầu tiên
- *       mua được, dù kho còn đủ cho người khác.</li>
+ *   <li>UPDATE_WITH_VERSION: {@code UPDATE products SET stock = ?, version = version + 1 WHERE id = ? AND version = ?}
+ *       (optimistic lock, giống @Version của entity). Lần ghi sau không khớp version → lỗi xung đột, rollback.
+ *       Không bán vượt, nhưng chỉ người ghi đầu tiên mua được, dù kho còn đủ cho người khác.
+ *       (Không lưu qua entity được: cột stock của Product là updatable = false.)</li>
  * </ul>
  */
 class NaiveProductInventory implements ProductInventory {
 
-    enum SaveMode { PLAIN_UPDATE, ENTITY_WITH_VERSION }
+    enum SaveMode { PLAIN_UPDATE, UPDATE_WITH_VERSION }
 
     private final ProductRepository repo;
     private final JdbcClient jdbc;
@@ -80,9 +82,20 @@ class NaiveProductInventory implements ProductInventory {
                             .param("id", productId)
                             .update();
                 }
-                case ENTITY_WITH_VERSION -> {
-                    p.changeStock(p.getStock() - quantity);   // 3. trừ ở Java
-                    repo.save(p);                             // 4. lưu: lúc commit chạy UPDATE ... WHERE id = ? AND version = ?
+                case UPDATE_WITH_VERSION -> {
+                    int newStock = p.getStock() - quantity;                       // 3. trừ ở Java
+                    int updated = jdbc.sql("""
+                                    UPDATE products SET stock = :stock, version = version + 1
+                                    WHERE id = :id AND version = :version
+                                    """)                                          // 4. lưu, chỉ khi version chưa đổi
+                            .param("stock", newStock)
+                            .param("id", productId)
+                            .param("version", p.getVersion())
+                            .update();
+                    if (updated == 0) {
+                        throw new OptimisticLockingFailureException(
+                                "Sản phẩm id = " + productId + " đã bị sửa sau lần đọc (version " + p.getVersion() + ")");
+                    }
                 }
             }
             reserved.add(new ReservedItem(p.getId(), p.getSku(), p.getName(), p.getPrice(), quantity));

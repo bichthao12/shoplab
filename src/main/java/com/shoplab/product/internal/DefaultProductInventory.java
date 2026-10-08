@@ -24,8 +24,9 @@ import java.util.TreeMap;
  * mới nhất. Không còn đủ hàng thì câu UPDATE không cập nhật dòng nào, và đơn không được tạo.
  *
  * Câu UPDATE chạy thẳng xuống DB, không qua entity Product: nếu cùng transaction đã nạp Product trước đó thì
- * entity đó vẫn giữ số tồn kho cũ. Vì vậy câu UPDATE tăng version: entity cũ đó có bị sửa và lưu lại thì gặp lỗi
- * xung đột (@Version), chứ không ghi đè số tồn kho mới.
+ * entity đó vẫn giữ số tồn kho cũ. Entity đó có bị sửa và lưu lại cũng không ghi đè được kho, vì cột stock
+ * không nằm trong câu UPDATE của entity (updatable = false). Câu UPDATE ở đây không tăng version: version là của
+ * thông tin sản phẩm (sku, tên, giá...), nên đơn hàng không làm PATCH sản phẩm của admin bị 409.
  */
 @Service
 class DefaultProductInventory implements ProductInventory {
@@ -48,7 +49,7 @@ class DefaultProductInventory implements ProductInventory {
 
             List<ReservedItem> updated = jdbc.sql("""
                             UPDATE products
-                            SET stock = stock - :quantity, version = version + 1, updated_at = now()
+                            SET stock = stock - :quantity, updated_at = now()
                             WHERE id = :id AND active AND stock >= :quantity
                             RETURNING id, sku, name, price
                             """)

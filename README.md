@@ -60,7 +60,8 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 - **Bán chớp nhoáng với app đang chạy:** `scripts\flash-sale.ps1` (xem mục *Test bán chớp nhoáng*).
 - **Deadlock chuyển tiền:** `scripts\transfer-deadlock.ps1` (xem mục *Deadlock*).
 - **Lost update khi sửa hồ sơ:** `scripts\profile-lost-update.ps1` (xem mục *Sửa hồ sơ: bắt buộc gửi `version`*).
-- **Lost update khi sửa sản phẩm / tồn kho:** `scripts\product-lost-update.ps1` (xem mục *Sửa sản phẩm: bắt buộc gửi `version`*).
+- **Lost update khi sửa sản phẩm:** `scripts\product-lost-update.ps1` (xem mục *Sửa sản phẩm: bắt buộc gửi `version`*).
+- **Nhập / trừ tồn kho cùng lúc với đơn hàng, gửi lại cùng key:** `scripts\stock-adjustment.ps1` (xem mục *Điều chỉnh tồn kho*).
 - **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
@@ -117,7 +118,8 @@ Mọi request có body dùng `Content-Type: application/json`. Mọi response l�
 | `POST` | `/api/products` | **201** + header `Location` | 400 dữ liệu không hợp lệ · 409 trùng SKU |
 | `GET` | `/api/products/{id}` | **200** | 400 `id` sai kiểu · 404 không tồn tại |
 | `GET` | `/api/products?category=AO&page=0&size=20&sort=price,desc` | **200** (có phân trang) | 400 `sort` theo trường không tồn tại |
-| `PATCH` | `/api/products/{id}` | **200** (chỉ sửa trường được gửi; bắt buộc gửi `version` đã đọc) | 400 dữ liệu không hợp lệ / thiếu `version` · 404 · 409 trùng SKU / sản phẩm đã bị sửa sau lần đọc |
+| `PATCH` | `/api/products/{id}` | **200** (chỉ sửa trường được gửi, trừ `stock`; bắt buộc gửi `version` đã đọc) | 400 dữ liệu không hợp lệ / thiếu `version` / có `stock` · 404 · 409 trùng SKU / sản phẩm đã bị sửa sau lần đọc |
+| `POST` | `/api/products/{id}/stock-adjustments` (bắt buộc header `Idempotency-Key`) | **200** với sản phẩm sau khi cộng / trừ tồn kho | 400 · 404 · 409 trừ quá tồn kho · 422 key đã dùng với `delta` khác |
 | `DELETE` | `/api/products/{id}` | **204** (không có body) | 404 · 409 sản phẩm đã nằm trong đơn hàng |
 
 Ví dụ body tạo sản phẩm:
@@ -141,26 +143,21 @@ Giống sửa hồ sơ người dùng (xem *Sửa hồ sơ: bắt buộc gửi `
 PATCH /api/products/1
 Content-Type: application/json
 
-{ "price": 179000, "stock": 45, "version": 0 }
+{ "price": 179000, "version": 0 }
 ```
 
-Với sản phẩm, lỗi ghi đè còn làm **sai tồn kho**, vì `stock` được gửi lên là con số tuyệt đối:
+**`PATCH` không sửa được `stock`** (gửi lên → 400 với `errors.stock` chỉ sang `stock-adjustments`). Tồn kho có API riêng nhận số tăng / giảm (mục bên dưới), và `version` chỉ là của thông tin sản phẩm (sku, tên, giá, mô tả, category, `active`):
 
-```
-Admin GET        → stock 10, version 0
-Khách đặt 3 cái  → stock 7, version 1   (giữ hàng cũng tăng version)
-Admin nhập thêm 5 cái, tính trên con số đã đọc: PATCH {"stock": 15, "version": 0}
-  → không kiểm tra version: 200, stock = 15, mất 3 cái đã bán → có thể bán vượt 3 cái
-  → hiện tại: 409, stock vẫn 7. Admin tải lại (stock 7, version 1) rồi gửi {"stock": 12, "version": 1} → 200
-```
+- **Đơn hàng không làm đổi `version`.** Admin mở form sửa giá, trong lúc đó có khách mua: admin lưu vẫn được (200), không bị 409 vô cớ dù sản phẩm đang bán chạy.
+- **Không ai ghi đè được tồn kho bằng con số cũ.** Không client nào gửi con số tồn kho tuyệt đối nữa. Trong code, cột `stock` của entity `Product` là `updatable = false`, nên một `Product` nạp từ trước (còn giữ số tồn kho cũ) có bị sửa và lưu lại thì câu `UPDATE` của nó cũng không có cột `stock`.
 
-Đánh đổi: version tính cho **cả dòng** sản phẩm, và mỗi đơn giữ hàng đều tăng version. Sản phẩm đang bán chạy thì sửa tên hay giá cũng dễ gặp 409, dù không đụng tới tồn kho; client chỉ cần tải lại rồi gửi lại. Nếu chuyện này hay xảy ra, có thể tách tồn kho ra API riêng nhận số **tăng / giảm** (`+5`) thay vì con số tuyệt đối.
+Trước khi tách, `PATCH {"stock": 15, "version": 0}` của admin tính trên con số 10 đọc trước khi khách mua 3 cái sẽ ghi kho thành 15, mất 3 cái đã bán. Bắt buộc `version` thì chặn được (409), nhưng mỗi đơn đều tăng `version`, nên sửa tên hay giá của sản phẩm bán chạy cũng hay gặp 409. Tách tồn kho ra giải quyết cả hai.
 
-Test: `patchStockReadBeforeOrder_returns409AndKeepsReservedStock`, `concurrentPatchesWithSameVersion_onlyOneWins`, `patch_withoutVersion_returns400` (`ProductApiIntegrationTests`).
+Test: `orderDoesNotChangeVersion_adminEditReadBeforeOrderSucceeds`, `patchStock_returns400PointingToStockAdjustments`, `concurrentPatchesWithSameVersion_onlyOneWins`, `patch_withoutVersion_returns400` (`ProductApiIntegrationTests`); `staleEntitySaved_doesNotOverwriteStock` (`ProductModuleTests`).
 
 #### Tự chạy với app thật: `scripts/product-lost-update.ps1`
 
-Gọi API của app đang chạy, kiểm tra 3 case, mỗi case một sản phẩm mới: (1) admin sửa tồn kho theo con số đọc trước khi có đơn → 409, kho giữ nguyên; (2) `-Concurrent` PATCH (mặc định 20) cùng gửi version 0, gửi cùng lúc → đúng 1 request 200; (3) PATCH không có `version` → 400.
+Gọi API của app đang chạy, kiểm tra 3 case, mỗi case một sản phẩm mới: (1) admin sửa giá theo version đọc trước khi có đơn → 200, kho giữ đúng số sau đơn; `PATCH` có `stock` → 400; nhập hàng qua `stock-adjustments` → kho cộng đúng; (2) `-Concurrent` PATCH (mặc định 20) cùng gửi version 0, gửi cùng lúc → đúng 1 request 200; (3) PATCH không có `version` → 400.
 
 ```powershell
 # cần app đang chạy (.\mvnw spring-boot:run)
@@ -168,32 +165,101 @@ powershell -ExecutionPolicy Bypass -File .\scripts\product-lost-update.ps1
 ```
 
 ```
-== Case 1: admin sửa tồn kho theo con số đọc trước khi có đơn (lost update)
-   tạo sản phẩm id 29202: version 0, stock 10, price 100000; người mua id 24402
+== Case 1: admin sửa sản phẩm sau khi có đơn, theo version đọc trước khi có đơn
+   tạo sản phẩm id 33705: version 0, stock 10, price 100000; người mua id 26803
    1. Admin GET          → version 0, stock 10, price 100000
-   2. Khách POST /api/orders {"userId":24402,"items":[{"productId":29202,"quantity":3}]}
-            → 201, đơn id 6302; sản phẩm lúc này: version 1, stock 7, price 100000
-   3. Admin nhập thêm 5 cái, tính trên số đã đọc: PATCH {"stock":15,"version":0}
-            → 409 concurrent-modification: Sản phẩm id = 29202 đã bị sửa sau lần bạn đọc (bạn gửi version 0, hiện tại là 1), hãy tải lại rồi sửa lại (expectedVersion 0, currentVersion 1)
-   4. GET lại            → version 1, stock 7, price 100000
-   5. Admin tải lại rồi nhập thêm 5 cái: PATCH {"stock":12,"version":1}
-            → 200, version 2, stock 12, price 100000
-   ĐÚNG: kho không bị ghi đè bằng con số cũ; admin nhận 409, tải lại rồi sửa được
+   2. Khách POST /api/orders {"userId":26803,"items":[{"productId":33705,"quantity":3}]}
+            → 201, đơn id 6962; sản phẩm lúc này: version 0, stock 7, price 100000
+   3. Admin đổi giá, version đọc ở bước 1: PATCH {"price":90000,"version":0}
+            → 200, version 1, stock 7, price 90000
+   4. Admin sửa tồn kho bằng PATCH: {"stock":15,"version":1}
+            → 400 validation: Dữ liệu gửi lên không hợp lệ [errors: stock = không sửa trực tiếp được, dùng POST /api/products/{id}/stock-adjustments]
+   5. Admin nhập thêm 5 cái: POST /api/products/33705/stock-adjustments {"delta":5}
+            → 200, version 1, stock 12, price 90000
+   ĐÚNG: đơn hàng không làm admin bị 409; tồn kho chỉ đổi qua stock-adjustments, kho đúng 7 + 5 = 12
 ...
-ĐÚNG (3/3 case): client gửi version cũ nhận 409, không ai ghi đè tồn kho hay thay đổi của người khác
+ĐÚNG (3/3 case): client gửi version cũ nhận 409, không ai ghi đè thay đổi của người khác
 ```
 
-Cùng script với bản app **trước khi** bắt buộc `version`:
+Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nếu không chạy được (app chưa chạy).
+
+#### Điều chỉnh tồn kho: `POST /api/products/{id}/stock-adjustments`
+
+Cộng (`delta > 0`, vd nhập hàng) hoặc trừ (`delta < 0`, vd hàng hỏng, kiểm kê thiếu) tồn kho. Gửi **số tăng / giảm**, không phải con số tồn kho mới, nên client không cần biết tồn kho hiện tại và không cần `version`.
+
+```http
+POST /api/products/1/stock-adjustments
+Content-Type: application/json
+Idempotency-Key: 6b1f0c2e-3d4a-4f5b-9c8d-7e6f5a4b3c2d
+
+{ "delta": 5 }
+```
+
+→ **200** với sản phẩm sau khi điều chỉnh (`stock` mới; `version` không đổi).
+
+```sql
+UPDATE products SET stock = stock + :delta, updated_at = now()
+WHERE id = :id AND stock + :delta >= 0
+```
+
+- **Một câu `UPDATE` tính trên con số mới nhất trong DB**, giống trừ kho khi đặt hàng. Nhập hàng, đặt hàng chạy cùng lúc thì các câu `UPDATE` lần lượt khoá dòng, câu sau cộng / trừ trên kết quả của câu trước: không mất lượt nào.
+- **Trừ quá số đang có** (`stock + delta < 0`): câu `UPDATE` không cập nhật dòng nào → **409** `insufficient-stock` kèm `requested`, `available`; kho giữ nguyên.
+- **Bắt buộc `Idempotency-Key`** như `POST /api/orders`. Cộng / trừ không tự an toàn khi gửi lại: client gửi `+5`, mạng chập chờn, client gửi lại thì sẽ thành `+10`. Có key thì lần gửi lại nhận nguyên văn response lần đầu (kèm `Idempotent-Replayed: true`), kho chỉ cộng một lần. Cùng key mà `delta` khác → 422 `idempotency-key-reused`.
+- `delta` bắt buộc, khác 0 (`errors.deltaNonZero`), trong khoảng −1.000.000 … 1.000.000. Sản phẩm không tồn tại → 404. Sản phẩm ngừng bán vẫn điều chỉnh được.
+
+60 request gửi cùng lúc (50 lượt nhập +1, 10 đơn mua 1 cái), kho ban đầu 10, với app thật:
+
+| Cách cộng / trừ | Request thành công | Kho sau cùng |
+|---|---|---|
+| `stock = stock + :delta` (hiện tại) | 60/60 | **50** = 10 + 50 − 10 |
+| Đọc tồn kho → cộng ở Java → `UPDATE ... SET stock = :mới` (thử nghiệm) | 60/60 | **11**: 39 lượt bị ghi đè, mà không request nào báo lỗi |
+
+Test: `stockAdjustment_addsAndSubtracts`, `stockAdjustment_belowZero_returns409`, `stockAdjustment_sameKey_appliedOnce`, `stockAdjustment_invalidRequests`, `restocksAndOrdersAtOnce_loseNoUpdate` (`ProductApiIntegrationTests`).
+
+#### Tự chạy với app thật: `scripts/stock-adjustment.ps1`
+
+Kiểm tra 3 case, mỗi case một sản phẩm mới, kho ban đầu 10: (1) `-Restocks` lượt nhập +1 (mặc định 50) và `-Orders` đơn mua 1 cái (mặc định 10) gửi cùng lúc → mọi request thành công, kho = 10 + Restocks − Orders; (2) gửi cùng lượt nhập +5 ba lần với cùng `Idempotency-Key` → kho chỉ cộng 5 một lần, cùng key khác `delta` → 422; (3) trừ quá tồn kho → 409, kho giữ nguyên.
+
+```powershell
+# cần app đang chạy (.\mvnw spring-boot:run)
+powershell -ExecutionPolicy Bypass -File .\scripts\stock-adjustment.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\stock-adjustment.ps1 -Restocks 200 -Orders 100
+```
 
 ```
-   3. Admin nhập thêm 5 cái, tính trên số đã đọc: PATCH {"stock":15,"version":0}
-            → 200, version 2, stock 15, price 100000
-   SAI: admin gửi version cũ mà vẫn 200: kho thành 15, mất 3 cái đã bán (lost update)
-   ...
-   200: 4 (price 1002, price 1006, price 1011, price 1016)
-   SAI: 4 request cùng gửi version 0 đều thành công, mong đợi đúng 1: request sau ghi đè request trước
-   ...
-SAI: case 1, case 2, case 3 không như mong đợi
+== Case 1: 50 lượt nhập +1 và 10 đơn mua 1 cái, gửi cùng lúc
+   tạo sản phẩm id 33702, kho 10; người mua id 26802
+   POST /api/products/33702/stock-adjustments {"delta":1} × 50   |   POST /api/orders (1 cái) × 10
+   xong sau 583 ms
+   nhập hàng 200: 50/50   đặt hàng 201: 10/10
+   kho sau cùng: 50 (mong đợi 10 + 50 - 10 = 50)
+   ĐÚNG: không mất lượt nào: kho = 10 + 50 - 10 = 50
+
+== Case 2: gửi lại cùng một lượt nhập +5 với cùng Idempotency-Key
+   tạo sản phẩm id 33703, kho 10; Idempotency-Key: adj-1791448732-retry
+   lần 1 POST {"delta":5} → 200, stock 15, version 0
+   lần 2 POST {"delta":5} → 200, stock 15, version 0   (Idempotent-Replayed: true)
+   lần 3 POST {"delta":5} → 200, stock 15, version 0   (Idempotent-Replayed: true)
+   cùng key, delta khác POST {"delta":6} → 422 idempotency-key-reused: Idempotency-Key 'adj-1791448732-retry' đã được dùng cho một request có nội dung khác
+   kho sau cùng: 15 (mong đợi 10 + 5 = 15)
+   ĐÚNG: gửi 3 lần nhưng kho chỉ cộng 5 một lần; lần 2, 3 nhận lại nguyên văn response lần đầu
+
+== Case 3: trừ nhiều hơn số đang có
+   tạo sản phẩm id 33704, kho 10
+   POST /api/products/33704/stock-adjustments {"delta":-11}
+            → 409 insufficient-stock: Sản phẩm ADJ-1791448732-3 không đủ hàng: cần 11, còn 10 (requested 11, available 10)
+   kho sau cùng: 10
+   ĐÚNG: bị từ chối với 409, kho giữ nguyên 10
+
+ĐÚNG (3/3 case): điều chỉnh tồn kho không mất lượt nào, không cộng hai lần, không cho kho âm
+```
+
+Cùng script với bản thử nghiệm đọc → cộng ở Java → ghi:
+
+```
+   nhập hàng 200: 50/50   đặt hàng 201: 10/10
+   kho sau cùng: 11 (mong đợi 10 + 50 - 10 = 50)
+   SAI: kho là 11, không khớp 10 + 50 lượt nhập - 10 đơn = 50: có lượt cộng / trừ bị ghi đè (lost update)
 ```
 
 Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nếu không chạy được (app chưa chạy).
@@ -506,7 +572,7 @@ Chuyển tiền khoá hai ví theo thứ tự id tăng dần, xem mục *Deadloc
 
 ```sql
 UPDATE products
-SET stock = stock - :quantity, version = version + 1, updated_at = now()
+SET stock = stock - :quantity, updated_at = now()
 WHERE id = :id AND active AND stock >= :quantity
 RETURNING id, sku, name, price      -- chụp vào dòng đơn
 ```
@@ -514,7 +580,7 @@ RETURNING id, sku, name, price      -- chụp vào dòng đơn
 - **Kiểm tra và trừ nằm trong cùng một câu**, nên không có khoảng hở giữa "đọc" và "ghi". Nhiều đơn cùng trừ một sản phẩm thì PostgreSQL cho các câu UPDATE lần lượt khoá dòng: câu đến sau chờ câu trước commit, rồi kiểm tra lại `stock >= :quantity` trên con số mới nhất.
 - **Cập nhật 0 dòng** (không tồn tại, ngừng bán hoặc không đủ hàng) thì ném lỗi; transaction của đơn rollback, kể cả phần đã trừ của các sản phẩm trước trong cùng đơn, và không đơn nào được tạo. Lý do được đọc lại sau đó để trả đúng lỗi: `invalid-order` (422) hoặc `insufficient-stock` (409).
 - Các sản phẩm của một đơn được trừ theo thứ tự `productId`, nên mọi đơn khoá các dòng theo cùng thứ tự → không deadlock.
-- **`version = version + 1`**: câu UPDATE không đi qua entity, nên `Product` đã nạp trước đó trong cùng transaction vẫn giữ số tồn kho cũ. Tăng version để entity cũ đó nếu bị sửa và lưu lại sẽ gặp lỗi xung đột (`@Version`) thay vì ghi đè số tồn kho mới.
+- **Không tăng `version`**: `version` là của thông tin sản phẩm, nên đơn hàng không làm `PATCH` của admin bị 409. Câu UPDATE không đi qua entity, nên `Product` đã nạp trước đó trong cùng transaction vẫn giữ số tồn kho cũ; entity đó có bị sửa và lưu lại cũng không ghi đè được kho, vì cột `stock` là `updatable = false` (câu UPDATE của entity không có cột này).
 - Đây là chỗ duy nhất quy tắc "không bán quá tồn kho" không nằm trong entity: nó nằm trong câu SQL, vì chỉ DB mới kiểm tra và trừ được trong cùng một bước. Ràng buộc `CHECK (stock >= 0)` của bảng là lớp chặn cuối.
 
 Mỗi phần của câu lệnh đều có test giữ. Thử bỏ từng phần thì:
@@ -523,7 +589,7 @@ Mỗi phần của câu lệnh đều có test giữ. Thử bỏ từng phần t
 |---|---|---|
 | Kiểm tra "đúng 1 dòng" | 1.000 × `201`: **1.000 đơn** cho 1 cái hàng | `FlashSaleIntegrationTests` |
 | Điều kiện `stock >= :quantity` | CHECK của DB chặn kho âm, nhưng 999 người nhận `409 data-integrity` thay vì "hết hàng" | `FlashSaleIntegrationTests` |
-| `version = version + 1` | `Product` nạp trước đó lưu lại được, ghi đè kho về số cũ | `ProductModuleTests` |
+| `updatable = false` của cột `stock` | `Product` nạp trước đó lưu lại được, ghi đè kho về số cũ | `ProductModuleTests` |
 
 ### So với cách "đọc → kiểm tra → trừ ở Java → lưu"
 
@@ -532,7 +598,7 @@ Mỗi phần của câu lệnh đều có test giữ. Thử bỏ từng phần t
 | Cách giữ hàng | Mua được | Lỗi | Kho còn | Vì sao |
 |---|---|---|---|---|
 | Ngây thơ, lưu bằng `UPDATE products SET stock = ?` | **8** | 0 | **4** | Cả 8 cùng đọc 5, cùng thấy còn hàng, cùng ghi 5 − 1 = 4: lần ghi sau đè lần ghi trước (lost update). Bán vượt 3 cái, mà kho vẫn báo còn 4 |
-| Ngây thơ, lưu qua entity (`@Version`) | 1 | 7 xung đột | 4 | `UPDATE ... WHERE id = ? AND version = ?`: người ghi đầu tiên đổi version, 7 người sau không khớp nên rollback. Không bán vượt, nhưng từ chối 7 người dù kho còn 4 |
+| Ngây thơ, lưu kèm kiểm tra version (optimistic lock) | 1 | 7 xung đột | 4 | `UPDATE products SET stock = ?, version = version + 1 WHERE id = ? AND version = ?`: người ghi đầu tiên đổi version, 7 người sau không khớp nên rollback. Không bán vượt, nhưng từ chối 7 người dù kho còn 4 |
 | Bản thật: `UPDATE ... WHERE stock >= ?`, nhận khi cập nhật đúng 1 dòng | **5** | 3 hết hàng | **0** | Kiểm tra và trừ trong cùng một câu; câu sau chờ câu trước commit rồi kiểm tra lại trên con số mới nhất |
 
 Log SQL của bản ngây thơ cho thấy rõ: 8 câu `SELECT` chạy trước, sau đó mới tới 8 câu `UPDATE`. Trong test, bản ngây thơ được giữ lại giữa bước kiểm tra và bước lưu tới khi cả 8 người đã đọc, để kết quả không tuỳ may rủi; bỏ chỗ giữ lại thì trên máy dev vẫn ra đúng kết quả trên (5/5 lần chạy), vì 8 câu `SELECT` xong trước khi câu `UPDATE` đầu tiên kịp chạy.
@@ -766,7 +832,7 @@ Tiền tố: `https://shoplab.dev/errors/`
 | `account-disabled` | 409 | Tài khoản đã vô hiệu hoá, không khoá / mở được |
 | `duplicate-wallet` | 409 | Người dùng đã có ví |
 | `insufficient-balance` | 409 | Ví không đủ tiền |
-| `insufficient-stock` | 409 | Không đủ hàng |
+| `insufficient-stock` | 409 | Không đủ hàng (đặt hàng, hoặc trừ tồn kho quá số đang có) |
 | `concurrent-modification` | 409 | Bản ghi vừa bị request khác sửa (`@Version`), hoặc `version` client gửi đã cũ (kèm `expectedVersion`, `currentVersion`) |
 | `data-integrity` | 409 | Vi phạm ràng buộc dữ liệu (vd xoá sản phẩm đã có trong đơn) |
 | `lock-timeout` / `idempotency-in-progress` | 409 | Đang có request khác xử lý cùng dữ liệu, kèm `Retry-After` |
@@ -810,8 +876,8 @@ Một ứng dụng, một database, nhưng chia thành các module có ranh gi�
 
 | Module | Lo việc gì | API cho module khác | Được phụ thuộc vào |
 |---|---|---|---|
-| `common` | Phần dùng chung (shared kernel) | `ApiException`, `BaseEntity`, `AuditedEntity`, `DbConstraints`, `ValidationPatterns` | (không module nào) |
-| `product` | Danh mục sản phẩm, tồn kho | `ProductInventory` (giữ hàng), `ReservedItem`, `ProductUnavailableException`, `InsufficientStockException`; `ProductReferences` (module khác cài đặt) | `common` |
+| `common` | Phần dùng chung (shared kernel) | `ApiException`, `BaseEntity`, `AuditedEntity`, `DbConstraints`, `StaleVersionException`, `ValidationPatterns` | (không module nào) |
+| `product` | Danh mục sản phẩm, tồn kho (giữ hàng cho đơn, điều chỉnh tồn kho) | `ProductInventory` (giữ hàng), `ReservedItem`, `ProductUnavailableException`, `InsufficientStockException`; `ProductReferences` (module khác cài đặt) | `common`, `idempotency` |
 | `idempotency` | Chạy request ghi đúng một lần theo `Idempotency-Key` | `IdempotencyService` và các exception của nó | `common` |
 | `order` | Đơn hàng | (chưa có) | `common`, `product`, `user`, `idempotency` |
 | `user` | Người dùng: hồ sơ + tài khoản đăng nhập | `UserDirectory` (tra người dùng đang ACTIVE), `UserSummary`, `UserUnavailableException` | `common` |
@@ -820,10 +886,11 @@ Một ứng dụng, một database, nhưng chia thành các module có ranh gi�
 ```
 order   ──► product, user, idempotency
 wallet  ──► user, idempotency
+product ──► idempotency
 mọi module ──► common
 ```
 
-Phụ thuộc chỉ đi một chiều: `product`, `user`, `idempotency` không phụ thuộc module nghiệp vụ nào khác (ngoài `common`).
+Phụ thuộc chỉ đi một chiều: `product`, `user` không phụ thuộc module nghiệp vụ nào khác (`product` chỉ dùng thêm `idempotency`, module hạ tầng); `idempotency` chỉ phụ thuộc `common`.
 
 ### Bố cục bên trong một module
 
@@ -883,14 +950,15 @@ Khoá ngoại chỉ nối các bảng **trong cùng một module** (`order_items
 ```
 src/main/java/com/shoplab/
 ├── ShoplabApplication.java   @Modulithic(sharedModules = "common")
-├── common/         ApiException, BaseEntity, AuditedEntity, DbConstraints, ValidationPatterns
+├── common/         ApiException, BaseEntity, AuditedEntity, DbConstraints, StaleVersionException, ValidationPatterns
 │   ├── config/     JpaAuditingConfig, SchedulingConfig, TransactionLogging
 │   └── web/        GlobalExceptionHandler
 ├── product/        ProductInventory, ReservedItem, ProductUnavailableException, InsufficientStockException,
 │   │               ProductReferences
 │   ├── internal/   Product, ProductRepository, ProductService, DefaultProductInventory,
-│   │               CreateProductCommand, UpdateProductCommand, các exception nội bộ
-│   └── web/        ProductController, CreateProductRequest, PatchProductRequest, ProductResponse
+│   │               CreateProductCommand, UpdateProductCommand, AdjustStockCommand, các exception nội bộ
+│   └── web/        ProductController, CreateProductRequest, PatchProductRequest, StockAdjustmentRequest,
+│                   ProductResponse
 ├── idempotency/    IdempotencyService, các exception của nó
 │   └── internal/   DefaultIdempotencyService, IdempotencyStore, IdempotencyRecord, IdempotencyStatus,
 │                   RequestFingerprint, IdempotencyCleanupJob

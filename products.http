@@ -50,24 +50,57 @@ GET http://localhost:8080/api/products?category=AO&sort=price,desc&page=0&size=1
 ### Sort theo field không tồn tại → 400
 GET http://localhost:8080/api/products?sort=abc
 
-### PATCH: chỉ đổi giá và tồn kho → 200, version tăng (version = version vừa đọc từ GET, bắt buộc)
+### PATCH: đổi giá → 200, version tăng (version = version vừa đọc từ GET, bắt buộc)
 PATCH http://localhost:8080/api/products/1
 Content-Type: application/json
 
-{ "price": 179000, "stock": 45, "version": 0 }
+{ "price": 179000, "version": 0 }
 
 ### PATCH lại với version cũ → 409 concurrent-modification kèm currentVersion, không ghi đè gì
-# (đặt hàng sản phẩm này cũng tăng version: tồn kho đã đọc trước đó không còn đúng)
 PATCH http://localhost:8080/api/products/1
 Content-Type: application/json
 
-{ "stock": 100, "version": 0 }
+{ "name": "Tên sửa trên form cũ", "version": 0 }
+
+### PATCH có stock → 400 (tồn kho chỉ đổi qua stock-adjustments)
+PATCH http://localhost:8080/api/products/1
+Content-Type: application/json
+
+{ "stock": 100, "version": 1 }
 
 ### PATCH sai → 400 (thiếu version cũng là 400, errors.version)
 PATCH http://localhost:8080/api/products/1
 Content-Type: application/json
 
 { "price": -1, "name": "   " }
+
+### Nhập thêm 5 cái → 200, stock + 5, version không đổi (bắt buộc Idempotency-Key)
+POST http://localhost:8080/api/products/1/stock-adjustments
+Content-Type: application/json
+Idempotency-Key: 6b1f0c2e-3d4a-4f5b-9c8d-7e6f5a4b3c2d
+
+{ "delta": 5 }
+
+### Gửi lại đúng request trên (cùng key) → 200, nguyên văn response lần đầu, Idempotent-Replayed: true, kho không cộng thêm
+POST http://localhost:8080/api/products/1/stock-adjustments
+Content-Type: application/json
+Idempotency-Key: 6b1f0c2e-3d4a-4f5b-9c8d-7e6f5a4b3c2d
+
+{ "delta": 5 }
+
+### Trừ 2 cái (hàng hỏng) → 200, stock - 2
+POST http://localhost:8080/api/products/1/stock-adjustments
+Content-Type: application/json
+Idempotency-Key: 0e9d8c7b-6a5f-4e3d-2c1b-0a9f8e7d6c5b
+
+{ "delta": -2 }
+
+### Trừ quá tồn kho → 409 insufficient-stock, kho giữ nguyên
+POST http://localhost:8080/api/products/1/stock-adjustments
+Content-Type: application/json
+Idempotency-Key: 1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d
+
+{ "delta": -100000 }
 
 ### Xoá → 204
 DELETE http://localhost:8080/api/products/2

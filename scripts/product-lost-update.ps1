@@ -1,17 +1,17 @@
 ﻿<#
 .SYNOPSIS
-  Chạy lại test case lost update khi sửa sản phẩm qua API: client gửi version cũ phải nhận 409, không ghi đè tồn kho.
+  Chạy lại test case lost update khi sửa sản phẩm qua API: client gửi version cũ phải nhận 409, không ghi đè ai.
 
 .DESCRIPTION
   Cùng kịch bản với các test PATCH trong ProductApiIntegrationTests, nhưng gọi API của app đang chạy
   (.\mvnw spring-boot:run). PATCH /api/products/{id} phải kèm "version" mà client đã đọc.
   Mỗi case dùng một sản phẩm mới:
 
-    1. Admin sửa tồn kho theo con số đọc trước khi có đơn:
-       Admin GET sản phẩm (stock 10, version 0). Khách đặt 3 cái (stock 7, version 1).
-       Admin nhập thêm 5 cái, tính trên con số đã đọc: PATCH {"stock":15,"version":0}.
-       Mong đợi: 409 concurrent-modification, kho vẫn 7 (không mất 3 cái đã bán).
-       Admin tải lại rồi gửi {"stock":12,"version":1} thì được 200.
+    1. Admin sửa sản phẩm sau khi có đơn, theo version đọc TRƯỚC khi có đơn:
+       Admin GET sản phẩm (stock 10, version 0). Khách đặt 3 cái (stock 7, version vẫn 0: đơn không đổi version).
+       Admin đổi giá với version 0 → mong đợi 200, kho vẫn 7.
+       Admin gửi PATCH có stock → mong đợi 400 (tồn kho không sửa qua PATCH).
+       Admin nhập thêm 5 cái qua POST /api/products/{id}/stock-adjustments {"delta":5} → mong đợi 200, kho 12.
     2. Concurrent request PATCH cùng gửi version 0, gửi CÙNG LÚC:
        Mong đợi: đúng 1 request 200, còn lại 409; sản phẩm mang giá của request thắng, version 1.
     3. PATCH không có version: mong đợi 400 validation, có errors.version.
@@ -120,7 +120,7 @@ try {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
-Write-Host '== Case 1: admin sửa tồn kho theo con số đọc trước khi có đơn (lost update)'
+Write-Host '== Case 1: admin sửa sản phẩm sau khi có đơn, theo version đọc trước khi có đơn'
 $buyer = Invoke-Setup '/api/users' ('{"email":"plu' + $run + '@example.com","fullName":"Khách ' + $run +
         '","username":"plu' + $run + '","password":"matkhau123"}')
 $product = New-Product "PLU-$run-1" 10
@@ -133,39 +133,43 @@ Write-Host "   1. Admin GET          → $(Format-Product $adminView)"
 $orderJson = '{"userId":' + $buyer.id + ',"items":[{"productId":' + $product.id + ',"quantity":3}]}'
 Write-Host "   2. Khách POST /api/orders $orderJson"
 $order = Send-Request 'POST' '/api/orders' $orderJson "plu-$run"
-Write-Host "            → $($order.Code), đơn id $($order.Body.id); sản phẩm lúc này: $(Format-Product (Send-Request 'GET' $path).Body)"
+$afterOrder = (Send-Request 'GET' $path).Body
+Write-Host "            → $($order.Code), đơn id $($order.Body.id); sản phẩm lúc này: $(Format-Product $afterOrder)"
 
-# Admin nhập thêm 5 cái, tính trên con số đã đọc ở bước 1
-$staleJson = '{"stock":' + ($adminView.stock + 5) + ',"version":' + $adminView.version + '}'
-Write-Host "   3. Admin nhập thêm 5 cái, tính trên số đã đọc: PATCH $staleJson"
-$stale = Send-Request 'PATCH' $path $staleJson
-Write-Host "            → $(Format-Result $stale)"
+# Admin đổi giá trên form mở từ bước 1 (version lúc đó)
+$priceJson = '{"price":90000,"version":' + $adminView.version + '}'
+Write-Host "   3. Admin đổi giá, version đọc ở bước 1: PATCH $priceJson"
+$repriced = Send-Request 'PATCH' $path $priceJson
+Write-Host "            → $(Format-Result $repriced)"
 
-$after = (Send-Request 'GET' $path).Body
-Write-Host "   4. GET lại            → $(Format-Product $after)"
+$current = (Send-Request 'GET' $path).Body
+$stockJson = '{"stock":15,"version":' + $current.version + '}'
+Write-Host "   4. Admin sửa tồn kho bằng PATCH: $stockJson"
+$stockPatch = Send-Request 'PATCH' $path $stockJson
+Write-Host "            → $(Format-Result $stockPatch)"
 
-$reloaded = (Send-Request 'GET' $path).Body
-$retryJson = '{"stock":' + ($reloaded.stock + 5) + ',"version":' + $reloaded.version + '}'
-Write-Host "   5. Admin tải lại rồi nhập thêm 5 cái: PATCH $retryJson"
-$retry = Send-Request 'PATCH' $path $retryJson
-Write-Host "            → $(Format-Result $retry)"
+$restockJson = '{"delta":5}'
+Write-Host "   5. Admin nhập thêm 5 cái: POST $path/stock-adjustments $restockJson"
+$restock = Send-Request 'POST' "$path/stock-adjustments" $restockJson "plu-$run-restock"
+Write-Host "            → $(Format-Result $restock)"
 
 $problems = New-Object System.Collections.Generic.List[string]
 if ($order.Code -ne 201) {
     $problems.Add("đặt hàng nhận $($order.Code), mong đợi 201")
 }
-if ($stale.Code -eq 200) {
-    $problems.Add("admin gửi version cũ mà vẫn 200: kho thành $($stale.Body.stock), mất 3 cái đã bán (lost update)")
-} elseif ($stale.Code -ne 409 -or (Get-ProblemType $stale) -ne 'concurrent-modification') {
-    $problems.Add("admin gửi version cũ, mong đợi 409 concurrent-modification, nhận $(Format-Result $stale)")
+if ($afterOrder.version -ne $adminView.version) {
+    $problems.Add("đơn hàng làm đổi version sản phẩm ($($adminView.version) → $($afterOrder.version)): PATCH theo version đọc trước đơn sẽ bị 409")
 }
-if ($after.stock -ne 7) {
-    $problems.Add("sau bước 3 kho là $($after.stock), mong đợi 7 (10 - 3 cái đã bán)")
+if ($repriced.Code -ne 200 -or $repriced.Body.stock -ne 7) {
+    $problems.Add("admin đổi giá với version đọc trước đơn, mong đợi 200 và kho vẫn 7, nhận $(Format-Result $repriced)")
 }
-if ($retry.Code -ne 200 -or $retry.Body.stock -ne 12) {
-    $problems.Add("admin tải lại rồi nhập thêm 5 cái, mong đợi 200 với stock 12, nhận $(Format-Result $retry)")
+if ($stockPatch.Code -ne 400 -or -not $stockPatch.Body.errors.stock) {
+    $problems.Add("PATCH có stock, mong đợi 400 với errors.stock, nhận $(Format-Result $stockPatch)")
 }
-Write-Verdict 'case 1' $problems 'kho không bị ghi đè bằng con số cũ; admin nhận 409, tải lại rồi sửa được'
+if ($restock.Code -ne 200 -or $restock.Body.stock -ne 12) {
+    $problems.Add("nhập thêm 5 cái, mong đợi 200 với stock 12 (7 + 5), nhận $(Format-Result $restock)")
+}
+Write-Verdict 'case 1' $problems 'đơn hàng không làm admin bị 409; tồn kho chỉ đổi qua stock-adjustments, kho đúng 7 + 5 = 12'
 
 # ---------------------------------------------------------------------------------------------------------------
 Write-Host ''
@@ -233,7 +237,7 @@ Write-Verdict 'case 2' $problems "chỉ 1 request thành công ($winnerPrices), 
 Write-Host ''
 Write-Host '== Case 3: PATCH không có version'
 $before = (Send-Request 'GET' $path).Body
-$json = '{"stock":999}'
+$json = '{"price":999}'
 Write-Host "   PATCH $json"
 $result = Send-Request 'PATCH' $path $json
 Write-Host "            → $(Format-Result $result)"
@@ -251,7 +255,7 @@ $client.Dispose()
 
 Write-Host ''
 if ($failedCases.Count -eq 0) {
-    Write-Host 'ĐÚNG (3/3 case): client gửi version cũ nhận 409, không ai ghi đè tồn kho hay thay đổi của người khác' `
+    Write-Host 'ĐÚNG (3/3 case): client gửi version cũ nhận 409, không ai ghi đè thay đổi của người khác' `
         -ForegroundColor Green
     exit 0
 }

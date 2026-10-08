@@ -31,8 +31,9 @@ class ProductTest {
                 new CreateProductCommand("AO-1", "Áo", null, "ao", new BigDecimal("-1"), 1, true)))
                 .isInstanceOf(IllegalArgumentException.class);
 
+        assertThatThrownBy(() -> product(-1)).isInstanceOf(IllegalArgumentException.class);
+
         Product p = product(5);
-        assertThatThrownBy(() -> p.changeStock(-1)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> p.rename(" \t ")).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> p.changeCategory("")).isInstanceOf(IllegalArgumentException.class);
         assertThat(p.getStock()).isEqualTo(5);

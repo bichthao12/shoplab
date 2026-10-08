@@ -2,6 +2,7 @@ package com.shoplab.product;
 
 import com.shoplab.TestcontainersConfiguration;
 import com.shoplab.common.ApiException;
+import com.shoplab.idempotency.IdempotencyService;
 import com.shoplab.product.internal.CreateProductCommand;
 import com.shoplab.product.internal.Product;
 import com.shoplab.product.internal.ProductService;
@@ -10,7 +11,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
-import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.modulith.test.ApplicationModuleTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
@@ -27,7 +27,7 @@ import static org.mockito.Mockito.when;
 /**
  * Test riêng module product: Spring Modulith chỉ dựng module này (kèm module dùng chung common),
  * không có order hay idempotency. Kiểm tra API ProductInventory mà module khác dùng, và API ProductReferences
- * mà module khác cài đặt (ở đây là mock thay cho module order).
+ * mà module khác cài đặt (ở đây là mock thay cho module order). IdempotencyService cũng là mock.
  * Mỗi test chạy trong một transaction và rollback ở cuối (reserveStock bắt buộc có transaction).
  *
  * reserveStock trừ kho bằng câu UPDATE chạy thẳng xuống DB, nên Product đã nạp trước đó trong cùng transaction
@@ -39,6 +39,7 @@ import static org.mockito.Mockito.when;
 class ProductModuleTests {
 
     @MockitoBean ProductReferences references;
+    @MockitoBean IdempotencyService idempotency;   // ProductController cần bean này; test không đi qua HTTP
 
     @Autowired ProductInventory inventory;
     @Autowired ProductService products;
@@ -108,19 +109,24 @@ class ProductModuleTests {
     }
 
     @Test
-    @DisplayName("reserveStock tăng version: Product nạp trước đó (số tồn kho cũ) có lưu lại thì lỗi xung đột, không ghi đè kho")
-    void reserveStock_bumpsVersion_soStaleEntityCannotOverwriteStock() {
+    @DisplayName("Product nạp trước khi giữ hàng (còn số tồn kho cũ) bị sửa và lưu lại → không ghi đè kho; giữ hàng không đổi version")
+    void staleEntitySaved_doesNotOverwriteStock() {
         Product p = products.create(new CreateProductCommand(
                 "MODULE-006", "Áo", null, "ao", BigDecimal.ONE, 10, true));   // entity này giữ stock = 10
 
-        inventory.reserveStock(Map.of(p.getId(), 3));                        // DB: stock = 7, version + 1
+        inventory.reserveStock(Map.of(p.getId(), 3));                        // DB: stock = 7, version vẫn 0
+        assertThat(versionInDb(p.getId())).isZero();
 
-        // p vẫn là entity trong transaction này (version 0), nên bước so version với client qua được;
-        // @Version chặn lúc ghi: UPDATE ... WHERE version = 0 không khớp dòng nào
-        assertThatThrownBy(() -> products.update(p.getId(),
-                new UpdateProductCommand(null, "Tên mới", null, null, null, null, null, p.getVersion())))
-                .isInstanceOf(OptimisticLockingFailureException.class);
+        // p vẫn là entity trong transaction này, còn giữ stock = 10. Lưu lại thành công (version khớp),
+        // nhưng câu UPDATE của entity không có cột stock (updatable = false) nên không ghi đè số 7.
+        products.update(p.getId(), new UpdateProductCommand(null, "Tên mới", null, null, null, null, p.getVersion()));
+
         assertThat(stockInDb(p.getId())).isEqualTo(7);
+        assertThat(versionInDb(p.getId())).isEqualTo(1);
+    }
+
+    private long versionInDb(long productId) {
+        return jdbc.sql("SELECT version FROM products WHERE id = :id").param("id", productId).query(Long.class).single();
     }
 
     private int stockInDb(long productId) {

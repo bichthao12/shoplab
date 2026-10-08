@@ -1,5 +1,7 @@
 package com.shoplab.product.web;
 
+import com.shoplab.idempotency.IdempotencyService;
+import com.shoplab.product.internal.AdjustStockCommand;
 import com.shoplab.product.internal.ProductService;
 import jakarta.validation.Valid;
 import org.springframework.data.domain.Pageable;
@@ -14,6 +16,7 @@ import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -28,9 +31,11 @@ import java.net.URI;
 public class ProductController {
 
     private final ProductService service;
+    private final IdempotencyService idempotency;
 
-    public ProductController(ProductService service) {
+    public ProductController(ProductService service, IdempotencyService idempotency) {
         this.service = service;
+        this.idempotency = idempotency;
     }
 
     /** POST /api/products → 201 Created + header Location */
@@ -62,6 +67,22 @@ public class ProductController {
     @PatchMapping("/{id}")
     public ProductResponse patch(@PathVariable Long id, @Valid @RequestBody PatchProductRequest req) {
         return ProductResponse.from(service.update(id, req.toCommand()));
+    }
+
+    /**
+     * POST /api/products/{id}/stock-adjustments (bắt buộc Idempotency-Key) → 200 với sản phẩm sau khi điều chỉnh.
+     * Body {"delta": 5} cộng 5, {"delta": -2} trừ 2. Trừ quá tồn kho → 409 insufficient-stock, kho giữ nguyên.
+     * Gửi lại cùng key (vd sau khi mạng chập chờn) → nhận lại response lần đầu, kho không bị cộng / trừ lần nữa.
+     */
+    @PostMapping("/{id}/stock-adjustments")
+    public ResponseEntity<String> adjustStock(
+            @RequestHeader(IdempotencyService.HEADER) String idempotencyKey,
+            @PathVariable long id,
+            @Valid @RequestBody StockAdjustmentRequest req) {
+
+        AdjustStockCommand command = req.toCommand(id);
+        return idempotency.execute(idempotencyKey, command,
+                () -> ResponseEntity.ok(ProductResponse.from(service.adjustStock(command))));
     }
 
     /** DELETE /api/products/{id} → 204 No Content */

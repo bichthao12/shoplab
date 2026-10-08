@@ -34,7 +34,12 @@ public class Product extends AuditedEntity {
     @Column(nullable = false, precision = 12, scale = 2)
     private BigDecimal price;
 
-    @Column(nullable = false)
+    /**
+     * Chỉ ghi lúc INSERT. Sau đó tồn kho chỉ đổi bằng câu UPDATE cộng / trừ thẳng trên DB (giữ hàng cho đơn,
+     * điều chỉnh tồn kho), không qua entity. Nhờ updatable = false, câu UPDATE của entity không có cột stock:
+     * Product nạp từ trước (còn giữ số tồn kho cũ) có bị sửa và lưu lại cũng không ghi đè được kho.
+     */
+    @Column(nullable = false, updatable = false)
     private int stock;
 
     @Column(nullable = false)
@@ -70,7 +75,6 @@ public class Product extends AuditedEntity {
     void changeDescription(String description) { this.description = description; }
     void changeCategory(String category)       { this.category = validCategory(category); }
     void changePrice(BigDecimal price)         { this.price = validPrice(price); }
-    void changeStock(int stock)                { this.stock = validStock(stock); }
     void changeActive(boolean active)          { this.active = active; }
 
     // ---------- Quy tắc chuẩn hoá: định nghĩa MỘT lần, dùng được cả khi chưa có entity ----------

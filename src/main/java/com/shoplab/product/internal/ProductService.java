@@ -2,6 +2,7 @@ package com.shoplab.product.internal;
 
 import com.shoplab.common.DbConstraints;
 import com.shoplab.common.StaleVersionException;
+import com.shoplab.product.InsufficientStockException;
 import com.shoplab.product.ProductReferences;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -55,7 +56,7 @@ public class ProductService {
     // ---------- UPDATE (cập nhật một phần) ----------
     /**
      * Sửa sản phẩm, chỉ khi client đang sửa đúng version hiện tại. Hai lớp chặn, cùng trả 409 concurrent-modification:
-     *  - client gửi version cũ (đã có người sửa, hoặc đã có đơn giữ hàng, sau lần client đọc) → StaleVersionException;
+     *  - client gửi version cũ (đã có người sửa sau lần client đọc) → StaleVersionException;
      *  - có người sửa xen vào giữa lúc kiểm tra và lúc ghi → UPDATE ... WHERE version = ? không khớp dòng nào,
      *    Hibernate báo ObjectOptimisticLockingFailureException.
      */
@@ -76,11 +77,27 @@ public class ProductService {
         if (changes.description() != null) p.changeDescription(changes.description());
         if (changes.category() != null)    p.changeCategory(changes.category());
         if (changes.price() != null)       p.changePrice(changes.price());
-        if (changes.stock() != null)       p.changeStock(changes.stock());
         if (changes.active() != null)      p.changeActive(changes.active());
 
         // flush ngay để version và updatedAt trả về là giá trị mới
         return saveAndFlush(p);
+    }
+
+    // ---------- TỒN KHO: cộng / trừ một lượng ----------
+    /**
+     * Cộng (delta > 0, nhập hàng) hoặc trừ (delta < 0, hàng hỏng, kiểm kê thiếu...) tồn kho bằng MỘT câu UPDATE
+     * {@code stock = stock + delta}: tính trên con số mới nhất trong DB, nên không ghi đè lượt giữ hàng hay lượt
+     * điều chỉnh nào chạy cùng lúc, và không cần version. Trừ quá số đang có → InsufficientStockException (409),
+     * kho giữ nguyên. Gửi lại cùng một lượt điều chỉnh không bị cộng hai lần là nhờ Idempotency-Key ở controller.
+     */
+    @Transactional
+    public Product adjustStock(AdjustStockCommand command) {
+        int updated = repo.adjustStock(command.productId(), command.delta());
+        Product p = findOrThrow(command.productId());   // đọc sau câu UPDATE: thấy tồn kho mới
+        if (updated == 0) {
+            throw new InsufficientStockException(p.getSku(), -command.delta(), p.getStock());
+        }
+        return p;
     }
 
     // ---------- DELETE ----------

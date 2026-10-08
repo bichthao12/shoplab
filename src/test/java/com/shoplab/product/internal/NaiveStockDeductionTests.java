@@ -50,12 +50,12 @@ class NaiveStockDeductionTests extends IntegrationTestBase {
     }
 
     @Test
-    @DisplayName("Ngây thơ, lưu qua entity có @Version: không bán vượt, nhưng chỉ 1 người mua được, 7 người lỗi xung đột dù kho còn 4")
-    void naive_entityWithVersion_rejectsAllButFirstWriter() throws Exception {
+    @DisplayName("Ngây thơ, lưu bằng UPDATE ... WHERE version = ? (optimistic lock): không bán vượt, nhưng chỉ 1 người mua được, 7 người lỗi xung đột dù kho còn 4")
+    void naive_updateWithVersion_rejectsAllButFirstWriter() throws Exception {
         long productId = createProduct("NAIVE-002", 100_000, STOCK);
-        ProductInventory naive = new NaiveProductInventory(repo, jdbc, SaveMode.ENTITY_WITH_VERSION, waitUntilAllHaveRead());
+        ProductInventory naive = new NaiveProductInventory(repo, jdbc, SaveMode.UPDATE_WITH_VERSION, waitUntilAllHaveRead());
 
-        List<Outcome> outcomes = Concurrently.run(BUYERS, i -> buy(naive, "naive-entity #" + i, productId));
+        List<Outcome> outcomes = Concurrently.run(BUYERS, i -> buy(naive, "naive-version #" + i, productId));
 
         assertThat(count(outcomes, Outcome.BOUGHT)).isEqualTo(1);
         assertThat(count(outcomes, Outcome.CONFLICT)).isEqualTo(BUYERS - 1);
