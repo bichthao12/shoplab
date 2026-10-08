@@ -48,7 +48,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
@@ -222,6 +222,18 @@ Content-Type: application/json
 | 405 | Method không hỗ trợ (vd `PUT /api/products/1`) |
 | 415 | `Content-Type` không phải `application/json` |
 | 500 | Lỗi không lường trước (chi tiết chỉ ghi log, không trả ra ngoài) |
+
+### Vì sao trừ kho phải khoá trước
+
+`NaiveStockDeductionTests` so sánh bản thật với một bản "ngây thơ" (`NaiveProductInventory`, chỉ có trong test): đọc tồn kho → kiểm tra còn hàng → trừ ở Java → lưu, không khoá gì. Kịch bản: 8 người cùng mua 1 cái, kho còn 5.
+
+| Cách giữ hàng | Mua được | Lỗi | Kho còn | Vì sao |
+|---|---|---|---|---|
+| Ngây thơ, lưu bằng `UPDATE products SET stock = ?` | **8** | 0 | **4** | Cả 8 cùng đọc 5, cùng thấy còn hàng, cùng ghi 5 − 1 = 4: lần ghi sau đè lần ghi trước (lost update). Bán vượt 3 cái, mà kho vẫn báo còn 4 |
+| Ngây thơ, lưu qua entity (`@Version`) | 1 | 7 xung đột | 4 | `UPDATE ... WHERE id = ? AND version = ?`: người ghi đầu tiên đổi version, 7 người sau không khớp nên rollback. Không bán vượt, nhưng từ chối 7 người dù kho còn 4 |
+| Bản thật: `SELECT ... FOR UPDATE` rồi mới kiểm tra | **5** | 3 hết hàng | **0** | Người sau chờ người trước commit rồi mới đọc, nên luôn đọc con số mới nhất |
+
+Log SQL của bản ngây thơ cho thấy rõ: 8 câu `SELECT` chạy trước, sau đó mới tới 8 câu `UPDATE`. Trong test, bản ngây thơ được giữ lại giữa bước kiểm tra và bước lưu tới khi cả 8 người đã đọc, để kết quả không tuỳ may rủi; bỏ chỗ giữ lại thì trên máy dev vẫn ra đúng kết quả trên (5/5 lần chạy), vì 8 câu `SELECT` xong trước khi câu `UPDATE` đầu tiên kịp chạy.
 
 ### Cách hoạt động của Idempotency
 
@@ -461,7 +473,8 @@ src/test/java/com/shoplab/
 │   ├── internal/       OrderTest, CreateOrderCommandTest
 │   └── web/            OrderApiIntegrationTests, OrderIdempotencyIntegrationTests
 ├── product/            ProductModuleTests
-│   ├── internal/       ProductTest, ProductRepositoryTests
+│   ├── internal/       ProductTest, ProductRepositoryTests,
+│   │                   NaiveProductInventory + NaiveStockDeductionTests (bản trừ kho ngây thơ, để so sánh)
 │   └── web/            ProductApiIntegrationTests
 └── user/               UserModuleTests
     ├── internal/       UserTest
