@@ -1,6 +1,5 @@
 package com.shoplab.product.internal;
 
-import com.shoplab.product.InsufficientStockException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -38,37 +37,6 @@ class ProductTest {
         assertThatThrownBy(() -> p.changeCategory("")).isInstanceOf(IllegalArgumentException.class);
         assertThat(p.getStock()).isEqualTo(5);
         assertThat(p.getName()).isEqualTo("Áo thun");
-    }
-
-    @Test
-    @DisplayName("deductStock trừ đúng số lượng")
-    void deductStock_reducesStock() {
-        Product p = product(10);
-
-        p.deductStock(3);
-
-        assertThat(p.getStock()).isEqualTo(7);
-    }
-
-    @Test
-    @DisplayName("Không đủ hàng → InsufficientStockException, kho giữ nguyên")
-    void deductStock_insufficient_throwsAndKeepsStock() {
-        Product p = product(2);
-
-        assertThatThrownBy(() -> p.deductStock(3))
-                .isInstanceOf(InsufficientStockException.class)
-                .hasMessageContaining("cần 3, còn 2");
-        assertThat(p.getStock()).isEqualTo(2);
-    }
-
-    @Test
-    @DisplayName("Số lượng ≤ 0 bị từ chối (không thể dùng deductStock để cộng kho)")
-    void deductStock_nonPositiveQuantity_isRejected() {
-        Product p = product(5);
-
-        assertThatThrownBy(() -> p.deductStock(0)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> p.deductStock(-1)).isInstanceOf(IllegalArgumentException.class);
-        assertThat(p.getStock()).isEqualTo(5);
     }
 
     private static Product product(int stock) {

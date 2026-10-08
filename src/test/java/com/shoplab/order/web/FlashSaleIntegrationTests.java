@@ -11,7 +11,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Bán chớp nhoáng: 1.000 lượt mua cùng lúc qua POST /api/orders, sản phẩm chỉ còn 1 cái.
- * Đi qua toàn bộ luồng thật: HTTP → idempotency → kiểm tra người đặt → giữ hàng (SELECT ... FOR UPDATE) → tạo đơn.
+ * Đi qua toàn bộ luồng thật: HTTP → idempotency → kiểm tra người đặt → giữ hàng (UPDATE có điều kiện) → tạo đơn.
  */
 // 1.000 request × ~15 dòng log SQL / transaction thì không đọc được nữa: tắt riêng cho test này
 @TestPropertySource(properties = {"logging.level.sql=INFO", "logging.level.tx=INFO"})

@@ -81,8 +81,8 @@ class NaiveProductInventory implements ProductInventory {
                             .update();
                 }
                 case ENTITY_WITH_VERSION -> {
-                    p.deductStock(quantity);   // 3. trừ ở Java
-                    repo.save(p);              // 4. lưu: lúc commit chạy UPDATE ... WHERE id = ? AND version = ?
+                    p.changeStock(p.getStock() - quantity);   // 3. trừ ở Java
+                    repo.save(p);                             // 4. lưu: lúc commit chạy UPDATE ... WHERE id = ? AND version = ?
                 }
             }
             reserved.add(new ReservedItem(p.getId(), p.getSku(), p.getName(), p.getPrice(), quantity));

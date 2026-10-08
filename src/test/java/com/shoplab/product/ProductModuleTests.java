@@ -5,10 +5,13 @@ import com.shoplab.common.ApiException;
 import com.shoplab.product.internal.CreateProductCommand;
 import com.shoplab.product.internal.Product;
 import com.shoplab.product.internal.ProductService;
+import com.shoplab.product.internal.UpdateProductCommand;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
+import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.modulith.test.ApplicationModuleTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,6 +29,9 @@ import static org.mockito.Mockito.when;
  * không có order hay idempotency. Kiểm tra API ProductInventory mà module khác dùng, và API ProductReferences
  * mà module khác cài đặt (ở đây là mock thay cho module order).
  * Mỗi test chạy trong một transaction và rollback ở cuối (reserveStock bắt buộc có transaction).
+ *
+ * reserveStock trừ kho bằng câu UPDATE chạy thẳng xuống DB, nên Product đã nạp trước đó trong cùng transaction
+ * vẫn giữ số cũ: test đọc tồn kho bằng SQL (stockInDb) thay vì qua ProductService.
  */
 @ApplicationModuleTest
 @Import(TestcontainersConfiguration.class)
@@ -36,6 +42,7 @@ class ProductModuleTests {
 
     @Autowired ProductInventory inventory;
     @Autowired ProductService products;
+    @Autowired JdbcClient jdbc;
 
     @Test
     @DisplayName("reserveStock trừ kho và trả sku, tên, giá tại thời điểm giữ hàng")
@@ -47,7 +54,7 @@ class ProductModuleTests {
 
         assertThat(reserved).containsExactly(
                 new ReservedItem(p.getId(), "MODULE-001", "Áo thun", new BigDecimal("100.00"), 3));
-        assertThat(products.getById(p.getId()).getStock()).isEqualTo(7);
+        assertThat(stockInDb(p.getId())).isEqualTo(7);
     }
 
     @Test
@@ -70,7 +77,7 @@ class ProductModuleTests {
 
         assertThatThrownBy(() -> inventory.reserveStock(Map.of(p.getId(), 3)))
                 .isInstanceOf(InsufficientStockException.class);
-        assertThat(products.getById(p.getId()).getStock()).isEqualTo(2);
+        assertThat(stockInDb(p.getId())).isEqualTo(2);
     }
 
     @Test
@@ -98,5 +105,23 @@ class ProductModuleTests {
         products.delete(p.getId());
 
         assertThatThrownBy(() -> products.getById(p.getId())).isInstanceOf(ApiException.class);
+    }
+
+    @Test
+    @DisplayName("reserveStock tăng version: Product nạp trước đó (số tồn kho cũ) có lưu lại thì lỗi xung đột, không ghi đè kho")
+    void reserveStock_bumpsVersion_soStaleEntityCannotOverwriteStock() {
+        Product p = products.create(new CreateProductCommand(
+                "MODULE-006", "Áo", null, "ao", BigDecimal.ONE, 10, true));   // entity này giữ stock = 10
+
+        inventory.reserveStock(Map.of(p.getId(), 3));                        // DB: stock = 7, version + 1
+
+        assertThatThrownBy(() -> products.update(p.getId(),
+                new UpdateProductCommand(null, "Tên mới", null, null, null, null, null)))
+                .isInstanceOf(OptimisticLockingFailureException.class);
+        assertThat(stockInDb(p.getId())).isEqualTo(7);
+    }
+
+    private int stockInDb(long productId) {
+        return jdbc.sql("SELECT stock FROM products WHERE id = :id").param("id", productId).query(Integer.class).single();
     }
 }

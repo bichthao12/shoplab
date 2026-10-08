@@ -1,7 +1,6 @@
 package com.shoplab.product.internal;
 
 import com.shoplab.common.AuditedEntity;
-import com.shoplab.product.InsufficientStockException;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.SequenceGenerator;
@@ -73,17 +72,6 @@ public class Product extends AuditedEntity {
     void changePrice(BigDecimal price)         { this.price = validPrice(price); }
     void changeStock(int stock)                { this.stock = validStock(stock); }
     void changeActive(boolean active)          { this.active = active; }
-
-    /**
-     * Trừ kho khi bán. Kho không bao giờ âm: không đủ hàng → InsufficientStockException, kho giữ nguyên.
-     */
-    void deductStock(int quantity) {
-        Assert.isTrue(quantity > 0, () -> "quantity phải > 0, nhận được " + quantity);
-        if (stock < quantity) {
-            throw new InsufficientStockException(sku, quantity, stock);
-        }
-        stock -= quantity;
-    }
 
     // ---------- Quy tắc chuẩn hoá: định nghĩa MỘT lần, dùng được cả khi chưa có entity ----------
     // strip() bỏ đúng những ký tự mà @NotBlank coi là khoảng trắng, nên request qua validation luôn còn dữ liệu.

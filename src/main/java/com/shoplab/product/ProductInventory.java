@@ -9,8 +9,9 @@ import java.util.Map;
 public interface ProductInventory {
 
     /**
-     * Khoá các sản phẩm, kiểm tra rồi trừ kho, xử lý theo thứ tự productId.
-     * Bắt buộc chạy trong transaction của bên gọi: khoá được giữ tới khi bên gọi commit/rollback,
+     * Trừ kho từng sản phẩm theo thứ tự productId, mỗi sản phẩm bằng một câu UPDATE có điều kiện
+     * (chỉ trừ khi đang bán và còn đủ hàng). Sản phẩm nào không trừ được thì ném lỗi, không trả về gì.
+     * Bắt buộc chạy trong transaction của bên gọi: dòng sản phẩm bị khoá tới khi bên gọi commit/rollback,
      * nên đơn hàng và việc trừ kho cùng thành công hoặc cùng huỷ.
      *
      * @param quantities productId → số lượng cần giữ

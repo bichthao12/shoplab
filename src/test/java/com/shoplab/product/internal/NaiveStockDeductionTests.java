@@ -63,10 +63,10 @@ class NaiveStockDeductionTests extends IntegrationTestBase {
     }
 
     @Test
-    @DisplayName("Bản thật (SELECT ... FOR UPDATE rồi mới kiểm tra): đúng 5 người mua được, 3 người hết hàng, kho về 0")
-    void real_lockThenCheck_sellsExactlyTheStock() throws Exception {
+    @DisplayName("Bản thật (UPDATE ... WHERE stock >= ?, chỉ nhận khi cập nhật đúng 1 dòng): đúng 5 người mua được, 3 người hết hàng, kho về 0")
+    void real_conditionalUpdate_sellsExactlyTheStock() throws Exception {
         long productId = createProduct("NAIVE-003", 100_000, STOCK);
-        ProductInventory real = new DefaultProductInventory(repo);
+        ProductInventory real = new DefaultProductInventory(jdbc);
 
         List<Outcome> outcomes = Concurrently.run(BUYERS, i -> buy(real, "real #" + i, productId));
 
