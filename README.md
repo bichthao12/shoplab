@@ -48,7 +48,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests`, `WalletModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `WalletApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `SelfInvocationTrapTests`, `WalletApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
@@ -747,6 +747,65 @@ SAI: 13/20 vòng không như mong đợi, 13 lượt bị huỷ vì deadlock (ap
 
 13/20 vòng bị deadlock (lượt thua chờ đúng ~1 giây rồi nhận `409 deadlock`), 7 vòng còn lại "qua" nhờ may. Một vòng có thể bỏ sót lỗi; `-Runs 10` thì gần như chắc chắn bắt được. Muốn xem chi tiết từng bước khoá của bản sai, chạy `.\mvnw test -Dtest=TransferDeadlockTests` và đọc log (`BEGIN` / `SELECT ... FOR UPDATE` / `deadlock detected` / `ROLLBACK`).
 
+### Bẫy @Transactional: gọi nội bộ (self-invocation)
+
+Method `@Transactional` được gọi từ **một method khác trong cùng class** thì không có transaction nào được mở. `@Transactional` chạy nhờ **proxy**: Spring đưa cho nơi khác một object bọc ngoài service, proxy mở transaction rồi mới gọi vào method thật. `this.transfer(...)` là lời gọi từ bên trong object thật, không đi qua proxy:
+
+```
+bên ngoài ──► proxy ──(BEGIN)──► transfer()                         có transaction
+bên ngoài ──► proxy ──► transferAll() ──this.transfer()──► transfer()   KHÔNG có transaction
+```
+
+`SelfInvocationTrapTests` tái hiện bằng `BatchTransferService` (chỉ có trong test): chuyển tiền hàng loạt (vd trả lương), mỗi lượt phải là một transaction riêng. `transferAll` gọi `this.transfer(...)`; `transfer` có `@Transactional`, trừ ví nguồn rồi `save`, sau đó mới tìm ví đích. Ví A có 100, chuyển hai lượt: A → ví không tồn tại 30 (lỗi ở bước tìm ví đích), rồi A → B 10.
+
+| Cách gọi `transfer` | Có transaction? | Sau lượt lỗi (A → ví không tồn tại, 30) | Sau cả 2 lượt: A / B / tổng |
+|---|---|---|---|
+| `batch.transfer(...)` từ bên ngoài (qua proxy) | Có | Rollback, A vẫn 100 | (test chỉ chạy lượt lỗi) |
+| `transferAll` → `this.transfer(...)` (**bẫy**) | **Không** | **A = 70**: phần trừ 30 đã commit | **60** / 110 / **170**: mất 30 |
+| `transferAllEachInOwnTransaction`: mỗi lượt trong `TransactionTemplate` (**sửa**) | Có | Rollback, A vẫn 100 | 90 / 110 / **200** |
+
+**Vì sao mất tiền mà không ai biết:** không có transaction thì mỗi lời gọi repository của Spring Data (`findById`, `save`) tự mở transaction riêng và **commit ngay**. Log `tx` của lượt lỗi khi gọi nội bộ, không có `BEGIN BatchTransferService.transfer` nào:
+
+```
+BEGIN    SimpleJpaRepository.findById (read-only)      ← tìm ví A
+COMMIT   SimpleJpaRepository.findById
+BEGIN    SimpleJpaRepository.save                      ← lưu ví A đã trừ 30
+update wallets set balance=?, ... where id=? and version=?
+COMMIT   SimpleJpaRepository.save                      ← đã commit, không rollback được nữa
+BEGIN    SimpleJpaRepository.findById (read-only)      ← tìm ví đích: không có → ném lỗi
+COMMIT   SimpleJpaRepository.findById
+```
+
+Gọi qua proxy (hoặc qua `TransactionTemplate`) thì cả lượt nằm trong một transaction, `save` chưa ghi gì xuống DB cho tới lúc commit:
+
+```
+BEGIN    BatchTransferService.transfer
+select ... from wallets ...                             ← tìm ví A
+select ... from wallets ...                             ← tìm ví đích: không có → ném lỗi
+ROLLBACK BatchTransferService.transfer                  ← chưa có UPDATE nào, A giữ nguyên
+```
+
+**Code thật:** đã quét mọi class có `@Transactional` trong `src/main`, không chỗ nào gọi nội bộ một method `@Transactional`. Nếu `WalletService.transfer` bị gọi kiểu đó (test giả lập bằng cách gọi thẳng vào object thật bên trong proxy, `AopTestUtils.getTargetObject`), nó lỗi ngay `TransactionRequiredException: No active transaction` ở câu khoá `SELECT ... FOR UPDATE` (khoá dòng bắt buộc có transaction), trước khi đổi gì. Đó là may mắn, không phải được thiết kế để chặn: viết theo kiểu `findById` + `save` như `BatchTransferService` thì lặng lẽ mất tiền.
+
+**Cách sửa**, từ hay dùng nhất:
+
+1. **Tách method `@Transactional` sang bean khác** rồi gọi qua bean đó (vd `transferAll` ở một class, gọi `walletService.transfer(...)`): lời gọi đi qua proxy.
+2. **Tự mở transaction bằng `TransactionTemplate`** cho từng lượt (cách test dùng): rõ ràng, không phụ thuộc proxy.
+3. Tự inject chính mình (`@Lazy` + gọi `self.transfer(...)`) hoặc `AopContext.currentProxy()`: chạy được nhưng khó đọc, dễ bị người sau "dọn" mất.
+
+Bẫy này áp dụng cho mọi annotation chạy nhờ proxy: `@Transactional`, `@Async`, `@Cacheable`, `@Retryable`...; method `private` thì không bao giờ qua proxy.
+
+"Phá" để chắc test bắt được lỗi:
+
+| Phá | Test fail |
+|---|---|
+| Bản sửa gọi thẳng `transfer(...)`, bỏ `TransactionTemplate` | `transferAllEachInOwnTransaction_keepsMoney`: A expected 90.00 but was **60.00** |
+| Bỏ `@Transactional` trên `transfer` | `transfer_calledThroughProxy_rollsBack`: không còn proxy, lượt lỗi không rollback |
+
+```bash
+./mvnw test -Dtest=SelfInvocationTrapTests
+```
+
 ### Cách hoạt động của Idempotency
 
 Bảng `idempotency_keys`: `idem_key` (khoá chính), `request_hash`, `status`, `response_status`, `response_headers` (JSONB, vd `Location`), `response_body` (TEXT, nguyên văn chuỗi JSON đã trả), `created_at`.
@@ -1011,6 +1070,7 @@ src/test/java/com/shoplab/
 │   └── web/            UserApiIntegrationTests
 └── wallet/             WalletModuleTests
     ├── internal/       NaiveWalletTransfer + TransferDeadlockTests (deadlock khi khoá theo tham số,
-    │                   không deadlock khi khoá theo id)
+    │                   không deadlock khi khoá theo id); BatchTransferService + SelfInvocationTrapTests
+    │                   (bẫy gọi nội bộ @Transactional)
     └── web/            WalletApiIntegrationTests
 ```
