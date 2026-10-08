@@ -1,6 +1,7 @@
 package com.shoplab.order.internal;
 
 import com.shoplab.product.ReservedItem;
+import com.shoplab.user.UserSummary;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -14,20 +15,22 @@ import static org.assertj.core.api.Assertions.tuple;
 class OrderTest {
 
     @Test
-    @DisplayName("Tạo đơn: tên bỏ khoảng trắng đầu/cuối, email về chữ thường; không cho để trống")
-    void constructor_normalizesCustomer() {
-        Order order = new Order("  Nguyễn Văn A ", " A.Nguyen@Example.COM ");
+    @DisplayName("Tạo đơn: gắn userId, chụp tên và email người đặt; thiếu tên / email → lỗi lập trình")
+    void constructor_snapshotsCustomer() {
+        Order order = new Order(new UserSummary(7L, "Nguyễn Văn A", "a.nguyen@example.com"));
 
+        assertThat(order.getUserId()).isEqualTo(7L);
         assertThat(order.getCustomerName()).isEqualTo("Nguyễn Văn A");
         assertThat(order.getCustomerEmail()).isEqualTo("a.nguyen@example.com");
         assertThat(order.getStatus()).isEqualTo(OrderStatus.PENDING);
-        assertThatThrownBy(() -> new Order(" ", "a@x.com")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Order(new UserSummary(7L, " ", "a@x.com")))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     @DisplayName("addItem chụp sku, tên, giá lúc đặt và cộng dồn tổng tiền (2 chữ số thập phân)")
     void addItem_snapshotsProductAndAddsUpTotal() {
-        Order order = new Order("Nguyễn Văn A", "a@example.com");
+        Order order = new Order(new UserSummary(7L, "Nguyễn Văn A", "a@example.com"));
 
         order.addItem(new ReservedItem(1L, "AO-1", "Áo thun", new BigDecimal("100000.00"), 2));
         order.addItem(new ReservedItem(2L, "QUAN-1", "Quần jean", new BigDecimal("50000.50"), 3));

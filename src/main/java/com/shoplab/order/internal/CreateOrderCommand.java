@@ -7,16 +7,15 @@ import java.util.TreeMap;
 
 /**
  * Dữ liệu đặt hàng đã chuẩn hoá: đầu vào của OrderService, đồng thời là "dạng chuẩn" để idempotency
- * so sánh hai request. Cùng nội dung (khác thứ tự dòng, tách dòng, khác hoa/thường email) → cùng command.
+ * so sánh hai request. Cùng nội dung (khác thứ tự dòng, tách dòng) → cùng command.
  * Không phụ thuộc HTTP: tầng web tự chuyển request sang command (CreateOrderRequest.toCommand).
  *
+ * @param userId     người đặt; tên, email lấy từ hồ sơ của người này lúc đặt
  * @param quantities productId → tổng số lượng, sắp theo productId
  */
-public record CreateOrderCommand(String customerName, String customerEmail, SortedMap<Long, Integer> quantities) {
+public record CreateOrderCommand(long userId, SortedMap<Long, Integer> quantities) {
 
     public CreateOrderCommand {
-        customerName = Order.normalizeCustomerName(customerName);
-        customerEmail = Order.normalizeEmail(customerEmail);
         quantities = Collections.unmodifiableSortedMap(new TreeMap<>(quantities));
     }
 
@@ -24,11 +23,11 @@ public record CreateOrderCommand(String customerName, String customerEmail, Sort
     public record Line(long productId, int quantity) {}
 
     /** Gộp các dòng trùng productId (cộng dồn số lượng). */
-    public static CreateOrderCommand of(String customerName, String customerEmail, List<Line> lines) {
+    public static CreateOrderCommand of(long userId, List<Line> lines) {
         SortedMap<Long, Integer> quantities = new TreeMap<>();
         for (Line line : lines) {
             quantities.merge(line.productId(), line.quantity(), Integer::sum);
         }
-        return new CreateOrderCommand(customerName, customerEmail, quantities);
+        return new CreateOrderCommand(userId, quantities);
     }
 }

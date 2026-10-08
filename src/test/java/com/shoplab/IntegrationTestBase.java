@@ -37,6 +37,9 @@ public abstract class IntegrationTestBase {
     @Autowired protected DataSource dataSource;
     @Autowired protected ObjectMapper mapper;
 
+    /** Người đặt mặc định của orderJson, tạo khi cần lần đầu trong mỗi test (xem customerId()). */
+    private Long customerId;
+
     private final HttpClient http = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
             .connectTimeout(Duration.ofSeconds(5))
@@ -49,6 +52,7 @@ public abstract class IntegrationTestBase {
     @BeforeEach
     protected void cleanDatabase() {
         jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys, accounts, users CASCADE").update();
+        customerId = null;
     }
 
     // ---------- HTTP ----------
@@ -136,6 +140,32 @@ public abstract class IntegrationTestBase {
                 .single();
     }
 
+    /** Tạo người dùng (users + accounts) bằng SQL; status: ACTIVE, LOCKED hoặc DISABLED. */
+    protected long createUser(String email, String fullName, String username, String status) {
+        long userId = jdbc.sql("INSERT INTO users (email, full_name) VALUES (:email, :fullName) RETURNING id")
+                .param("email", email)
+                .param("fullName", fullName)
+                .query(Long.class)
+                .single();
+        jdbc.sql("""
+                        INSERT INTO accounts (user_id, username, password_hash, status)
+                        VALUES (:userId, :username, '{bcrypt}không-dùng-để-đăng-nhập', :status)
+                        """)
+                .param("userId", userId)
+                .param("username", username)
+                .param("status", status)
+                .update();
+        return userId;
+    }
+
+    /** Người đặt mặc định: Nguyễn Văn A, tài khoản ACTIVE. Chỉ tạo khi test thật sự cần. */
+    protected long customerId() {
+        if (customerId == null) {
+            customerId = createUser("a.nguyen@example.com", "Nguyễn Văn A", "a.nguyen", "ACTIVE");
+        }
+        return customerId;
+    }
+
     protected int stockOf(long productId) {
         return jdbc.sql("SELECT stock FROM products WHERE id = :id")
                 .param("id", productId).query(Integer.class).single();
@@ -145,11 +175,15 @@ public abstract class IntegrationTestBase {
         return jdbc.sql("SELECT count(*) FROM " + table).query(Long.class).single();
     }
 
-    protected static String orderJson(long productId, int quantity) {
+    /** Body đặt hàng của người đặt mặc định (customerId()). */
+    protected String orderJson(long productId, int quantity) {
+        return orderJson(customerId(), productId, quantity);
+    }
+
+    protected static String orderJson(long userId, long productId, int quantity) {
         return """
-                {"customerName":"Nguyễn Văn A","customerEmail":"a.nguyen@example.com",
-                 "items":[{"productId":%d,"quantity":%d}]}
-                """.formatted(productId, quantity);
+                {"userId":%d,"items":[{"productId":%d,"quantity":%d}]}
+                """.formatted(userId, productId, quantity);
     }
 
     protected static String newKey() {

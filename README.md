@@ -110,6 +110,7 @@ Ví dụ body tạo sản phẩm:
 |---|---|---|---|
 | `POST` | `/api/orders` (bắt buộc header `Idempotency-Key`) | **201** + `Location` | xem bảng bên dưới |
 | `GET` | `/api/orders/{id}` | **200** | 404 |
+| `GET` | `/api/orders?userId=1&page=0&size=20` | **200**: đơn của người dùng, mới nhất trước, có phân trang, không kèm dòng hàng | 400 thiếu `userId` · 400 `sort` theo trường không tồn tại |
 
 Ví dụ:
 
@@ -119,11 +120,12 @@ Content-Type: application/json
 Idempotency-Key: 3f1c2a9e-7b4d-4c1e-9a55-0d2f6b8e1a77
 
 {
-  "customerName": "Nguyễn Văn A",
-  "customerEmail": "a.nguyen@example.com",
+  "userId": 1,
   "items": [{ "productId": 1, "quantity": 2 }]
 }
 ```
+
+Đơn gắn với người đặt qua `userId`. Tên và email khách (`customerName`, `customerEmail` trong response) được chụp từ hồ sơ lúc đặt, như `sku` và giá của dòng đơn: sửa hồ sơ sau đó không làm đổi đơn cũ. Đơn tạo trước khi có `userId` (trước V11) trả `userId: null`.
 
 **Hành vi của `POST /api/orders`:**
 
@@ -133,8 +135,9 @@ Idempotency-Key: 3f1c2a9e-7b4d-4c1e-9a55-0d2f6b8e1a77
 | Gửi lại cùng key + cùng nội dung | **201** | Trả **nguyên văn** response lần đầu, header `Idempotent-Replayed: true`, không tạo đơn mới |
 | Thiếu header `Idempotency-Key` | **400** | |
 | Key sai định dạng | **400** | 8–255 ký tự `[A-Za-z0-9_-]`, khuyến nghị UUID |
-| Body không hợp lệ (email sai, `items` rỗng…) | **400** | Kèm `errors` theo từng trường |
+| Body không hợp lệ (thiếu `userId`, `items` rỗng…) | **400** | Kèm `errors` theo từng trường |
 | Cùng key nhưng nội dung khác | **422** | `idempotency-key-reused` |
+| Người dùng không tồn tại / tài khoản bị khoá hoặc vô hiệu hoá | **422** | `invalid-order`; kiểm tra trước khi giữ hàng, kho không bị đụng tới |
 | Sản phẩm không tồn tại / ngừng bán | **422** | `invalid-order` |
 | Không đủ hàng | **409** | Kèm `sku`, `requested`, `available` |
 | Request khác cùng key đang chạy quá 5 giây | **409** | Header `Retry-After: 1`, gửi lại với **cùng** key |
@@ -199,7 +202,7 @@ Content-Type: application/json
 
 Bảng `idempotency_keys`: `idem_key` (khoá chính), `request_hash`, `status`, `response_status`, `response_headers` (JSONB, vd `Location`), `response_body` (TEXT, nguyên văn chuỗi JSON đã trả), `created_at`.
 
-`request_hash` là SHA-256 của JSON dạng chuẩn hoá của request (`CreateOrderCommand`: tên, email chữ thường, các dòng đã gộp và sắp theo `productId`). Băm JSON chứ không tự ghép chuỗi, nên hai request khác nhau không thể trùng mã băm.
+`request_hash` là SHA-256 của JSON dạng chuẩn hoá của request (`CreateOrderCommand`: `userId`, các dòng đã gộp và sắp theo `productId`). Băm JSON chứ không tự ghép chuỗi, nên hai request khác nhau không thể trùng mã băm.
 
 Ghi key, tạo đơn, trừ kho và lưu response diễn ra trong **một transaction**:
 
@@ -256,7 +259,7 @@ Lỗi validation có thêm `errors` theo từng trường:
   "status": 400,
   "detail": "Dữ liệu gửi lên không hợp lệ",
   "errors": {
-    "customerEmail": "must be a well-formed email address",
+    "userId": "must not be null",
     "items[0].quantity": "must be greater than or equal to 1"
   }
 }
@@ -282,7 +285,7 @@ Tiền tố: `https://shoplab.dev/errors/`
 | `data-integrity` | 409 | Vi phạm ràng buộc dữ liệu (vd xoá sản phẩm đã có trong đơn) |
 | `lock-timeout` / `idempotency-in-progress` | 409 | Đang có request khác xử lý cùng dữ liệu, kèm `Retry-After` |
 | `idempotency-key-reused` | 422 | Key đã dùng với nội dung khác |
-| `invalid-order` | 422 | Đơn hàng không xử lý được (sản phẩm không tồn tại / ngừng bán) |
+| `invalid-order` | 422 | Đơn hàng không xử lý được (người dùng không tồn tại / bị khoá, sản phẩm không tồn tại / ngừng bán) |
 | `internal` | 500 | Lỗi hệ thống |
 
 Các lỗi có sẵn của Spring MVC (JSON sai, thiếu header, 404 đường dẫn, 405, 415) dùng `type` mặc định `about:blank` nhưng vẫn cùng cấu trúc và có `timestamp`.
@@ -321,17 +324,14 @@ Một ứng dụng, một database, nhưng chia thành các module có ranh gi�
 | `common` | Phần dùng chung (shared kernel) | `ApiException`, `BaseEntity`, `AuditedEntity`, `DbConstraints`, `ValidationPatterns` | (không module nào) |
 | `product` | Danh mục sản phẩm, tồn kho | `ProductInventory` (giữ hàng), `ReservedItem`, `ProductUnavailableException`, `InsufficientStockException`; `ProductReferences` (module khác cài đặt) | `common` |
 | `idempotency` | Chạy request ghi đúng một lần theo `Idempotency-Key` | `IdempotencyService` và các exception của nó | `common` |
-| `order` | Đơn hàng | (chưa có) | `common`, `product`, `idempotency` |
-| `user` | Người dùng: hồ sơ + tài khoản đăng nhập | (chưa có) | `common` |
+| `order` | Đơn hàng | (chưa có) | `common`, `product`, `user`, `idempotency` |
+| `user` | Người dùng: hồ sơ + tài khoản đăng nhập | `UserDirectory` (tra người dùng đang ACTIVE), `UserSummary`, `UserUnavailableException` | `common` |
 
 ```
-order ──► product ─────┐
-  │                    ├──► common
-  └────► idempotency ──┘     ▲
-user ────────────────────────┘
+order ──► product ──────┐
+  ├─────► user ─────────┼──► common
+  └─────► idempotency ──┘
 ```
-
-Đơn hàng chưa gắn với người dùng: vẫn lưu `customerName`, `customerEmail` như cũ. Khi cần gắn, module `user` thêm API ở package gốc (giống `ProductInventory`) và `order` khai báo phụ thuộc vào `user`.
 
 ### Bố cục bên trong một module
 
@@ -357,6 +357,7 @@ Vi phạm thì test đỏ và chỉ rõ chỗ vi phạm.
 - **Ranh giới module ở DB:** mỗi bảng khai báo thuộc đúng một module; không có khoá ngoại nối bảng của hai module khác nhau.
 
 Các quy ước khác:
+- `order` lấy người đặt qua API `UserDirectory.requireActiveUser(...)` (chỉ tài khoản ACTIVE mới đặt được) và chụp lại tên, email; kiểm tra này chạy trước khi giữ hàng.
 - `order` giữ hàng qua API `ProductInventory.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
 - Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`, `User`, `Account`). Service nhận command (`CreateProductCommand`, `CreateOrderCommand`, `RegisterUserCommand`...) và trả entity; controller đổi DTO web ↔ command / entity.
 - Entity kế thừa `common.BaseEntity` (id lấy từ sequence của bảng, khai báo bằng `@SequenceGenerator` trên class) hoặc `common.AuditedEntity` (thêm `version`, `createdAt`, `updatedAt` do Spring Data auditing điền).
@@ -374,8 +375,9 @@ Các quy ước khác:
 
 Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`; `user` → `users`, `accounts`.
 
-Khoá ngoại chỉ nối các bảng **trong cùng một module** (`order_items → orders`, `accounts → users`). Giữa hai module chỉ lưu id (vd `order_items.product_id`), không có khoá ngoại (V10 bỏ `fk_order_items_product`). Nhờ vậy mỗi module có thể đổi bảng, tách schema hay tách DB riêng mà không kéo module khác theo. Toàn vẹn dữ liệu giữa các module do code giữ:
-- Dòng đơn đã chụp `sku`, tên, giá nên không cần đọc lại `products`.
+Khoá ngoại chỉ nối các bảng **trong cùng một module** (`order_items → orders`, `accounts → users`). Giữa hai module chỉ lưu id (vd `order_items.product_id`, `orders.user_id`), không có khoá ngoại (V10 bỏ `fk_order_items_product`). Nhờ vậy mỗi module có thể đổi bảng, tách schema hay tách DB riêng mà không kéo module khác theo. Toàn vẹn dữ liệu giữa các module do code giữ:
+- Dòng đơn đã chụp `sku`, tên, giá, và đơn đã chụp tên, email người đặt, nên không cần đọc lại `products` hay `users`.
+- Chưa có API xoá người dùng, nên chưa cần chặn xoá người dùng đã có đơn. Khi thêm, làm giống `ProductReferences`.
 - Không xoá được sản phẩm đã có trong đơn: `ProductService.delete` khoá dòng sản phẩm (`FOR UPDATE`), rồi hỏi các module qua `ProductReferences`. Tạo đơn cũng khoá dòng này khi giữ hàng, nên đơn đang tạo dở không lọt qua được: lệnh xoá chờ đơn commit rồi mới kiểm tra (→ 409); còn nếu lệnh xoá đến trước thì đơn đến sau không còn thấy sản phẩm (→ 422 `invalid-order`).
 
 ### Tài liệu module sinh tự động
@@ -403,10 +405,10 @@ src/main/java/com/shoplab/
 ├── order/
 │   ├── internal/   Order, OrderItem, OrderStatus, OrderRepository, OrderService, CreateOrderCommand,
 │   │               OrderProductReferences, các exception nội bộ
-│   └── web/        OrderController, CreateOrderRequest, OrderResponse
-└── user/
-    ├── internal/   User, Account, AccountStatus, UserRepository, UserService, PasswordConfig,
-    │               RegisterUserCommand, UpdateProfileCommand, các exception nội bộ
+│   └── web/        OrderController, CreateOrderRequest, OrderResponse, OrderSummaryResponse
+└── user/           UserDirectory, UserSummary, UserUnavailableException
+    ├── internal/   User, Account, AccountStatus, UserRepository, UserService, DefaultUserDirectory,
+    │               PasswordConfig, RegisterUserCommand, UpdateProfileCommand, các exception nội bộ
     └── web/        UserController, RegisterUserRequest, UpdateProfileRequest, UserResponse
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
@@ -418,7 +420,8 @@ src/main/resources/db/migration/
 ├── V7__idempotency_store_raw_response.sql    lưu nguyên văn response (body TEXT + header)
 ├── V8__ids_from_sequence.sql                 id lấy từ sequence (bước 50) thay vì IDENTITY
 ├── V9__user_ids_from_sequence.sql            như V8, cho users, accounts
-└── V10__drop_cross_module_fk.sql             bỏ khoá ngoại chéo module order_items → products
+├── V10__drop_cross_module_fk.sql             bỏ khoá ngoại chéo module order_items → products
+└── V11__orders_user_id.sql                   orders.user_id (không khoá ngoại) + index cho danh sách đơn
 src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java

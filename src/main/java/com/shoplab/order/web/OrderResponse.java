@@ -10,6 +10,7 @@ import java.util.List;
 
 public record OrderResponse(
         Long id,
+        Long userId,
         String customerName,
         String customerEmail,
         OrderStatus status,
@@ -33,7 +34,7 @@ public record OrderResponse(
 
     public static OrderResponse from(Order o) {
         return new OrderResponse(
-                o.getId(), o.getCustomerName(), o.getCustomerEmail(), o.getStatus(), o.getTotalAmount(),
+                o.getId(), o.getUserId(), o.getCustomerName(), o.getCustomerEmail(), o.getStatus(), o.getTotalAmount(),
                 o.getItems().stream().map(Line::from).toList(),
                 o.getCreatedAt());
     }

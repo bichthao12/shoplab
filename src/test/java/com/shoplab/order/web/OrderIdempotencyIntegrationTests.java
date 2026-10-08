@@ -137,20 +137,19 @@ class OrderIdempotencyIntegrationTests extends IntegrationTestBase {
     }
 
     @Test
-    @DisplayName("Cùng nội dung nhưng khác thứ tự item / hoa-thường email → vẫn là replay")
+    @DisplayName("Cùng nội dung nhưng khác thứ tự item / tách dòng → vẫn là replay")
     void equivalentBody_isTreatedAsSameRequest() {
         long p1 = createProduct("BASIC-006A", 100_000, 10);
         long p2 = createProduct("BASIC-006B", 50_000, 10);
         String key = newKey();
 
         String original = """
-                {"customerName":"Nguyễn Văn A","customerEmail":"a.nguyen@example.com",
-                 "items":[{"productId":%d,"quantity":2},{"productId":%d,"quantity":1}]}
-                """.formatted(p1, p2);
+                {"userId":%d,"items":[{"productId":%d,"quantity":2},{"productId":%d,"quantity":1}]}
+                """.formatted(customerId(), p1, p2);
         String equivalent = """
-                {"customerName":"Nguyễn Văn A","customerEmail":"A.NGUYEN@example.com",
-                 "items":[{"productId":%d,"quantity":1},{"productId":%d,"quantity":1},{"productId":%d,"quantity":1}]}
-                """.formatted(p2, p1, p1);
+                {"items":[{"productId":%d,"quantity":1},{"productId":%d,"quantity":1},{"productId":%d,"quantity":1}],
+                 "userId":%d}
+                """.formatted(p2, p1, p1, customerId());
 
         HttpResponse<String> first = postOrder(key, original);
         HttpResponse<String> retry = postOrder(key, equivalent);
@@ -177,19 +176,14 @@ class OrderIdempotencyIntegrationTests extends IntegrationTestBase {
     }
 
     @Test
-    @DisplayName("Cùng key, hai body khác nhau nhưng ghép chuỗi lại giống nhau (dấu | trong tên/email) → vẫn 422")
-    void sameKey_bodiesThatOnlyDifferAroundSeparator_returns422() {
+    @DisplayName("Cùng key, cùng giỏ hàng nhưng người đặt khác → 422, không tạo đơn cho người thứ hai")
+    void sameKeyDifferentUser_returns422() {
         long productId = createProduct("BASIC-008", 100_000, 10);
+        long otherUser = createUser("b@example.com", "Trần Thị B", "b.tran", "ACTIVE");
         String key = newKey();
-        String first = """
-                {"customerName":"A|b","customerEmail":"c@example.com","items":[{"productId":%d,"quantity":1}]}
-                """.formatted(productId);
-        String second = """
-                {"customerName":"A","customerEmail":"b|c@example.com","items":[{"productId":%d,"quantity":1}]}
-                """.formatted(productId);
 
-        assertThat(postOrder(key, first).statusCode()).isEqualTo(201);
-        HttpResponse<String> r = postOrder(key, second);
+        assertThat(postOrder(key, orderJson(customerId(), productId, 1)).statusCode()).isEqualTo(201);
+        HttpResponse<String> r = postOrder(key, orderJson(otherUser, productId, 1));
 
         assertProblem(r, 422, "idempotency-key-reused");
         assertThat(count("orders")).isEqualTo(1);
