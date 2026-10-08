@@ -57,7 +57,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 
 - **Postman:** import `shoplab.postman_collection.json` → *Run collection* (chạy đúng thứ tự). Biến `baseUrl` mặc định `http://localhost:8080`.
 - **File `.http`** (IntelliJ / VS Code REST Client): `products.http`, `users.http`.
-- **Bán chớp nhoáng với app đang chạy:** `./scripts/flash-sale.sh` (xem mục *Test bán chớp nhoáng*).
+- **Bán chớp nhoáng với app đang chạy:** `./scripts/flash-sale.sh`, hoặc `scripts\flash-sale.ps1` trên Windows (xem mục *Test bán chớp nhoáng*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -254,20 +254,36 @@ Mỗi test tạo một sản phẩm còn 1 cái, rồi `buyAtOnce(productId, 100
 - **Đếm số đơn thôi chưa đủ.** Thử bỏ `FOR UPDATE` ở bản thật thì vẫn chỉ ra 1 đơn (`@Version` chặn được bán vượt), nhưng 9 lượt mua nhận `409 concurrent-modification` thay vì "hết hàng". Test kiểm tra cả cách phân bố response nên vẫn bắt được.
 - Hai test này tắt log SQL (`@TestPropertySource`), vì 1.000 request in ra khoảng 18.000 dòng.
 
-#### Tự chạy với app thật: `scripts/flash-sale.sh`
+#### Tự chạy với app thật: `scripts/flash-sale.sh` / `scripts/flash-sale.ps1`
 
-Cần app đang chạy, `curl` và `jq` (Windows: chạy trong Git Bash, cài `jq` bằng `winget install jqlang.jq`).
+Hai script làm cùng một việc, cho cùng kết quả và mã thoát:
+- `flash-sale.sh` (bash): cần `curl` và `jq`; trên Windows chạy trong Git Bash.
+- `flash-sale.ps1` (PowerShell): không cần cài thêm gì, chạy được trên Windows PowerShell 5.1 có sẵn và PowerShell 7+. Gửi request song song bằng `HttpClient` của .NET (tối đa `-Parallel` kết nối cùng lúc).
+
+Chạy DB và app (lệnh `./mvnw` trên Windows là `.\mvnw`):
 
 ```bash
 docker compose up -d
 ./mvnw spring-boot:run -Dspring-boot.run.arguments="--logging.level.sql=INFO --logging.level.tx=INFO"
+```
 
-# terminal khác
+Rồi ở terminal khác, khi app đã báo `Started ShoplabApplication`:
+
+```powershell
+# Windows PowerShell
+powershell -ExecutionPolicy Bypass -File .\scripts\flash-sale.ps1                                  # 1000 lượt mua, kho 1, 200 lượt song song
+powershell -ExecutionPolicy Bypass -File .\scripts\flash-sale.ps1 -Buyers 300 -Stock 7 -Parallel 50
+```
+
+```bash
+# bash / Git Bash
 ./scripts/flash-sale.sh                                 # 1000 lượt mua, kho 1, 200 lượt song song
 BUYERS=300 STOCK=7 PARALLEL=50 ./scripts/flash-sale.sh  # đổi kịch bản
 ```
 
-Script tạo một người mua và một sản phẩm mới (không đụng dữ liệu cũ), bắn `BUYERS` request `POST /api/orders` với `PARALLEL` request song song, mỗi request một `Idempotency-Key` riêng, rồi in số response theo mã HTTP và loại lỗi, số đơn, tồn kho còn lại:
+App chạy ở cổng khác thì thêm `-BaseUrl http://localhost:9090` (PowerShell) hoặc `BASE_URL=http://localhost:9090` (bash).
+
+Script tạo một người mua và một sản phẩm mới (không đụng dữ liệu cũ), bắn `BUYERS` request `POST /api/orders` với tối đa `PARALLEL` request song song, mỗi request một `Idempotency-Key` riêng, rồi in số response theo mã HTTP và loại lỗi, số đơn, tồn kho còn lại:
 
 ```
 == Bước 4: 1000 lượt mua, 200 lượt chạy song song
