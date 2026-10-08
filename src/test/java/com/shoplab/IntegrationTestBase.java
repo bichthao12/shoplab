@@ -54,7 +54,7 @@ public abstract class IntegrationTestBase {
      */
     @BeforeEach
     protected void cleanDatabase() {
-        jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys, accounts, users CASCADE").update();
+        jdbc.sql("TRUNCATE TABLE order_items, orders, products, idempotency_keys, accounts, users, wallets CASCADE").update();
         customerId = null;
     }
 

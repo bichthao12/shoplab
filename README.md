@@ -48,7 +48,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
@@ -327,6 +327,35 @@ Script tạo một người mua và một sản phẩm mới (không đụng d�
 
 Mã thoát: `0` nếu bán đúng `min(STOCK, BUYERS)` cái và mọi lượt còn lại đều nhận "hết hàng"; `1` nếu bán vượt hoặc có lượt nhận lỗi khác (vd bỏ kiểm tra "đúng 1 dòng" thì 1.000 đơn; bỏ điều kiện `stock >= :quantity` thì vẫn 1 đơn nhưng 999 lượt nhận `data-integrity`); `2` nếu không chạy được (app chưa chạy, thiếu `curl` / `jq`).
 
+### Deadlock: chuyển tiền A→B và B→A cùng lúc
+
+`TransferDeadlockTests` dùng `NaiveWalletTransfer` (chỉ có trong test): chuyển tiền bằng cách khoá hai ví (`SELECT ... FOR UPDATE`) **theo thứ tự tham số**, ví nguồn trước, ví đích sau, với `Thread.sleep(50)` giữa hai lần khoá. Hai lượt chuyển ngược chiều chạy cùng lúc, mỗi lượt một transaction:
+
+```
+A→B:  khoá A ── sleep 50ms ── xin khoá B ⏳ (B đang bị B→A giữ)
+B→A:  khoá B ── sleep 50ms ── xin khoá A ⏳ (A đang bị A→B giữ)
+```
+
+Mỗi bên giữ một khoá và chờ khoá bên kia: không bên nào đi tiếp được. Log thật:
+
+```
+04:57:55.340 [virtual-53] select ... from wallets where id=? for no key update   ← B→A khoá B
+04:57:55.340 [virtual-51] select ... from wallets where id=? for no key update   ← A→B khoá A
+04:57:55.439 [virtual-53] select ... from wallets where id=? for no key update   ← B→A xin khoá A, chờ
+04:57:55.439 [virtual-51] select ... from wallets where id=? for no key update   ← A→B xin khoá B, chờ
+04:57:56.449 [virtual-51] ERROR: deadlock detected
+  Detail: Process 534 waits for ShareLock on transaction 41340; blocked by process 530.
+          Process 530 waits for ShareLock on transaction 41339; blocked by process 534.
+04:57:56.457 [virtual-51] ROLLBACK transfer A→B
+04:57:56.471 [virtual-53] update wallets set balance=? ... where id=? and version=?
+04:57:56.482 [virtual-53] COMMIT   transfer B→A
+```
+
+- PostgreSQL chỉ đi tìm deadlock khi một bên đã chờ khoá quá `deadlock_timeout` (mặc định **1 giây**), rồi huỷ một transaction với lỗi `40P01`. Bên còn lại lấy được khoá và chạy xong. Bên nào bị huỷ là ngẫu nhiên.
+- Không mất tiền: lượt bị huỷ rollback toàn bộ, tổng số dư hai ví không đổi. Nhưng cả hai lượt đều bị treo khoảng 1 giây, và một lượt thất bại dù hợp lệ.
+- Phía Spring nhận `CannotAcquireLockException` (một `PessimisticLockingFailureException`). `GlobalExceptionHandler` hiện xếp loại này vào `409 lock-timeout`, nên khi thêm API chuyển tiền cần báo riêng trường hợp deadlock.
+- `sleep(50)` để chắc chắn cả hai bên đã giữ khoá đầu tiên trước khi xin khoá thứ hai. Bỏ đi thì trên máy dev vẫn deadlock 10/10 lần, nhưng không đảm bảo trên máy khác.
+
 ### Cách hoạt động của Idempotency
 
 Bảng `idempotency_keys`: `idem_key` (khoá chính), `request_hash`, `status`, `response_status`, `response_headers` (JSONB, vd `Location`), `response_body` (TEXT, nguyên văn chuỗi JSON đã trả), `created_at`.
@@ -455,11 +484,13 @@ Một ứng dụng, một database, nhưng chia thành các module có ranh gi�
 | `idempotency` | Chạy request ghi đúng một lần theo `Idempotency-Key` | `IdempotencyService` và các exception của nó | `common` |
 | `order` | Đơn hàng | (chưa có) | `common`, `product`, `user`, `idempotency` |
 | `user` | Người dùng: hồ sơ + tài khoản đăng nhập | `UserDirectory` (tra người dùng đang ACTIVE), `UserSummary`, `UserUnavailableException` | `common` |
+| `wallet` | Ví tiền của người dùng (số dư không âm) | (chưa có) | `common` |
 
 ```
 order ──► product ──────┐
   ├─────► user ─────────┼──► common
-  └─────► idempotency ──┘
+  └─────► idempotency ──┘     ▲
+wallet ───────────────────────┘
 ```
 
 ### Bố cục bên trong một module
@@ -502,7 +533,7 @@ Các quy ước khác:
 
 ### Dữ liệu
 
-Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`; `user` → `users`, `accounts`.
+Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của mình trong code: `product` → `products`; `order` → `orders`, `order_items`; `idempotency` → `idempotency_keys`; `user` → `users`, `accounts`; `wallet` → `wallets`.
 
 Khoá ngoại chỉ nối các bảng **trong cùng một module** (`order_items → orders`, `accounts → users`). Giữa hai module chỉ lưu id (vd `order_items.product_id`, `orders.user_id`), không có khoá ngoại (V10 bỏ `fk_order_items_product`). Nhờ vậy mỗi module có thể đổi bảng, tách schema hay tách DB riêng mà không kéo module khác theo. Toàn vẹn dữ liệu giữa các module do code giữ:
 - Dòng đơn đã chụp `sku`, tên, giá, và đơn đã chụp tên, email người đặt, nên không cần đọc lại `products` hay `users`.
@@ -535,10 +566,12 @@ src/main/java/com/shoplab/
 │   ├── internal/   Order, OrderItem, OrderStatus, OrderRepository, OrderService, CreateOrderCommand,
 │   │               OrderProductReferences, các exception nội bộ
 │   └── web/        OrderController, CreateOrderRequest, OrderResponse, OrderSummaryResponse
-└── user/           UserDirectory, UserSummary, UserUnavailableException
-    ├── internal/   User, Account, AccountStatus, UserRepository, UserService, DefaultUserDirectory,
-    │               PasswordConfig, RegisterUserCommand, UpdateProfileCommand, các exception nội bộ
-    └── web/        UserController, RegisterUserRequest, UpdateProfileRequest, UserResponse
+├── user/           UserDirectory, UserSummary, UserUnavailableException
+│   ├── internal/   User, Account, AccountStatus, UserRepository, UserService, DefaultUserDirectory,
+│   │               PasswordConfig, RegisterUserCommand, UpdateProfileCommand, các exception nội bộ
+│   └── web/        UserController, RegisterUserRequest, UpdateProfileRequest, UserResponse
+└── wallet/
+    └── internal/   Wallet, WalletRepository, InsufficientBalanceException
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
 ├── V2__add_product_category.sql              cột category
@@ -550,7 +583,8 @@ src/main/resources/db/migration/
 ├── V8__ids_from_sequence.sql                 id lấy từ sequence (bước 50) thay vì IDENTITY
 ├── V9__user_ids_from_sequence.sql            như V8, cho users, accounts
 ├── V10__drop_cross_module_fk.sql             bỏ khoá ngoại chéo module order_items → products
-└── V11__orders_user_id.sql                   orders.user_id (không khoá ngoại) + index cho danh sách đơn
+├── V11__orders_user_id.sql                   orders.user_id (không khoá ngoại) + index cho danh sách đơn
+└── V12__create_wallets.sql                   bảng wallets (module wallet)
 src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java
@@ -569,7 +603,9 @@ src/test/java/com/shoplab/
 │   │                   NaiveProductInventory + NaiveStockDeductionTests, NaiveFlashSaleTests
 │   │                   (bản trừ kho ngây thơ, để so sánh)
 │   └── web/            ProductApiIntegrationTests
-└── user/               UserModuleTests
-    ├── internal/       UserTest
-    └── web/            UserApiIntegrationTests
+├── user/               UserModuleTests
+│   ├── internal/       UserTest
+│   └── web/            UserApiIntegrationTests
+└── wallet/
+    └── internal/       NaiveWalletTransfer + TransferDeadlockTests (chuyển tiền gây deadlock)
 ```

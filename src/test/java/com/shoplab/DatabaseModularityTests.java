@@ -22,7 +22,8 @@ class DatabaseModularityTests extends IntegrationTestBase {
             "order_items", "order",
             "idempotency_keys", "idempotency",
             "users", "user",
-            "accounts", "user");
+            "accounts", "user",
+            "wallets", "wallet");
 
     @Test
     @DisplayName("Mọi bảng đều đã khai báo thuộc module nào")
