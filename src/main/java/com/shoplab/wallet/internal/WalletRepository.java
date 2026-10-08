@@ -11,6 +11,8 @@ import java.util.Optional;
 /** Chỉ dùng trong package wallet. */
 interface WalletRepository extends JpaRepository<Wallet, Long> {
 
+    boolean existsByUserId(Long userId);
+
     /** SELECT ... FOR UPDATE một ví: khoá dòng tới hết transaction, giao dịch khác muốn khoá phải chờ. */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select w from Wallet w where w.id = :id")

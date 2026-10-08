@@ -2,6 +2,7 @@ package com.shoplab.wallet.internal;
 
 import com.shoplab.Concurrently;
 import com.shoplab.IntegrationTestBase;
+import com.shoplab.user.UserDirectory;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -39,6 +40,7 @@ class TransferDeadlockTests extends IntegrationTestBase {
     }
 
     @Autowired WalletRepository repo;
+    @Autowired UserDirectory users;
     @Autowired PlatformTransactionManager txManager;
 
     @Test
@@ -73,12 +75,13 @@ class TransferDeadlockTests extends IntegrationTestBase {
     void oppositeTransfers_lockingInIdOrder_bothSucceed() throws Exception {
         long a = createWallet(1, "100.00");
         long b = createWallet(2, "100.00");
-        WalletService service = new WalletService(pausingAfterEachLock(repo, PAUSE_BETWEEN_LOCKS));
+        WalletService service = new WalletService(pausingAfterEachLock(repo, PAUSE_BETWEEN_LOCKS), users);
+        Transfer ordered = (from, to, amount) -> service.transfer(new TransferCommand(from, to, amount));
 
         long start = System.nanoTime();
         List<Outcome> outcomes = Concurrently.run(2, i -> i == 0
-                ? transfer(service::transfer, "ordered A->B", a, b, "10.00")
-                : transfer(service::transfer, "ordered B->A", b, a, "30.00"));
+                ? transfer(ordered, "ordered A->B", a, b, "10.00")
+                : transfer(ordered, "ordered B->A", b, a, "30.00"));
         Duration took = Duration.ofNanos(System.nanoTime() - start);
 
         assertThat(outcomes).containsExactly(Outcome.TRANSFERRED, Outcome.TRANSFERRED);

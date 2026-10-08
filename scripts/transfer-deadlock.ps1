@@ -1,194 +1,172 @@
 ﻿<#
 .SYNOPSIS
-  Chạy test deadlock chuyển tiền (TransferDeadlockTests) và in diễn biến của hai cách khoá:
-  khoá theo thứ tự tham số (deadlock, PostgreSQL huỷ một lượt) và khoá theo thứ tự id tăng dần (bản sửa, không deadlock).
+  Chuyển tiền A->B và B->A cùng lúc qua API, kiểm tra không deadlock và số dư đúng.
 
 .DESCRIPTION
-  Kịch bản: chuyển A->B và B->A cùng lúc, chờ 50ms giữa hai lần khoá.
-   - Khoá theo thứ tự tham số (ví nguồn trước): mỗi lượt giữ một khoá và chờ khoá lượt kia đang giữ → deadlock.
-   - Khoá theo thứ tự id tăng dần (WalletService): cả hai cùng xin ví A trước, lượt sau chờ lượt trước xong → không deadlock.
+  Cần app đang chạy (.\mvnw spring-boot:run). Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
 
-  Module ví chưa có REST API (và bản khoá theo tham số chỉ có trong test), nên script chạy test qua Maven
-  (cần Docker đang chạy: test dựng PostgreSQL bằng Testcontainers) rồi đọc log SQL / transaction của test.
-  Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
+  Các bước:
+    2. tạo hai người dùng A, B (POST /api/users)
+    3. tạo ví cho mỗi người (POST /api/wallets) và nạp InitialBalance (POST /api/wallets/{id}/deposits)
+    4. bắn Pairs lượt A->B (1 đồng / lượt) và Pairs lượt B->A (2 đồng / lượt) cùng lúc
+       (POST /api/wallets/transfers, tối đa Parallel request song song, mỗi lượt một Idempotency-Key riêng)
+    5. đọc lại số dư hai ví (GET /api/wallets/{id})
 
-  Thoát với mã 0 nếu mọi lần chạy đều đúng như trên (cả hai test xanh), 1 nếu không.
+  App khoá hai ví theo thứ tự id tăng dần, nên mọi lượt đều chuyển xong:
+    ví A = InitialBalance - Pairs*1 + Pairs*2,  ví B = InitialBalance + Pairs*1 - Pairs*2,  tổng không đổi.
+  Nếu app khoá theo thứ tự tham số (ví nguồn trước), sẽ thấy response 409 deadlock và có thể cả request hết giờ chờ.
+
+  Thoát với mã 0 nếu mọi lượt chuyển đều 200 và số dư đúng; 1 nếu sai; 2 nếu không chạy được.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1 -Runs 3
-  Chạy 3 lần để thấy lượt bị huỷ (ở bản khoá theo tham số) thay đổi ngẫu nhiên giữa A->B và B->A.
+  powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1 -Pairs 500 -Parallel 100
 #>
 param(
-    [int]$Runs = 1
+    [string]$BaseUrl = 'http://localhost:8080',
+    [int]$Pairs = 100,
+    [int]$Parallel = 50,
+    [int]$InitialBalance = 1000
 )
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Net.Http
 
-$root = Split-Path -Parent $PSScriptRoot
-$onWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or $IsWindows
-$testClass = 'TransferDeadlockTests'
-$report = Join-Path $root "target/surefire-reports/com.shoplab.wallet.internal.$testClass.txt"
-
-# Một dòng log mặc định của Spring Boot:
-# 2026-10-08T11:57:55.340+07:00 DEBUG 1962 --- [virtual-53] org.hibernate.SQL : select ...
-$logLine = '^\S+T(?<time>\d\d:\d\d:\d\d\.\d{3})\S*\s+(?<level>[A-Z]+)\s+\d+\s+---\s+\[\s*(?<thread>[^\]]+)\]\s+(?<logger>\S+)\s*:\s(?<msg>.*)$'
-
-# Chạy test một lần, trả về các dòng output của Maven (gồm log của app trong test)
-function Invoke-DeadlockTest {
-    Push-Location $root
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'   # Java có thể in ra stderr; Windows PowerShell coi đó là lỗi nếu để 'Stop'
-    try {
-        if ($onWindows) {
-            $output = & .\mvnw.cmd -q test "-Dtest=$testClass" 2>&1 | ForEach-Object { "$_" }
-        } else {
-            $output = & sh ./mvnw -q test "-Dtest=$testClass" 2>&1 | ForEach-Object { "$_" }
-        }
-        return @{ ExitCode = $LASTEXITCODE; Lines = $output }
-    } finally {
-        $ErrorActionPreference = $previous
-        Pop-Location
-    }
+if ($InitialBalance -lt 2 * $Pairs) {
+    # B->A trừ 2 đồng / lượt: nếu mọi lượt B->A chạy trước, ví B cần ít nhất 2 * Pairs
+    Write-Host "InitialBalance phải >= 2 * Pairs ($(2 * $Pairs)) để không lượt nào thiếu tiền" -ForegroundColor Red
+    exit 2
 }
 
-# Đọc log của hai test, in diễn biến từng test.
-# Trả về @{ Loser = lượt bị huỷ ở bản khoá theo tham số; OrderedCommits = số lượt COMMIT ở bản khoá theo id }
-function Show-Timeline([string[]]$lines) {
-    $titles = @{
-        naive   = 'Khoá theo thứ tự tham số (NaiveWalletTransfer): ví nguồn trước, ví đích sau'
-        ordered = 'Khoá theo thứ tự id tăng dần (WalletService): luôn ví A (id nhỏ) trước, ví B sau'
-    }
-    $tx = @{}          # thread → @{ Variant; Dir; Locks }
-    $section = $null
-    $sectionStart = $null
-    $waitStart = $null
-    $deadlockAt = $null
-    $committed = @()   # lượt đã COMMIT trong phần đang in
-    $loser = $null
-    $orderedCommits = 0
-    $inDetail = $false
+$run = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()   # mã của lần chạy: email, username, Idempotency-Key không trùng
 
-    foreach ($line in $lines) {
-        $m = [regex]::Match($line, $logLine)
-        if (-not $m.Success) {
-            # Dòng tiếp theo của thông báo deadlock: "Detail: Process ... waits for ..."
-            if ($inDetail -and $line -match '(Process \d+ waits for .*)') {
-                Write-Host ('{0,-14}{1,-6}  {2}' -f '', '', $Matches[1].Trim())
-            }
-            continue
-        }
-        $inDetail = $false
-        $time = $m.Groups['time'].Value
-        $thread = $m.Groups['thread'].Value
-        $msg = $m.Groups['msg'].Value
+$handler = New-Object System.Net.Http.HttpClientHandler
+$handler.MaxConnectionsPerServer = $Parallel          # tối đa Parallel request đang chạy cùng lúc
+$client = New-Object System.Net.Http.HttpClient($handler)
+$client.Timeout = [TimeSpan]::FromSeconds(60)
+$client.DefaultRequestHeaders.ExpectContinue = $false  # PowerShell 5.1: không chờ "100 Continue" trước mỗi POST
 
-        if ($msg -match '^BEGIN\s+(naive|ordered) (\S+)') {
-            $variant = $Matches[1]
-            if ($variant -ne $section) {
-                Write-Summary $section $sectionStart $waitStart $deadlockAt $committed
-                $section = $variant
-                $sectionStart = [TimeSpan]::Parse($time)
-                $waitStart = $null
-                $deadlockAt = $null
-                $committed = @()
-                Write-Host ''
-                Write-Host "-- $($titles[$variant])" -ForegroundColor Cyan
-            }
-            $tx[$thread] = @{ Variant = $variant; Dir = $Matches[2]; Locks = 0 }
-            Write-Host ('{0,-14}{1,-6}  BEGIN' -f $time, $Matches[2])
-            continue
-        }
-        if (-not $tx.ContainsKey($thread)) { continue }   # dòng log không thuộc các lượt chuyển
-        $t = $tx[$thread]
-        $who = $t.Dir
-        $wallets = $who -split '->'                         # "A->B" → A, B
-
-        if ($msg -match 'from wallets .* for (no key )?update') {
-            $t.Locks++
-            if ($t.Variant -eq 'naive') {
-                $wallet = if ($t.Locks -eq 1) { $wallets[0] } else { $wallets[1] }   # ví nguồn rồi ví đích
-            } else {
-                $wallet = if ($t.Locks -eq 1) { 'A' } else { 'B' }                   # id nhỏ rồi id lớn
-            }
-            $note = ''
-            if ($t.Locks -eq 2 -and $t.Variant -eq 'naive') {
-                if (-not $waitStart) { $waitStart = [TimeSpan]::Parse($time) }
-                $note = ' ... chờ'
-            }
-            if ($t.Locks -eq 2 -and $t.Variant -eq 'ordered' -and $committed.Count -gt 0) {
-                $note = "   (trước đó chờ ở khoá ví A tới khi $($committed[0]) COMMIT)"
-            }
-            Write-Host ('{0,-14}{1,-6}  khoá ví {2} (SELECT ... FOR UPDATE){3}' -f $time, $who, $wallet, $note)
-        } elseif ($msg -match 'deadlock detected') {
-            $deadlockAt = [TimeSpan]::Parse($time)
-            $inDetail = $true
-            Write-Host ('{0,-14}{1,-6}  PostgreSQL: deadlock detected (40P01)' -f $time, $who) -ForegroundColor Red
-        } elseif ($msg -match '^update wallets') {
-            Write-Host ('{0,-14}{1,-6}  cập nhật số dư (UPDATE wallets)' -f $time, $who)
-        } elseif ($msg -match '^ROLLBACK\s+') {
-            if ($t.Variant -eq 'naive') { $loser = $who }
-            Write-Host ('{0,-14}{1,-6}  ROLLBACK: bị huỷ, không chuyển gì' -f $time, $who) -ForegroundColor Red
-        } elseif ($msg -match '^COMMIT\s+') {
-            $committed += $who
-            if ($t.Variant -eq 'ordered') { $orderedCommits++ }
-            $script:lastCommit = [TimeSpan]::Parse($time)
-            Write-Host ('{0,-14}{1,-6}  COMMIT: chuyển xong' -f $time, $who) -ForegroundColor Green
-        }
-    }
-    Write-Summary $section $sectionStart $waitStart $deadlockAt $committed
-    return @{ Loser = $loser; OrderedCommits = $orderedCommits }
+function New-JsonPost([string]$path, [string]$json, [string]$idempotencyKey) {
+    $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, "$BaseUrl$path")
+    $request.Content = New-Object System.Net.Http.StringContent($json, [System.Text.Encoding]::UTF8, 'application/json')
+    if ($idempotencyKey) { $request.Headers.Add('Idempotency-Key', $idempotencyKey) }
+    return $request
 }
 
-# Dòng tóm tắt cuối mỗi phần
-function Write-Summary($section, $sectionStart, $waitStart, $deadlockAt, $committed) {
-    if ($section -eq 'naive' -and $waitStart -and $deadlockAt) {
-        Write-Host ('   Hai lượt chờ nhau ~{0:N1} giây thì PostgreSQL mới phát hiện deadlock (deadlock_timeout mặc định 1 giây)' -f `
-            ($deadlockAt - $waitStart).TotalSeconds)
-    }
-    if ($section -eq 'ordered' -and $sectionStart -and $script:lastCommit) {
-        if ($committed.Count -eq 2) {
-            Write-Host ('   Không deadlock: lượt đến sau chỉ chờ lượt trước xong, cả hai chuyển xong sau ~{0:N2} giây' -f `
-                ($script:lastCommit - $sectionStart).TotalSeconds)
-        }
-    }
+# Gửi một request, trả về @{ Code = mã HTTP; Body = nội dung }
+function Send-Request($request) {
+    $response = $client.SendAsync($request).GetAwaiter().GetResult()
+    return @{ Code = [int]$response.StatusCode; Body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() }
 }
 
-$losers = @()
-$failed = 0
-for ($run = 1; $run -le $Runs; $run++) {
-    Write-Host "== Lần $run/$Runs`: chạy $testClass (A->B và B->A cùng lúc, chờ 50ms giữa hai lần khoá)"
-    $result = Invoke-DeadlockTest
-    $timeline = Show-Timeline $result.Lines
-    Write-Host ''
-
-    if ($result.ExitCode -eq 0) {
-        $summary = if (Test-Path $report) { (Get-Content $report | Select-String 'Tests run').Line } else { '' }
-        Write-Host "   Test XANH: $summary" -ForegroundColor Green
-        $losers += $timeline.Loser
-    } else {
-        $failed++
-        Write-Host "   Test ĐỎ (mã thoát Maven $($result.ExitCode)). Trích lỗi:" -ForegroundColor Red
-        $result.Lines | Where-Object { $_ -match '<<< (FAILURE|ERROR)|Expecting|expected|but was|Exception:' } |
-                Select-Object -First 10 | ForEach-Object { Write-Host "     $_" }
-        if (Test-Path $report) { Write-Host "   Chi tiết: $report" }
+# POST JSON, trả về body đã đọc thành object. Mã HTTP không phải 2xx thì in lỗi và dừng.
+function Invoke-Setup([string]$path, [string]$json, [string]$idempotencyKey) {
+    $result = Send-Request (New-JsonPost $path $json $idempotencyKey)
+    if ($result.Code -lt 200 -or $result.Code -ge 300) {
+        Write-Host "POST $path -> $($result.Code): $($result.Body)" -ForegroundColor Red
+        exit 2
     }
-    Write-Host ''
+    return $result.Body | ConvertFrom-Json
 }
 
-if ($Runs -gt 1 -and $losers.Count -gt 0) {
-    Write-Host '== Khoá theo thứ tự tham số: lượt bị PostgreSQL huỷ qua các lần chạy:'
-    $losers | Group-Object | Sort-Object Name | ForEach-Object { Write-Host ('{0,6} lần  {1}' -f $_.Count, $_.Name) }
+function Get-Json([string]$path) {
+    return (Send-Request (New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, "$BaseUrl$path"))).Body |
+            ConvertFrom-Json
 }
 
-if ($failed -eq 0) {
-    Write-Host "ĐÚNG ($Runs/$Runs lần): khoá theo thứ tự tham số → deadlock, PostgreSQL huỷ một lượt;" `
-        -ForegroundColor Green
-    Write-Host "      khoá theo thứ tự id tăng dần → không deadlock, cả hai lượt chuyển xong" -ForegroundColor Green
+try {
+    [void](Send-Request (New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, "$BaseUrl/api/products")))
+} catch {
+    Write-Host "Không gọi được $BaseUrl. App đã chạy chưa? (.\mvnw spring-boot:run)" -ForegroundColor Red
+    exit 2
+}
+
+Write-Host '== Bước 2: tạo hai người dùng A, B'
+$userIds = @{}
+foreach ($name in 'A', 'B') {
+    $user = Invoke-Setup '/api/users' (@{
+        email    = "transfer$run$($name.ToLower())@example.com"
+        fullName = "Người dùng $name $run"
+        username = "transfer$run$($name.ToLower())"
+        password = 'matkhau123'
+    } | ConvertTo-Json -Compress)
+    $userIds[$name] = $user.id
+    Write-Host "   $name`: userId = $($user.id)"
+}
+
+Write-Host "== Bước 3: tạo ví và nạp mỗi ví $InitialBalance"
+$walletIds = @{}
+foreach ($name in 'A', 'B') {
+    $wallet = Invoke-Setup '/api/wallets' ('{"userId":' + $userIds[$name] + '}')
+    $wallet = Invoke-Setup "/api/wallets/$($wallet.id)/deposits" ('{"amount":' + $InitialBalance + '}') "deposit-$run-$name"
+    $walletIds[$name] = $wallet.id
+    Write-Host "   ví $name`: id = $($wallet.id), số dư = $($wallet.balance)"
+}
+
+Write-Host "== Bước 4: $Pairs lượt A->B (1 / lượt) và $Pairs lượt B->A (2 / lượt) cùng lúc, $Parallel lượt chạy song song"
+$abJson = '{"fromWalletId":' + $walletIds['A'] + ',"toWalletId":' + $walletIds['B'] + ',"amount":1}'
+$baJson = '{"fromWalletId":' + $walletIds['B'] + ',"toWalletId":' + $walletIds['A'] + ',"amount":2}'
+$watch = [System.Diagnostics.Stopwatch]::StartNew()
+$tasks = New-Object System.Collections.ArrayList
+for ($i = 1; $i -le 2 * $Pairs; $i++) {
+    # xen kẽ A->B, B->A: hai chiều cùng chạy suốt cả lượt bắn
+    $json = if ($i % 2 -eq 1) { $abJson } else { $baJson }
+    [void]$tasks.Add($client.SendAsync((New-JsonPost '/api/wallets/transfers' $json "transfer-$run-$i")))
+}
+try {
+    [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]$tasks.ToArray())
+} catch {
+    # request lỗi kết nối / hết giờ: xem ở từng task bên dưới (mã 000)
+}
+$watch.Stop()
+Write-Host ("   xong sau ~{0:N1} giây" -f $watch.Elapsed.TotalSeconds)
+
+$results = foreach ($task in $tasks) {
+    if ($task.IsFaulted -or $task.IsCanceled) {
+        [PSCustomObject]@{ Code = '000'; Type = $null }
+        continue
+    }
+    $code = [int]$task.Result.StatusCode
+    $type = $null
+    if ($code -ge 400) {
+        $body = $task.Result.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        try { $type = (($body | ConvertFrom-Json).type -split '/')[-1] } catch { $type = '(không đọc được body)' }
+    }
+    [PSCustomObject]@{ Code = [string]$code; Type = $type }
+}
+
+Write-Host '   Mã HTTP (000 = không kết nối được / hết giờ chờ):'
+$results | Group-Object Code | Sort-Object Name | ForEach-Object { Write-Host ('{0,12} {1}' -f $_.Count, $_.Name) }
+$errors = @($results | Where-Object { $_.Type })
+if ($errors.Count -gt 0) {
+    Write-Host '   Loại lỗi:'
+    $errors | Group-Object Type | Sort-Object Name | ForEach-Object { Write-Host ('{0,12} {1}' -f $_.Count, $_.Name) }
+}
+
+Write-Host '== Bước 5: đọc lại số dư'
+$balanceA = [decimal](Get-Json "/api/wallets/$($walletIds['A'])").balance
+$balanceB = [decimal](Get-Json "/api/wallets/$($walletIds['B'])").balance
+$expectedA = $InitialBalance - $Pairs * 1 + $Pairs * 2
+$expectedB = $InitialBalance + $Pairs * 1 - $Pairs * 2
+$ok = @($results | Where-Object { $_.Code -eq '200' }).Count
+$deadlocks = @($results | Where-Object { $_.Type -eq 'deadlock' }).Count
+Write-Host "   chuyển xong     : $ok / $(2 * $Pairs)"
+Write-Host "   ví A            : $balanceA (mong đợi $expectedA)"
+Write-Host "   ví B            : $balanceB (mong đợi $expectedB)"
+Write-Host "   tổng            : $($balanceA + $balanceB) (mong đợi $(2 * $InitialBalance))"
+
+$client.Dispose()
+
+if ($ok -eq 2 * $Pairs -and $balanceA -eq $expectedA -and $balanceB -eq $expectedB) {
+    Write-Host "ĐÚNG: $(2 * $Pairs) lượt chuyển ngược chiều cùng lúc đều xong, không deadlock, số dư đúng" -ForegroundColor Green
     exit 0
 }
-Write-Host "SAI: $failed/$Runs lần test không như mong đợi" -ForegroundColor Red
+if ($deadlocks -gt 0) {
+    Write-Host "SAI: $deadlocks lượt bị huỷ vì deadlock (app khoá hai ví theo thứ tự khác nhau?)" -ForegroundColor Red
+} else {
+    Write-Host "SAI: có lượt chuyển không thành công hoặc số dư không đúng (xem ở trên)" -ForegroundColor Red
+}
 exit 1

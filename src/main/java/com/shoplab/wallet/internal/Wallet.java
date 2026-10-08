@@ -26,6 +26,11 @@ public class Wallet extends AuditedEntity {
         // dành cho JPA
     }
 
+    /** Ví mới, số dư 0. Chỉ tạo được trong package wallet (qua WalletService). */
+    Wallet(long userId) {
+        this.userId = userId;
+    }
+
     public Long getUserId() { return userId; }
     public BigDecimal getBalance() { return balance; }
 

@@ -22,6 +22,7 @@ import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 import java.net.URI;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -43,6 +44,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
     private static final String TYPE_BASE = "https://shoplab.dev/errors/";
     private static final String PG_LOCK_NOT_AVAILABLE = "55P03";   // lock_not_available (vượt quá lock_timeout)
+    private static final String PG_DEADLOCK_DETECTED = "40P01";    // deadlock_detected
 
 
     // ===================== 1. LỖI NGHIỆP VỤ =====================
@@ -61,14 +63,23 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     // ===================== 2. LỖI KHOÁ / DB / DỮ LIỆU =====================
 
     /**
-     * Chờ khoá quá lock_timeout: request trùng key đang chạy quá lâu,
-     * hoặc sản phẩm đang bị đơn khác khoá → 409 + Retry-After, client gửi lại với CÙNG key.
-     * Lỗi có thể tới theo 2 đường:
-     *  - qua JPA/Hibernate → PessimisticLockingFailureException
-     *  - qua JdbcClient    → UncategorizedSQLException (Spring không phân loại mã 55P03)
+     * Lỗi khi chờ khoá, client gửi lại với CÙNG key (409 + Retry-After):
+     *  - deadlock (40P01): PostgreSQL huỷ transaction này để gỡ vòng chờ với transaction khác → 409 deadlock;
+     *  - chờ khoá quá lock_timeout: request trùng key đang chạy quá lâu, hoặc dữ liệu đang bị request khác khoá
+     *    → 409 lock-timeout. Lỗi này có thể tới theo 2 đường:
+     *     - qua JPA/Hibernate → PessimisticLockingFailureException
+     *     - qua JdbcClient    → UncategorizedSQLException (Spring không phân loại mã 55P03)
      */
     @ExceptionHandler(PessimisticLockingFailureException.class)
     public ResponseEntity<ProblemDetail> handleLockTimeout(PessimisticLockingFailureException ex) {
+        if (hasSqlState(ex, PG_DEADLOCK_DETECTED)) {
+            log.warn("Deadlock detected: {}", ex.getMostSpecificCause().getMessage());
+            ProblemDetail pd = problem(HttpStatus.CONFLICT, "deadlock", "Deadlock Detected",
+                    "Thao tác bị huỷ vì tranh chấp khoá với một thao tác khác (deadlock), hãy thử lại");
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .header(HttpHeaders.RETRY_AFTER, "1")
+                    .body(pd);
+        }
         return lockTimeoutResponse();
     }
 
@@ -170,6 +181,15 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     }
 
     // ===================== HELPER =====================
+
+    private static boolean hasSqlState(Throwable ex, String sqlState) {
+        for (Throwable t = ex; t != null; t = t.getCause()) {
+            if (t instanceof SQLException sql && sqlState.equals(sql.getSQLState())) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private static ProblemDetail problem(HttpStatus status, String type, String title, String detail) {
         ProblemDetail pd = ProblemDetail.forStatusAndDetail(status, detail);

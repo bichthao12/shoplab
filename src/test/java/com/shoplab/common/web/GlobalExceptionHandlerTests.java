@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -13,6 +14,8 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.sql.SQLException;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
@@ -58,6 +61,21 @@ class GlobalExceptionHandlerTests {
     }
 
     @Test
+    @DisplayName("Deadlock (40P01) → 409 deadlock + Retry-After; lỗi khoá khác vẫn là 409 lock-timeout")
+    void deadlock_isReportedSeparatelyFromLockTimeout() throws Exception {
+        mvc.perform(get("/test/deadlock"))
+                .andExpect(status().isConflict())
+                .andExpect(header().string(HttpHeaders.RETRY_AFTER, "1"))
+                .andExpect(jsonPath("$.type").value("https://shoplab.dev/errors/deadlock"))
+                .andExpect(jsonPath("$.title").value("Deadlock Detected"));
+
+        mvc.perform(get("/test/lock-timeout"))
+                .andExpect(status().isConflict())
+                .andExpect(header().string(HttpHeaders.RETRY_AFTER, "1"))
+                .andExpect(jsonPath("$.type").value("https://shoplab.dev/errors/lock-timeout"));
+    }
+
+    @Test
     @DisplayName("Lỗi không lường trước → 500, không lộ chi tiết bên trong")
     void unexpectedError_returns500WithoutInternalDetail() throws Exception {
         mvc.perform(get("/test/unexpected"))
@@ -78,6 +96,18 @@ class GlobalExceptionHandlerTests {
         @GetMapping("/test/data-integrity")
         void dataIntegrity() {
             throw new DataIntegrityViolationException("duplicate key value violates unique constraint");
+        }
+
+        @GetMapping("/test/deadlock")
+        void deadlock() {
+            throw new CannotAcquireLockException("could not execute statement",
+                    new SQLException("ERROR: deadlock detected", "40P01"));
+        }
+
+        @GetMapping("/test/lock-timeout")
+        void lockTimeout() {
+            throw new CannotAcquireLockException("could not execute statement",
+                    new SQLException("ERROR: canceling statement due to lock timeout", "55P03"));
         }
 
         @GetMapping("/test/unexpected")
