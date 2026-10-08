@@ -46,7 +46,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Loại | Ví dụ | Dựng gì |
 |---|---|---|
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
-| Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
+| Test slice | `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
 | Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 
@@ -84,10 +84,9 @@ Mỗi dòng có thời điểm (ms) và tên luồng, nên lọc theo luồng l�
 04:12:01.293 [exec-1] TransactionLogging : BEGIN    DefaultIdempotencyService.execute
 04:12:01.303 [exec-1] JdbcTemplate       : Executing prepared SQL statement [INSERT INTO idempotency_keys ...]
 04:12:01.344 [exec-1] org.hibernate.SQL  : select ... from users u1_0 join accounts a1_0 ...
-04:12:01.452 [exec-1] org.hibernate.SQL  : select ... from products p1_0 where p1_0.id in (?) order by p1_0.id for no key update of p1_0
+04:12:01.452 [exec-1] JdbcTemplate       : Executing prepared SQL statement [UPDATE products SET stock = stock - ? ... WHERE id = ? AND active AND stock >= ? RETURNING ...]
 04:12:01.510 [exec-1] org.hibernate.SQL  : insert into orders ...
 04:12:01.516 [exec-1] org.hibernate.SQL  : insert into order_items ...
-04:12:01.521 [exec-1] org.hibernate.SQL  : update products set ... stock=? ...
 04:12:01.550 [exec-1] JdbcTemplate       : Executing prepared SQL statement [UPDATE idempotency_keys SET status = ? ...]
 04:12:01.558 [exec-1] TransactionLogging : COMMIT   DefaultIdempotencyService.execute
 ```
@@ -224,7 +223,32 @@ Content-Type: application/json
 | 415 | `Content-Type` không phải `application/json` |
 | 500 | Lỗi không lường trước (chi tiết chỉ ghi log, không trả ra ngoài) |
 
-### Vì sao trừ kho phải khoá trước
+### Trừ kho: một câu UPDATE có điều kiện
+
+`DefaultProductInventory` trừ kho mỗi sản phẩm bằng đúng một câu lệnh, và chỉ nhận khi câu lệnh cập nhật được **đúng 1 dòng**:
+
+```sql
+UPDATE products
+SET stock = stock - :quantity, version = version + 1, updated_at = now()
+WHERE id = :id AND active AND stock >= :quantity
+RETURNING id, sku, name, price      -- chụp vào dòng đơn
+```
+
+- **Kiểm tra và trừ nằm trong cùng một câu**, nên không có khoảng hở giữa "đọc" và "ghi". Nhiều đơn cùng trừ một sản phẩm thì PostgreSQL cho các câu UPDATE lần lượt khoá dòng: câu đến sau chờ câu trước commit, rồi kiểm tra lại `stock >= :quantity` trên con số mới nhất.
+- **Cập nhật 0 dòng** (không tồn tại, ngừng bán hoặc không đủ hàng) thì ném lỗi; transaction của đơn rollback, kể cả phần đã trừ của các sản phẩm trước trong cùng đơn, và không đơn nào được tạo. Lý do được đọc lại sau đó để trả đúng lỗi: `invalid-order` (422) hoặc `insufficient-stock` (409).
+- Các sản phẩm của một đơn được trừ theo thứ tự `productId`, nên mọi đơn khoá các dòng theo cùng thứ tự → không deadlock.
+- **`version = version + 1`**: câu UPDATE không đi qua entity, nên `Product` đã nạp trước đó trong cùng transaction vẫn giữ số tồn kho cũ. Tăng version để entity cũ đó nếu bị sửa và lưu lại sẽ gặp lỗi xung đột (`@Version`) thay vì ghi đè số tồn kho mới.
+- Đây là chỗ duy nhất quy tắc "không bán quá tồn kho" không nằm trong entity: nó nằm trong câu SQL, vì chỉ DB mới kiểm tra và trừ được trong cùng một bước. Ràng buộc `CHECK (stock >= 0)` của bảng là lớp chặn cuối.
+
+Mỗi phần của câu lệnh đều có test giữ. Thử bỏ từng phần thì:
+
+| Bỏ đi | Điều xảy ra (1.000 lượt mua, kho 1) | Test bắt được |
+|---|---|---|
+| Kiểm tra "đúng 1 dòng" | 1.000 × `201`: **1.000 đơn** cho 1 cái hàng | `FlashSaleIntegrationTests` |
+| Điều kiện `stock >= :quantity` | CHECK của DB chặn kho âm, nhưng 999 người nhận `409 data-integrity` thay vì "hết hàng" | `FlashSaleIntegrationTests` |
+| `version = version + 1` | `Product` nạp trước đó lưu lại được, ghi đè kho về số cũ | `ProductModuleTests` |
+
+### So với cách "đọc → kiểm tra → trừ ở Java → lưu"
 
 `NaiveStockDeductionTests` so sánh bản thật với một bản "ngây thơ" (`NaiveProductInventory`, chỉ có trong test): đọc tồn kho → kiểm tra còn hàng → trừ ở Java → lưu, không khoá gì. Kịch bản: 8 người cùng mua 1 cái, kho còn 5.
 
@@ -232,7 +256,7 @@ Content-Type: application/json
 |---|---|---|---|---|
 | Ngây thơ, lưu bằng `UPDATE products SET stock = ?` | **8** | 0 | **4** | Cả 8 cùng đọc 5, cùng thấy còn hàng, cùng ghi 5 − 1 = 4: lần ghi sau đè lần ghi trước (lost update). Bán vượt 3 cái, mà kho vẫn báo còn 4 |
 | Ngây thơ, lưu qua entity (`@Version`) | 1 | 7 xung đột | 4 | `UPDATE ... WHERE id = ? AND version = ?`: người ghi đầu tiên đổi version, 7 người sau không khớp nên rollback. Không bán vượt, nhưng từ chối 7 người dù kho còn 4 |
-| Bản thật: `SELECT ... FOR UPDATE` rồi mới kiểm tra | **5** | 3 hết hàng | **0** | Người sau chờ người trước commit rồi mới đọc, nên luôn đọc con số mới nhất |
+| Bản thật: `UPDATE ... WHERE stock >= ?`, nhận khi cập nhật đúng 1 dòng | **5** | 3 hết hàng | **0** | Kiểm tra và trừ trong cùng một câu; câu sau chờ câu trước commit rồi kiểm tra lại trên con số mới nhất |
 
 Log SQL của bản ngây thơ cho thấy rõ: 8 câu `SELECT` chạy trước, sau đó mới tới 8 câu `UPDATE`. Trong test, bản ngây thơ được giữ lại giữa bước kiểm tra và bước lưu tới khi cả 8 người đã đọc, để kết quả không tuỳ may rủi; bỏ chỗ giữ lại thì trên máy dev vẫn ra đúng kết quả trên (5/5 lần chạy), vì 8 câu `SELECT` xong trước khi câu `UPDATE` đầu tiên kịp chạy.
 
@@ -246,12 +270,12 @@ Mỗi test tạo một sản phẩm còn 1 cái, rồi `buyAtOnce(productId, 100
 
 | Test | Giữ hàng bằng | Response | Số đơn | Kho còn |
 |---|---|---|---|---|
-| `FlashSaleIntegrationTests` | Bản thật: `SELECT ... FOR UPDATE` rồi mới kiểm tra | 1 × `201`, 999 × `409 insufficient-stock` | **1** | 0 |
+| `FlashSaleIntegrationTests` | Bản thật: `UPDATE` có điều kiện, nhận khi cập nhật đúng 1 dòng | 1 × `201`, 999 × `409 insufficient-stock` | **1** | 0 |
 | `NaiveFlashSaleTests` | Bản ngây thơ: đọc → kiểm tra → trừ ở Java → `UPDATE stock = ?` | 10 × `201`, 990 × `409 insufficient-stock` | **10** | 0 |
 
 - **Bản ngây thơ bán vượt tối đa bằng số connection của pool** (Hikari mặc định 10). Mỗi lượt mua giữ một connection suốt transaction, nên cùng lúc chỉ có 10 lượt đọc được "còn 1 cái" trước khi lượt đầu tiên commit; các lượt sau đều đọc thấy 0. Kho vẫn báo 0 nên nhìn tồn kho không phát hiện được.
 - **Không ép thứ tự thì số đơn thay đổi theo từng lần chạy.** 5 lần chạy thử cho 6, 10, 9, 1, 10 đơn; có lần chỉ ra 1 đơn, tức lỗi không lộ ra. Vì vậy `NaiveFlashSaleTests` giữ mỗi lượt mua lại giữa bước kiểm tra và bước lưu tới khi 10 lượt đã cùng đọc kho (trường hợp xấu nhất), để luôn ra 10 đơn.
-- **Đếm số đơn thôi chưa đủ.** Thử bỏ `FOR UPDATE` ở bản thật thì vẫn chỉ ra 1 đơn (`@Version` chặn được bán vượt), nhưng 9 lượt mua nhận `409 concurrent-modification` thay vì "hết hàng". Test kiểm tra cả cách phân bố response nên vẫn bắt được.
+- **Đếm số đơn thôi chưa đủ.** Thử bỏ điều kiện `stock >= :quantity` thì vẫn chỉ ra 1 đơn (CHECK `stock >= 0` của DB chặn được kho âm), nhưng 999 lượt mua nhận `409 data-integrity` thay vì "hết hàng". Test kiểm tra cả cách phân bố response nên vẫn bắt được.
 - Hai test này tắt log SQL (`@TestPropertySource`), vì 1.000 request in ra khoảng 18.000 dòng.
 
 #### Tự chạy với app thật: `scripts/flash-sale.sh` / `scripts/flash-sale.ps1`
@@ -301,7 +325,7 @@ Script tạo một người mua và một sản phẩm mới (không đụng d�
 ĐÚNG: bán đúng 1 cái, các lượt còn lại đều nhận "hết hàng"
 ```
 
-Mã thoát: `0` nếu bán đúng `min(STOCK, BUYERS)` cái và mọi lượt còn lại đều nhận "hết hàng"; `1` nếu bán vượt hoặc có lượt nhận lỗi khác (vd bỏ `FOR UPDATE` thì vẫn 1 đơn nhưng 9 lượt nhận `concurrent-modification`); `2` nếu không chạy được (app chưa chạy, thiếu `curl` / `jq`).
+Mã thoát: `0` nếu bán đúng `min(STOCK, BUYERS)` cái và mọi lượt còn lại đều nhận "hết hàng"; `1` nếu bán vượt hoặc có lượt nhận lỗi khác (vd bỏ kiểm tra "đúng 1 dòng" thì 1.000 đơn; bỏ điều kiện `stock >= :quantity` thì vẫn 1 đơn nhưng 999 lượt nhận `data-integrity`); `2` nếu không chạy được (app chưa chạy, thiếu `curl` / `jq`).
 
 ### Cách hoạt động của Idempotency
 
@@ -314,8 +338,8 @@ Ghi key, tạo đơn, trừ kho và lưu response diễn ra trong **một transa
 ```
 BEGIN
   INSERT key ... ON CONFLICT DO NOTHING   -- request trùng key phải chờ ở đây
-  SELECT products ... FOR UPDATE          -- khoá sản phẩm, chống bán vượt tồn kho
-  trừ kho, tạo order
+  UPDATE products ... WHERE stock >= ?    -- trừ kho có điều kiện, 0 dòng → huỷ cả đơn
+  tạo order
   UPDATE key → COMPLETED + status, header, body của response
 COMMIT
 ```
@@ -463,7 +487,7 @@ Vi phạm thì test đỏ và chỉ rõ chỗ vi phạm.
 
 Các quy ước khác:
 - `order` lấy người đặt qua API `UserDirectory.requireActiveUser(...)` (chỉ tài khoản ACTIVE mới đặt được) và chụp lại tên, email; kiểm tra này chạy trước khi giữ hàng.
-- `order` giữ hàng qua API `ProductInventory.reserveStock(...)`: module product khoá, kiểm tra và trừ kho ngay trong transaction của đơn. Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
+- `order` giữ hàng qua API `ProductInventory.reserveStock(...)`: module product trừ kho bằng một câu UPDATE có điều kiện ngay trong transaction của đơn (xem *Trừ kho: một câu UPDATE có điều kiện*). Dòng đơn tham chiếu sản phẩm bằng `productId` và chụp lại `sku`, tên, giá tại thời điểm đặt, nên sửa sản phẩm không làm đổi đơn cũ.
 - Entity tự chuẩn hoá và tự kiểm tra dữ liệu của mình (`Product`, `Order`, `User`, `Account`). Service nhận command (`CreateProductCommand`, `CreateOrderCommand`, `RegisterUserCommand`...) và trả entity; controller đổi DTO web ↔ command / entity.
 - Entity kế thừa `common.BaseEntity` (id lấy từ sequence của bảng, khai báo bằng `@SequenceGenerator` trên class) hoặc `common.AuditedEntity` (thêm `version`, `createdAt`, `updatedAt` do Spring Data auditing điền).
 - Lỗi nghiệp vụ kế thừa `common.ApiException` (tự mang status, `type`, `title`). `GlobalExceptionHandler` không import exception của module nào.
@@ -483,7 +507,7 @@ Các module dùng chung một schema. Mỗi module chỉ đọc/ghi bảng của
 Khoá ngoại chỉ nối các bảng **trong cùng một module** (`order_items → orders`, `accounts → users`). Giữa hai module chỉ lưu id (vd `order_items.product_id`, `orders.user_id`), không có khoá ngoại (V10 bỏ `fk_order_items_product`). Nhờ vậy mỗi module có thể đổi bảng, tách schema hay tách DB riêng mà không kéo module khác theo. Toàn vẹn dữ liệu giữa các module do code giữ:
 - Dòng đơn đã chụp `sku`, tên, giá, và đơn đã chụp tên, email người đặt, nên không cần đọc lại `products` hay `users`.
 - Chưa có API xoá người dùng, nên chưa cần chặn xoá người dùng đã có đơn. Khi thêm, làm giống `ProductReferences`.
-- Không xoá được sản phẩm đã có trong đơn: `ProductService.delete` khoá dòng sản phẩm (`FOR UPDATE`), rồi hỏi các module qua `ProductReferences`. Tạo đơn cũng khoá dòng này khi giữ hàng, nên đơn đang tạo dở không lọt qua được: lệnh xoá chờ đơn commit rồi mới kiểm tra (→ 409); còn nếu lệnh xoá đến trước thì đơn đến sau không còn thấy sản phẩm (→ 422 `invalid-order`).
+- Không xoá được sản phẩm đã có trong đơn: `ProductService.delete` khoá dòng sản phẩm (`FOR UPDATE`), rồi hỏi các module qua `ProductReferences`. Tạo đơn cũng khoá dòng này khi giữ hàng (câu UPDATE trừ kho), nên đơn đang tạo dở không lọt qua được: lệnh xoá chờ đơn commit rồi mới kiểm tra (→ 409); còn nếu lệnh xoá đến trước thì đơn đến sau không còn thấy sản phẩm (→ 422 `invalid-order`).
 
 ### Tài liệu module sinh tự động
 
@@ -541,7 +565,7 @@ src/test/java/com/shoplab/
 │   ├── internal/       OrderTest, CreateOrderCommandTest
 │   └── web/            OrderApiIntegrationTests, OrderIdempotencyIntegrationTests, FlashSaleIntegrationTests
 ├── product/            ProductModuleTests
-│   ├── internal/       ProductTest, ProductRepositoryTests,
+│   ├── internal/       ProductTest,
 │   │                   NaiveProductInventory + NaiveStockDeductionTests, NaiveFlashSaleTests
 │   │                   (bản trừ kho ngây thơ, để so sánh)
 │   └── web/            ProductApiIntegrationTests
