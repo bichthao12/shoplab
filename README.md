@@ -386,40 +386,37 @@ Quy tắc chung: chỗ nào khoá nhiều dòng trong cùng một transaction th
 
 #### Tự chạy với app thật: `scripts/transfer-deadlock.ps1`
 
-Script gọi API ví: tạo hai người dùng A, B, tạo ví và nạp mỗi ví `-InitialBalance` (mặc định 1000), rồi bắn cùng lúc `-Pairs` lượt A→B (1 đồng / lượt) và `-Pairs` lượt B→A (2 đồng / lượt), tối đa `-Parallel` request song song, mỗi lượt một `Idempotency-Key` riêng. Cuối cùng đọc lại số dư và đối chiếu.
+Cùng kịch bản với `TransferDeadlockTests`, nhưng gọi API của app đang chạy. Mỗi vòng: tạo hai người dùng A, B, tạo ví và nạp mỗi ví 100, rồi gửi **cùng lúc** 1 lượt A→B 10 và 1 lượt B→A 30 (`POST /api/wallets/transfers`, mỗi lượt một `Idempotency-Key`), in lượt nào xong trước, sau bao lâu, rồi đọc lại số dư.
 
 ```powershell
 # cần app đang chạy (.\mvnw spring-boot:run)
-powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1                          # 100 + 100 lượt, 50 song song
-powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1 -Pairs 500 -Parallel 100
+powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1             # 1 vòng
+powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1 -Runs 10    # 10 vòng, mỗi vòng hai ví mới
 ```
 
 ```
-== Bước 4: 100 lượt A->B (1 / lượt) và 100 lượt B->A (2 / lượt) cùng lúc, 50 lượt chạy song song
-   xong sau ~1.5 giây
-   Mã HTTP (000 = không kết nối được / hết giờ chờ):
-         200 200
-== Bước 5: đọc lại số dư
-   chuyển xong     : 200 / 200
-   ví A            : 1100 (mong đợi 1100)
-   ví B            : 900 (mong đợi 900)
-   tổng            : 2000 (mong đợi 2000)
-ĐÚNG: 200 lượt chuyển ngược chiều cùng lúc đều xong, không deadlock, số dư đúng
+== Vòng 1/1
+   ví A (id 4802) = 100, ví B (id 4803) = 100
+   gửi cùng lúc: A->B 10 | B->A 30
+   A->B 10  → 200 sau   50 ms   (sau lượt này: ví nguồn = 90, ví đích = 110)
+   B->A 30  → 200 sau   66 ms   (sau lượt này: ví nguồn = 80, ví đích = 120)
+   số dư cuối: A = 120 (mong đợi 120), B = 80 (mong đợi 80), tổng 200
+   ĐÚNG
+
+ĐÚNG (1/1 vòng): A->B và B->A cùng lúc đều chuyển xong, không deadlock, A = 120, B = 80
 ```
 
-Mã thoát `0` nếu mọi lượt chuyển đều `200` và số dư đúng; `1` nếu không; `2` nếu không chạy được (app chưa chạy, `-InitialBalance` nhỏ hơn `2 × -Pairs`).
+Lượt B→A trả về số dư sau khi A→B đã chuyển xong (ví nguồn 110 → 80, ví đích 90 → 120): nó chờ A→B nhả khoá rồi mới chạy. Mã thoát `0` nếu mọi vòng đều đúng; `1` nếu có vòng sai; `2` nếu không chạy được (app chưa chạy).
 
-Cùng script, chạy với một bản app cố ý khoá theo thứ tự tham số (`-Pairs 50`):
+**Nên chạy nhiều vòng.** App thật không có `sleep(50)` giữa hai lần khoá như trong test, nên chỉ một cặp chuyển tiền thì hai lượt không phải lúc nào cũng chồng lên nhau. Chạy 20 vòng với một bản app cố ý khoá theo thứ tự tham số:
 
 ```
-   xong sau ~29.2 giây
-   Mã HTTP:            7 × 200,  93 × 409
-   Loại lỗi:          92 × deadlock,  1 × lock-timeout
-   chuyển xong     : 7 / 100
-SAI: 92 lượt bị huỷ vì deadlock (app khoá hai ví theo thứ tự khác nhau?)
+   B->A 30  → 409 deadlock sau 1044 ms: Thao tác bị huỷ vì tranh chấp khoá với một thao tác khác (deadlock), hãy thử lại
+   ...
+SAI: 13/20 vòng không như mong đợi, 13 lượt bị huỷ vì deadlock (app khoá hai ví theo thứ tự khác nhau?)
 ```
 
-Dưới tải, deadlock không chỉ làm hỏng một lượt: mỗi lần PostgreSQL phải chờ 1 giây mới phát hiện, trong lúc đó các transaction kẹt vẫn giữ connection, nên pool (10 connection) cạn và các request khác xếp hàng tới hết giờ chờ. Tổng tiền vẫn đúng (lượt bị huỷ rollback), nhưng 93% yêu cầu chuyển tiền thất bại. Muốn xem chi tiết từng bước khoá của bản sai, chạy `.\mvnw test -Dtest=TransferDeadlockTests` và đọc log (`BEGIN` / `SELECT ... FOR UPDATE` / `deadlock detected` / `ROLLBACK`).
+13/20 vòng bị deadlock (lượt thua chờ đúng ~1 giây rồi nhận `409 deadlock`), 7 vòng còn lại "qua" nhờ may. Một vòng có thể bỏ sót lỗi; `-Runs 10` thì gần như chắc chắn bắt được. Muốn xem chi tiết từng bước khoá của bản sai, chạy `.\mvnw test -Dtest=TransferDeadlockTests` và đọc log (`BEGIN` / `SELECT ... FOR UPDATE` / `deadlock detected` / `ROLLBACK`).
 
 ### Cách hoạt động của Idempotency
 
