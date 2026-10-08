@@ -40,8 +40,8 @@ class TransferDeadlockTests extends IntegrationTestBase {
 
         long start = System.nanoTime();
         List<Outcome> outcomes = Concurrently.run(2, i -> i == 0
-                ? transfer(transfer, "transfer A→B", a, b, "10.00")
-                : transfer(transfer, "transfer B→A", b, a, "30.00"));
+                ? transfer(transfer, "transfer A->B", a, b, "10.00")
+                : transfer(transfer, "transfer B->A", b, a, "30.00"));
         Duration took = Duration.ofNanos(System.nanoTime() - start);
 
         assertThat(outcomes).containsExactlyInAnyOrder(Outcome.TRANSFERRED, Outcome.DEADLOCK);

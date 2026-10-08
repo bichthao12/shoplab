@@ -58,6 +58,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 - **Postman:** import `shoplab.postman_collection.json` → *Run collection* (chạy đúng thứ tự). Biến `baseUrl` mặc định `http://localhost:8080`.
 - **File `.http`** (IntelliJ / VS Code REST Client): `products.http`, `users.http`.
 - **Bán chớp nhoáng với app đang chạy:** `scripts\flash-sale.ps1` (xem mục *Test bán chớp nhoáng*).
+- **Deadlock chuyển tiền:** `scripts\transfer-deadlock.ps1` (xem mục *Deadlock*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -346,6 +347,36 @@ Mỗi bên giữ một khoá và chờ khoá bên kia: không bên nào đi ti�
 - Không mất tiền: lượt bị huỷ rollback toàn bộ, tổng số dư hai ví không đổi. Nhưng cả hai lượt đều bị treo khoảng 1 giây, và một lượt thất bại dù hợp lệ.
 - Phía Spring nhận `CannotAcquireLockException` (một `PessimisticLockingFailureException`). `GlobalExceptionHandler` hiện xếp loại này vào `409 lock-timeout`, nên khi thêm API chuyển tiền cần báo riêng trường hợp deadlock.
 - `sleep(50)` để chắc chắn cả hai bên đã giữ khoá đầu tiên trước khi xin khoá thứ hai. Bỏ đi thì trên máy dev vẫn deadlock 10/10 lần, nhưng không đảm bảo trên máy khác.
+
+#### Tự chạy: `scripts/transfer-deadlock.ps1`
+
+Module ví chưa có REST API, nên script chạy chính test này qua Maven (cần Docker đang chạy, như mọi test) rồi đọc log SQL / transaction để in diễn biến:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1            # 1 lần
+powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1 -Runs 3    # thấy lượt bị huỷ đổi ngẫu nhiên
+```
+
+```
+06:16:21.478  B->A    BEGIN
+06:16:21.478  A->B    BEGIN
+06:16:21.563  A->B    khoá ví nguồn (SELECT ... FOR UPDATE)
+06:16:21.564  B->A    khoá ví nguồn (SELECT ... FOR UPDATE)
+06:16:21.663  A->B    xin khoá ví đích ... chờ
+06:16:21.663  B->A    xin khoá ví đích ... chờ
+06:16:22.673  A->B    PostgreSQL: deadlock detected (40P01)
+                      Process 1827 waits for ShareLock on transaction 45904; blocked by process 1823.
+                      Process 1823 waits for ShareLock on transaction 45905; blocked by process 1827.
+06:16:22.685  A->B    ROLLBACK: bị huỷ, không chuyển gì
+06:16:22.700  B->A    cập nhật số dư (UPDATE wallets)
+06:16:22.705  B->A    cập nhật số dư (UPDATE wallets)
+06:16:22.710  B->A    COMMIT: chuyển xong
+   Hai lượt chờ nhau ~1.0 giây thì PostgreSQL mới phát hiện deadlock (deadlock_timeout mặc định 1 giây)
+   Test XANH: Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 ...
+ĐÚNG: 1/1 lần đều deadlock, PostgreSQL huỷ một lượt, lượt kia chuyển xong, tổng tiền không đổi
+```
+
+Mã thoát `0` nếu mọi lần chạy đều tái hiện đúng deadlock (test xanh), `1` nếu không (script in kèm trích lỗi của test).
 
 ### Cách hoạt động của Idempotency
 
