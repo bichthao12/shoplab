@@ -1,5 +1,6 @@
 package com.shoplab.order.web;
 
+import com.shoplab.Concurrently;
 import com.shoplab.IntegrationTestBase;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -9,16 +10,10 @@ import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -268,7 +263,7 @@ class OrderIdempotencyIntegrationTests extends IntegrationTestBase {
         String body = orderJson(productId, 1);
         int n = 8;
 
-        List<HttpResponse<String>> responses = sendConcurrently(n, i -> postOrder(key, body));
+        List<HttpResponse<String>> responses = Concurrently.run(n, i -> postOrder(key, body));
 
         assertThat(responses).allSatisfy(r -> assertThat(r.statusCode()).isEqualTo(201));
         long replayed = responses.stream()
@@ -288,7 +283,7 @@ class OrderIdempotencyIntegrationTests extends IntegrationTestBase {
         long productId = createProduct("PAR-002", 100_000, 5);
         String body = orderJson(productId, 1);
 
-        List<HttpResponse<String>> responses = sendConcurrently(8, i -> postOrder(newKey(), body));
+        List<HttpResponse<String>> responses = Concurrently.run(8, i -> postOrder(newKey(), body));
 
         long created = responses.stream().filter(r -> r.statusCode() == 201).count();
         long outOfStock = responses.stream()
@@ -333,34 +328,8 @@ class OrderIdempotencyIntegrationTests extends IntegrationTestBase {
     }
 
     // =====================================================================
-    // Helpers riêng của test đồng thời
+    // Helpers
     // =====================================================================
-
-    @FunctionalInterface
-    private interface Call {
-        HttpResponse<String> send(int index) throws Exception;
-    }
-
-    /** Bắn n request cùng lúc (cùng chờ 1 "tiếng súng" CountDownLatch). */
-    private List<HttpResponse<String>> sendConcurrently(int n, Call call) throws Exception {
-        CountDownLatch startSignal = new CountDownLatch(1);
-        List<Future<HttpResponse<String>>> futures = new ArrayList<>();
-        try (ExecutorService pool = Executors.newFixedThreadPool(n)) {
-            for (int i = 0; i < n; i++) {
-                int index = i;
-                futures.add(pool.submit(() -> {
-                    startSignal.await();
-                    return call.send(index);
-                }));
-            }
-            startSignal.countDown();
-            List<HttpResponse<String>> responses = new ArrayList<>();
-            for (Future<HttpResponse<String>> f : futures) {
-                responses.add(f.get(60, TimeUnit.SECONDS));
-            }
-            return responses;
-        }
-    }
 
     private boolean keyExists(String key) {
         return jdbc.sql("SELECT count(*) FROM idempotency_keys WHERE idem_key = :key")

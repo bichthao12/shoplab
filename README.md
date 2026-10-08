@@ -45,10 +45,12 @@ Test đặt theo package của từng module, gồm 5 loại:
 
 | Loại | Ví dụ | Dựng gì |
 |---|---|---|
-| Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest` | Không Spring, không DB |
+| Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
 | Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+
+Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
 
 ### Test thủ công
@@ -426,6 +428,7 @@ src/test/java/com/shoplab/
 ├── TestcontainersConfiguration.java          PostgreSQL 17 (cùng bản với docker-compose)
 ├── TestShoplabApplication.java
 ├── IntegrationTestBase.java                  nền chung cho integration test qua HTTP
+├── Concurrently.java                         chạy N tác vụ cùng lúc (virtual thread + CountDownLatch)
 ├── ModularityTests.java                      kiểm tra cấu trúc module, sinh tài liệu module
 ├── DatabaseModularityTests.java              bảng thuộc module nào, không có khoá ngoại chéo module
 ├── common/web/         GlobalExceptionHandlerTests
