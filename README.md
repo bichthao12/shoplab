@@ -57,6 +57,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 
 - **Postman:** import `shoplab.postman_collection.json` → *Run collection* (chạy đúng thứ tự). Biến `baseUrl` mặc định `http://localhost:8080`.
 - **File `.http`** (IntelliJ / VS Code REST Client): `products.http`, `users.http`.
+- **Bán chớp nhoáng với app đang chạy:** `./scripts/flash-sale.sh` (xem mục *Test bán chớp nhoáng*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -252,6 +253,39 @@ Mỗi test tạo một sản phẩm còn 1 cái, rồi `buyAtOnce(productId, 100
 - **Không ép thứ tự thì số đơn thay đổi theo từng lần chạy.** 5 lần chạy thử cho 6, 10, 9, 1, 10 đơn; có lần chỉ ra 1 đơn, tức lỗi không lộ ra. Vì vậy `NaiveFlashSaleTests` giữ mỗi lượt mua lại giữa bước kiểm tra và bước lưu tới khi 10 lượt đã cùng đọc kho (trường hợp xấu nhất), để luôn ra 10 đơn.
 - **Đếm số đơn thôi chưa đủ.** Thử bỏ `FOR UPDATE` ở bản thật thì vẫn chỉ ra 1 đơn (`@Version` chặn được bán vượt), nhưng 9 lượt mua nhận `409 concurrent-modification` thay vì "hết hàng". Test kiểm tra cả cách phân bố response nên vẫn bắt được.
 - Hai test này tắt log SQL (`@TestPropertySource`), vì 1.000 request in ra khoảng 18.000 dòng.
+
+#### Tự chạy với app thật: `scripts/flash-sale.sh`
+
+Cần app đang chạy, `curl` và `jq` (Windows: chạy trong Git Bash, cài `jq` bằng `winget install jqlang.jq`).
+
+```bash
+docker compose up -d
+./mvnw spring-boot:run -Dspring-boot.run.arguments="--logging.level.sql=INFO --logging.level.tx=INFO"
+
+# terminal khác
+./scripts/flash-sale.sh                                 # 1000 lượt mua, kho 1, 200 lượt song song
+BUYERS=300 STOCK=7 PARALLEL=50 ./scripts/flash-sale.sh  # đổi kịch bản
+```
+
+Script tạo một người mua và một sản phẩm mới (không đụng dữ liệu cũ), bắn `BUYERS` request `POST /api/orders` với `PARALLEL` request song song, mỗi request một `Idempotency-Key` riêng, rồi in số response theo mã HTTP và loại lỗi, số đơn, tồn kho còn lại:
+
+```
+== Bước 4: 1000 lượt mua, 200 lượt chạy song song
+   xong sau ~4 giây
+   Mã HTTP (000 = không kết nối được):
+           1 201
+         999 409
+   Loại lỗi:
+         999 insufficient-stock
+== Bước 5: đếm đơn và xem kho
+   số đơn trong DB : 1 (mong đợi 1)
+   response 201    : 1 (mong đợi 1)
+   hết hàng        : 999 (mong đợi 999)
+   kho còn         : 0 (mong đợi 0)
+ĐÚNG: bán đúng 1 cái, các lượt còn lại đều nhận "hết hàng"
+```
+
+Mã thoát: `0` nếu bán đúng `min(STOCK, BUYERS)` cái và mọi lượt còn lại đều nhận "hết hàng"; `1` nếu bán vượt hoặc có lượt nhận lỗi khác (vd bỏ `FOR UPDATE` thì vẫn 1 đơn nhưng 9 lượt nhận `concurrent-modification`); `2` nếu không chạy được (app chưa chạy, thiếu `curl` / `jq`).
 
 ### Cách hoạt động của Idempotency
 
