@@ -6,6 +6,9 @@ import jakarta.persistence.TransactionRequiredException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
@@ -16,7 +19,7 @@ import java.math.BigDecimal;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * Bẫy gọi nội bộ của @Transactional (xem BatchTransferService): method @Transactional được gọi từ method khác
@@ -34,16 +37,24 @@ class SelfInvocationTrapTests extends IntegrationTestBase {
 
     private static final long MISSING_WALLET = 999_999_999L;
 
+    private static final Logger log = LoggerFactory.getLogger(SelfInvocationTrapTests.class);
+
     @Autowired BatchTransferService batch;   // proxy Spring tạo vì class có @Transactional
     @Autowired WalletService walletService;
 
     private long a;
     private long b;
 
+    /**
+     * Mỗi test ghi một dòng CASE lúc bắt đầu và một dòng RESULT TRƯỚC khi kiểm tra (để test có fail thì vẫn thấy số dư
+     * thật). Log ASCII, để scripts/self-invocation-trap.ps1 đọc được output Maven trên mọi console.
+     */
     @BeforeEach
-    void createWallets() {
+    void createWallets(TestInfo info) {
         a = createWallet(1, "100.00");
         b = createWallet(2, "100.00");
+        log.info("[self-invocation] CASE {} a={} b={} missing={}",
+                info.getTestMethod().orElseThrow().getName(), a, b, MISSING_WALLET);
     }
 
     @Test
@@ -51,9 +62,10 @@ class SelfInvocationTrapTests extends IntegrationTestBase {
     void transfer_calledThroughProxy_rollsBack() {
         assertThat(AopUtils.isAopProxy(batch)).isTrue();
 
-        assertThatThrownBy(() -> batch.transfer(new TransferCommand(a, MISSING_WALLET, new BigDecimal("30"))))
-                .isInstanceOf(WalletNotFoundException.class);
+        Throwable error = catchThrowable(() -> batch.transfer(new TransferCommand(a, MISSING_WALLET, new BigDecimal("30"))));
+        logResult(error, batch.lastTransferHadTransaction());
 
+        assertThat(error).isInstanceOf(WalletNotFoundException.class);
         assertThat(batch.lastTransferHadTransaction()).isTrue();
         assertThat(balanceOf(a)).isEqualByComparingTo("100.00");
     }
@@ -62,6 +74,7 @@ class SelfInvocationTrapTests extends IntegrationTestBase {
     @DisplayName("BẪY: transferAll gọi this.transfer → không có transaction; lượt lỗi vẫn trừ 30 của A mà không ai nhận → mất 30")
     void transferAll_selfInvocation_losesMoney() {
         List<Outcome> outcomes = batch.transferAll(payroll());
+        logResult(outcomes, batch.lastTransferHadTransaction());
 
         assertThat(outcomes).containsExactly(Outcome.FAILED, Outcome.TRANSFERRED);
         assertThat(batch.lastTransferHadTransaction()).isFalse();
@@ -74,6 +87,7 @@ class SelfInvocationTrapTests extends IntegrationTestBase {
     @DisplayName("SỬA: mỗi lượt chạy trong transaction mở bằng TransactionTemplate → lượt lỗi rollback, lượt kia vẫn chuyển, tổng giữ 200")
     void transferAllEachInOwnTransaction_keepsMoney() {
         List<Outcome> outcomes = batch.transferAllEachInOwnTransaction(payroll());
+        logResult(outcomes, batch.lastTransferHadTransaction());
 
         assertThat(outcomes).containsExactly(Outcome.FAILED, Outcome.TRANSFERRED);
         assertThat(balanceOf(a)).isEqualByComparingTo("90.00");    // lượt lỗi đã rollback: chỉ trừ 10
@@ -88,13 +102,23 @@ class SelfInvocationTrapTests extends IntegrationTestBase {
         WalletService target = AopTestUtils.getTargetObject(walletService);
         assertThat(AopUtils.isAopProxy(target)).isFalse();
 
-        assertThatThrownBy(() -> target.transfer(new TransferCommand(a, b, new BigDecimal("10"))))
+        Throwable error = catchThrowable(() -> target.transfer(new TransferCommand(a, b, new BigDecimal("10"))));
+        logResult(error, "-");
+
+        assertThat(error)
                 .isInstanceOf(InvalidDataAccessApiUsageException.class)
                 .hasCauseInstanceOf(TransactionRequiredException.class);
-
         // May mắn chứ không phải được thiết kế để chặn: đổi sang findById + save (như BatchTransferService) là mất tiền
         assertThat(balanceOf(a)).isEqualByComparingTo("100.00");
         assertThat(balanceOf(b)).isEqualByComparingTo("100.00");
+    }
+
+    /** outcome: danh sách kết quả từng lượt, hoặc lỗi (in tên class lỗi và class nguyên nhân). */
+    private void logResult(Object outcome, Object transaction) {
+        String text = outcome instanceof Throwable t
+                ? t.getClass().getSimpleName() + (t.getCause() != null ? "<-" + t.getCause().getClass().getSimpleName() : "")
+                : outcome instanceof List<?> list ? list.toString().replace(" ", "") : String.valueOf(outcome);
+        log.info("[self-invocation] RESULT outcome={} transaction={} a={} b={}", text, transaction, balanceOf(a), balanceOf(b));
     }
 
     private List<TransferCommand> payroll() {

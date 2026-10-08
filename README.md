@@ -60,6 +60,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 - **Bán chớp nhoáng với app đang chạy:** `scripts\flash-sale.ps1` (xem mục *Test bán chớp nhoáng*).
 - **Deadlock chuyển tiền:** `scripts\transfer-deadlock.ps1` (xem mục *Deadlock*).
 - **Lost update khi sửa hồ sơ:** `scripts\profile-lost-update.ps1` (xem mục *Sửa hồ sơ: bắt buộc gửi `version`*).
+- **Bẫy gọi nội bộ `@Transactional`:** `scripts\self-invocation-trap.ps1` (chạy test, cần Docker; xem mục *Bẫy @Transactional: gọi nội bộ*).
 - **Lost update khi sửa sản phẩm:** `scripts\product-lost-update.ps1` (xem mục *Sửa sản phẩm: bắt buộc gửi `version`*).
 - **Nhập / trừ tồn kho cùng lúc với đơn hàng, gửi lại cùng key:** `scripts\stock-adjustment.ps1` (xem mục *Điều chỉnh tồn kho*).
 - **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).
@@ -805,6 +806,50 @@ Bẫy này áp dụng cho mọi annotation chạy nhờ proxy: `@Transactional`,
 ```bash
 ./mvnw test -Dtest=SelfInvocationTrapTests
 ```
+
+#### Tự chạy: `scripts/self-invocation-trap.ps1`
+
+Bản lỗi chỉ có trong test, app không có API nào đi vào nó, nên script **chạy test** `SelfInvocationTrapTests` qua Maven (cần Docker đang chạy, như khi chạy test), rồi đọc log `BEGIN` / `COMMIT` / `ROLLBACK`, SQL và các dòng `[self-invocation]` mà test ghi ra, in diễn biến từng lượt chuyển của 4 case theo thứ tự: qua proxy → bẫy → sửa → code thật.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\self-invocation-trap.ps1          # 4 case, mong đợi ĐÚNG
+powershell -ExecutionPolicy Bypass -File .\scripts\self-invocation-trap.ps1 -Break   # tự "phá" bản sửa, xem test bắt được
+```
+
+```
+-- 2. BẪY: transferAll gọi this.transfer(...) (không qua proxy)
+   mong đợi: KHÔNG có transaction; lượt lỗi vẫn trừ 30 của A → mất 30 (A 60, B 110, tổng 170)
+   lượt: ví A → ví không tồn tại, 30.00   (trong transfer có transaction: KHÔNG)
+     09:42:20.524  BEGIN SimpleJpaRepository.findById (read-only)                tìm ví A
+     09:42:20.579  COMMIT SimpleJpaRepository.findById
+     09:42:20.581  BEGIN SimpleJpaRepository.save                                lưu ví A đã trừ 30.00
+     09:42:20.619    update wallets set balance=? ...
+     09:42:20.628  COMMIT SimpleJpaRepository.save                               ← commit ngay, không rollback được nữa
+     09:42:20.629  BEGIN SimpleJpaRepository.findById (read-only)                tìm ví không tồn tại: không có → lỗi
+     09:42:20.642  COMMIT SimpleJpaRepository.findById
+   lượt: ví A → ví B, 10.00   (trong transfer có transaction: KHÔNG)
+     ...
+   kết quả: [FAILED,TRANSFERRED]; transaction trong transfer: KHÔNG; A = 60.00, B = 110.00, tổng 170.00 → MẤT 30.00
+   đúng như mong đợi
+
+-- 3. SỬA: mỗi lượt chạy trong transaction mở bằng TransactionTemplate
+   mong đợi: có transaction; lượt lỗi rollback, lượt kia vẫn chuyển (A 90, B 110, tổng 200)
+   lượt: ví A → ví không tồn tại, 30.00   (trong transfer có transaction: CÓ)
+     09:42:20.804  BEGIN BatchTransferService.transfer (TransactionTemplate)     ← mở transaction cho cả lượt
+     09:42:20.805    select ... from wallets                                     tìm ví A
+     09:42:20.808    select ... from wallets                                     tìm ví không tồn tại: không có → lỗi
+     09:42:20.809  ROLLBACK BatchTransferService.transfer (TransactionTemplate)  ← huỷ cả lượt: chưa có UPDATE nào
+   ...
+   kết quả: [FAILED,TRANSFERRED]; transaction trong transfer: CÓ; A = 90.00, B = 110.00, tổng 200.00
+   đúng như mong đợi
+...
+ĐÚNG (4/4 case): gọi nội bộ this.transfer(...) không có transaction và làm mất 30;
+      qua proxy hoặc TransactionTemplate thì lượt lỗi rollback, tổng tiền giữ 200
+```
+
+`-Break` truyền `-Dshoplab.trap.break=true` cho test: `transferAllEachInOwnTransaction` bỏ `TransactionTemplate`, gọi thẳng `transfer(...)` như bản bẫy. Case 3 lúc đó ra `MẤT 30.00`, test đỏ ở `expected: 90.00 but was: 60.00`, và script kết luận `ĐÚNG: đã phá bản sửa và test bắt được`. Không cần sửa code, chạy lại không có `-Break` là về như cũ.
+
+Mã thoát `0` nếu đúng như mong đợi (không `-Break`: 4 test xanh; `-Break`: đúng test của bản sửa đỏ); `1` nếu không; `2` nếu không chạy được test (vd Docker chưa chạy). Trên macOS / Linux: `pwsh ./scripts/self-invocation-trap.ps1`.
 
 ### Cách hoạt động của Idempotency
 

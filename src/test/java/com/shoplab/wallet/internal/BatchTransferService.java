@@ -1,5 +1,7 @@
 package com.shoplab.wallet.internal;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -30,6 +32,14 @@ class BatchTransferService {
 
     enum Outcome { TRANSFERRED, FAILED }
 
+    /**
+     * Công tắc để tự "phá" bản sửa (scripts/self-invocation-trap.ps1 -Break, hoặc mvn test -Dshoplab.trap.break=true):
+     * transferAllEachInOwnTransaction bỏ TransactionTemplate, gọi thẳng transfer(...) như bản bẫy.
+     */
+    static final String BREAK_PROPERTY = "shoplab.trap.break";
+
+    private static final Logger log = LoggerFactory.getLogger(BatchTransferService.class);
+
     private final WalletRepository repo;
     private final TransactionTemplate tx;
 
@@ -46,6 +56,9 @@ class BatchTransferService {
     @Transactional
     public void transfer(TransferCommand command) {
         lastTransferHadTransaction = TransactionSynchronizationManager.isActualTransactionActive();
+        // ASCII để script đọc output Maven trên mọi console (scripts/self-invocation-trap.ps1)
+        log.info("[self-invocation] transfer from={} to={} amount={} transaction={}",
+                command.fromWalletId(), command.toWalletId(), command.amount(), lastTransferHadTransaction);
 
         Wallet from = repo.findById(command.fromWalletId())
                 .orElseThrow(() -> new WalletNotFoundException(command.fromWalletId()));
@@ -65,6 +78,10 @@ class BatchTransferService {
 
     /** SỬA: tự mở transaction cho từng lượt bằng TransactionTemplate, không trông vào @Transactional của transfer. */
     public List<Outcome> transferAllEachInOwnTransaction(List<TransferCommand> commands) {
+        if (Boolean.getBoolean(BREAK_PROPERTY)) {
+            log.warn("[self-invocation] BREAK: {}=true, bo TransactionTemplate, goi thang transfer(...)", BREAK_PROPERTY);
+            return runEach(commands, this::transfer);
+        }
         return runEach(commands, command -> tx.executeWithoutResult(status -> transfer(command)));
     }
 
