@@ -17,8 +17,11 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -81,6 +84,27 @@ public abstract class IntegrationTestBase {
 
     protected HttpResponse<String> postOrder(String idempotencyKey, String jsonBody) {
         return send("POST", "/api/orders", jsonBody, idempotencyKey);
+    }
+
+    /**
+     * buyers lượt mua 1 cái cùng lúc qua POST /api/orders (Concurrently), mỗi lượt một Idempotency-Key riêng
+     * nên là một lần mua khác nhau, không phải gửi lại.
+     *
+     * @return số response theo kết quả, vd {"201": 1, "409 insufficient-stock": 999}
+     */
+    protected Map<String, Long> buyAtOnce(long productId, int buyers) throws Exception {
+        String body = orderJson(productId, 1);
+        List<HttpResponse<String>> responses = Concurrently.run(buyers, i -> postOrder(newKey(), body));
+        return responses.stream().collect(Collectors.groupingBy(this::outcome, TreeMap::new, Collectors.counting()));
+    }
+
+    /** "201", hoặc mã lỗi kèm type của ProblemDetail, vd "409 insufficient-stock". */
+    private String outcome(HttpResponse<String> r) {
+        if (r.statusCode() < 400) {
+            return String.valueOf(r.statusCode());
+        }
+        String type = String.valueOf(json(r).get("type"));
+        return r.statusCode() + " " + type.substring(type.lastIndexOf('/') + 1);
     }
 
     @SuppressWarnings("unchecked")

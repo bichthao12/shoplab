@@ -48,7 +48,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `ProductRepositoryTests` (`@DataJpaTest`), `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
@@ -234,6 +234,24 @@ Content-Type: application/json
 | Bản thật: `SELECT ... FOR UPDATE` rồi mới kiểm tra | **5** | 3 hết hàng | **0** | Người sau chờ người trước commit rồi mới đọc, nên luôn đọc con số mới nhất |
 
 Log SQL của bản ngây thơ cho thấy rõ: 8 câu `SELECT` chạy trước, sau đó mới tới 8 câu `UPDATE`. Trong test, bản ngây thơ được giữ lại giữa bước kiểm tra và bước lưu tới khi cả 8 người đã đọc, để kết quả không tuỳ may rủi; bỏ chỗ giữ lại thì trên máy dev vẫn ra đúng kết quả trên (5/5 lần chạy), vì 8 câu `SELECT` xong trước khi câu `UPDATE` đầu tiên kịp chạy.
+
+### Test bán chớp nhoáng: 1.000 lượt mua, kho còn 1 cái
+
+```bash
+./mvnw test -Dtest='FlashSaleIntegrationTests,NaiveFlashSaleTests'
+```
+
+Mỗi test tạo một sản phẩm còn 1 cái, rồi `buyAtOnce(productId, 1000)` (trong `IntegrationTestBase`) bắn 1.000 request `POST /api/orders` cùng lúc. Mỗi request có `Idempotency-Key` riêng, nên là 1.000 lần mua khác nhau chứ không phải gửi lại. Request đi qua đủ luồng thật: HTTP → idempotency → kiểm tra người đặt → giữ hàng → tạo đơn. Sau đó test đếm response theo loại kết quả, số đơn trong DB và tồn kho còn lại.
+
+| Test | Giữ hàng bằng | Response | Số đơn | Kho còn |
+|---|---|---|---|---|
+| `FlashSaleIntegrationTests` | Bản thật: `SELECT ... FOR UPDATE` rồi mới kiểm tra | 1 × `201`, 999 × `409 insufficient-stock` | **1** | 0 |
+| `NaiveFlashSaleTests` | Bản ngây thơ: đọc → kiểm tra → trừ ở Java → `UPDATE stock = ?` | 10 × `201`, 990 × `409 insufficient-stock` | **10** | 0 |
+
+- **Bản ngây thơ bán vượt tối đa bằng số connection của pool** (Hikari mặc định 10). Mỗi lượt mua giữ một connection suốt transaction, nên cùng lúc chỉ có 10 lượt đọc được "còn 1 cái" trước khi lượt đầu tiên commit; các lượt sau đều đọc thấy 0. Kho vẫn báo 0 nên nhìn tồn kho không phát hiện được.
+- **Không ép thứ tự thì số đơn thay đổi theo từng lần chạy.** 5 lần chạy thử cho 6, 10, 9, 1, 10 đơn; có lần chỉ ra 1 đơn, tức lỗi không lộ ra. Vì vậy `NaiveFlashSaleTests` giữ mỗi lượt mua lại giữa bước kiểm tra và bước lưu tới khi 10 lượt đã cùng đọc kho (trường hợp xấu nhất), để luôn ra 10 đơn.
+- **Đếm số đơn thôi chưa đủ.** Thử bỏ `FOR UPDATE` ở bản thật thì vẫn chỉ ra 1 đơn (`@Version` chặn được bán vượt), nhưng 9 lượt mua nhận `409 concurrent-modification` thay vì "hết hàng". Test kiểm tra cả cách phân bố response nên vẫn bắt được.
+- Hai test này tắt log SQL (`@TestPropertySource`), vì 1.000 request in ra khoảng 18.000 dòng.
 
 ### Cách hoạt động của Idempotency
 
@@ -471,10 +489,11 @@ src/test/java/com/shoplab/
 ├── idempotency/internal/ RequestFingerprintTest
 ├── order/              OrderModuleTests
 │   ├── internal/       OrderTest, CreateOrderCommandTest
-│   └── web/            OrderApiIntegrationTests, OrderIdempotencyIntegrationTests
+│   └── web/            OrderApiIntegrationTests, OrderIdempotencyIntegrationTests, FlashSaleIntegrationTests
 ├── product/            ProductModuleTests
 │   ├── internal/       ProductTest, ProductRepositoryTests,
-│   │                   NaiveProductInventory + NaiveStockDeductionTests (bản trừ kho ngây thơ, để so sánh)
+│   │                   NaiveProductInventory + NaiveStockDeductionTests, NaiveFlashSaleTests
+│   │                   (bản trừ kho ngây thơ, để so sánh)
 │   └── web/            ProductApiIntegrationTests
 └── user/               UserModuleTests
     ├── internal/       UserTest
