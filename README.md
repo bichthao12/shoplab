@@ -47,7 +47,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 |---|---|---|
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
-| Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
+| Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests`, `WalletModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
 | Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
@@ -348,9 +348,32 @@ Mỗi bên giữ một khoá và chờ khoá bên kia: không bên nào đi ti�
 - Phía Spring nhận `CannotAcquireLockException` (một `PessimisticLockingFailureException`). `GlobalExceptionHandler` hiện xếp loại này vào `409 lock-timeout`, nên khi thêm API chuyển tiền cần báo riêng trường hợp deadlock.
 - `sleep(50)` để chắc chắn cả hai bên đã giữ khoá đầu tiên trước khi xin khoá thứ hai. Bỏ đi thì trên máy dev vẫn deadlock 10/10 lần, nhưng không đảm bảo trên máy khác.
 
+#### Sửa: khoá hai ví theo thứ tự id tăng dần
+
+`WalletService.transfer` (code thật) khoá ví **id nhỏ trước, id lớn sau**, bất kể chiều chuyển:
+
+```java
+long firstId = Math.min(fromWalletId, toWalletId);
+Wallet first = lock(firstId);                                 // id nhỏ trước
+Wallet second = lock(Math.max(fromWalletId, toWalletId));     // id lớn sau
+Wallet from = firstId == fromWalletId ? first : second;
+Wallet to = firstId == fromWalletId ? second : first;
+from.withdraw(amount);
+to.deposit(amount);
+```
+
+A→B và B→A đều xin khoá ví A trước. Lượt đến sau chờ ngay ở khoá đầu tiên, khi chưa giữ khoá nào, nên không thể có cảnh mỗi bên giữ một khoá rồi chờ nhau. Cùng điều kiện như bản ngây thơ (chờ 50ms giữa hai lần khoá, test chèn bằng một proxy bọc `WalletRepository` để code thật không chứa `sleep`):
+
+| Cách khoá | Kết quả A→B 10 và B→A 30 cùng lúc (mỗi ví 100) | Thời gian |
+|---|---|---|
+| Theo thứ tự tham số | 1 lượt chuyển xong, 1 lượt bị huỷ vì deadlock | ~1,1 giây |
+| Theo thứ tự id tăng dần | Cả 2 lượt chuyển xong: A = 120, B = 80 | ~0,2–0,5 giây |
+
+Quy tắc chung: chỗ nào khoá nhiều dòng trong cùng một transaction thì mọi nơi phải khoá theo **cùng một thứ tự** (ở đây là id tăng dần). Trừ kho cho đơn nhiều sản phẩm cũng theo quy tắc này (theo `productId`).
+
 #### Tự chạy: `scripts/transfer-deadlock.ps1`
 
-Module ví chưa có REST API, nên script chạy chính test này qua Maven (cần Docker đang chạy, như mọi test) rồi đọc log SQL / transaction để in diễn biến:
+Module ví chưa có REST API, nên script chạy chính test này qua Maven (cần Docker đang chạy, như mọi test) rồi đọc log SQL / transaction để in diễn biến của cả hai cách khoá:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1            # 1 lần
@@ -358,25 +381,45 @@ powershell -ExecutionPolicy Bypass -File .\scripts\transfer-deadlock.ps1 -Runs 3
 ```
 
 ```
-06:16:21.478  B->A    BEGIN
-06:16:21.478  A->B    BEGIN
-06:16:21.563  A->B    khoá ví nguồn (SELECT ... FOR UPDATE)
-06:16:21.564  B->A    khoá ví nguồn (SELECT ... FOR UPDATE)
-06:16:21.663  A->B    xin khoá ví đích ... chờ
-06:16:21.663  B->A    xin khoá ví đích ... chờ
-06:16:22.673  A->B    PostgreSQL: deadlock detected (40P01)
-                      Process 1827 waits for ShareLock on transaction 45904; blocked by process 1823.
-                      Process 1823 waits for ShareLock on transaction 45905; blocked by process 1827.
-06:16:22.685  A->B    ROLLBACK: bị huỷ, không chuyển gì
-06:16:22.700  B->A    cập nhật số dư (UPDATE wallets)
-06:16:22.705  B->A    cập nhật số dư (UPDATE wallets)
-06:16:22.710  B->A    COMMIT: chuyển xong
+-- Khoá theo thứ tự id tăng dần (WalletService): luôn ví A (id nhỏ) trước, ví B sau
+06:31:48.122  B->A    BEGIN
+06:31:48.122  A->B    BEGIN
+06:31:48.212  A->B    khoá ví A (SELECT ... FOR UPDATE)
+06:31:48.212  B->A    khoá ví A (SELECT ... FOR UPDATE)
+06:31:48.305  B->A    khoá ví B (SELECT ... FOR UPDATE)
+06:31:48.391  B->A    cập nhật số dư (UPDATE wallets)
+06:31:48.397  B->A    cập nhật số dư (UPDATE wallets)
+06:31:48.405  B->A    COMMIT: chuyển xong
+06:31:48.458  A->B    khoá ví B (SELECT ... FOR UPDATE)   (trước đó chờ ở khoá ví A tới khi B->A COMMIT)
+06:31:48.516  A->B    cập nhật số dư (UPDATE wallets)
+06:31:48.517  A->B    cập nhật số dư (UPDATE wallets)
+06:31:48.520  A->B    COMMIT: chuyển xong
+   Không deadlock: lượt đến sau chỉ chờ lượt trước xong, cả hai chuyển xong sau ~0.40 giây
+
+-- Khoá theo thứ tự tham số (NaiveWalletTransfer): ví nguồn trước, ví đích sau
+06:31:48.628  A->B    BEGIN
+06:31:48.628  B->A    BEGIN
+06:31:48.629  B->A    khoá ví B (SELECT ... FOR UPDATE)
+06:31:48.630  A->B    khoá ví A (SELECT ... FOR UPDATE)
+06:31:48.683  B->A    khoá ví A (SELECT ... FOR UPDATE) ... chờ
+06:31:48.684  A->B    khoá ví B (SELECT ... FOR UPDATE) ... chờ
+06:31:49.689  A->B    cập nhật số dư (UPDATE wallets)
+06:31:49.690  A->B    cập nhật số dư (UPDATE wallets)
+06:31:49.692  A->B    COMMIT: chuyển xong
+06:31:49.693  B->A    PostgreSQL: deadlock detected (40P01)
+                      Process 1481 waits for ShareLock on transaction 45947; blocked by process 1477.
+                      Process 1477 waits for ShareLock on transaction 45946; blocked by process 1481.
+06:31:49.699  B->A    ROLLBACK: bị huỷ, không chuyển gì
    Hai lượt chờ nhau ~1.0 giây thì PostgreSQL mới phát hiện deadlock (deadlock_timeout mặc định 1 giây)
-   Test XANH: Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 ...
-ĐÚNG: 1/1 lần đều deadlock, PostgreSQL huỷ một lượt, lượt kia chuyển xong, tổng tiền không đổi
+
+   Test XANH: Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 ...
+ĐÚNG (1/1 lần): khoá theo thứ tự tham số → deadlock, PostgreSQL huỷ một lượt;
+      khoá theo thứ tự id tăng dần → không deadlock, cả hai lượt chuyển xong
 ```
 
-Mã thoát `0` nếu mọi lần chạy đều tái hiện đúng deadlock (test xanh), `1` nếu không (script in kèm trích lỗi của test).
+Hai test chạy theo thứ tự JUnit tự chọn, nên phần nào in trước cũng được. Log của lượt thắng có thể hiện trước dòng `deadlock detected` của lượt thua, vì dòng đó được ghi khi lỗi đã truyền ngược lên ứng dụng.
+
+Mã thoát `0` nếu mọi lần chạy đều đúng như trên (cả hai test xanh), `1` nếu không (script in kèm trích lỗi của test).
 
 ### Cách hoạt động của Idempotency
 
@@ -506,7 +549,7 @@ Một ứng dụng, một database, nhưng chia thành các module có ranh gi�
 | `idempotency` | Chạy request ghi đúng một lần theo `Idempotency-Key` | `IdempotencyService` và các exception của nó | `common` |
 | `order` | Đơn hàng | (chưa có) | `common`, `product`, `user`, `idempotency` |
 | `user` | Người dùng: hồ sơ + tài khoản đăng nhập | `UserDirectory` (tra người dùng đang ACTIVE), `UserSummary`, `UserUnavailableException` | `common` |
-| `wallet` | Ví tiền của người dùng (số dư không âm) | (chưa có) | `common` |
+| `wallet` | Ví tiền của người dùng (số dư không âm), chuyển tiền giữa hai ví | (chưa có) | `common` |
 
 ```
 order ──► product ──────┐
@@ -593,7 +636,8 @@ src/main/java/com/shoplab/
 │   │               PasswordConfig, RegisterUserCommand, UpdateProfileCommand, các exception nội bộ
 │   └── web/        UserController, RegisterUserRequest, UpdateProfileRequest, UserResponse
 └── wallet/
-    └── internal/   Wallet, WalletRepository, InsufficientBalanceException
+    └── internal/   Wallet, WalletRepository, WalletService (chuyển tiền, khoá theo id tăng dần),
+                    các exception nội bộ
 src/main/resources/db/migration/
 ├── V1__init.sql                              products, orders, order_items
 ├── V2__add_product_category.sql              cột category
@@ -628,6 +672,7 @@ src/test/java/com/shoplab/
 ├── user/               UserModuleTests
 │   ├── internal/       UserTest
 │   └── web/            UserApiIntegrationTests
-└── wallet/
-    └── internal/       NaiveWalletTransfer + TransferDeadlockTests (chuyển tiền gây deadlock)
+└── wallet/             WalletModuleTests
+    └── internal/       NaiveWalletTransfer + TransferDeadlockTests (deadlock khi khoá theo tham số,
+                        không deadlock khi khoá theo id)
 ```

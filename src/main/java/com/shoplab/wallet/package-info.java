@@ -1,9 +1,9 @@
 /**
  * Module ví: mỗi người dùng một ví tiền (bảng wallets), số dư không âm.
  *
- * Chưa có API cho module khác và chưa có REST API. Nội bộ: internal/ (entity Wallet, WalletRepository).
- * Chuyển tiền giữa hai ví: hiện mới có bản khoá theo thứ tự tham số trong test (NaiveWalletTransfer),
- * dùng để tái hiện deadlock.
+ * Chưa có API cho module khác và chưa có REST API. Nội bộ: internal/ (entity Wallet, WalletRepository,
+ * WalletService chuyển tiền giữa hai ví, khoá hai ví theo thứ tự id tăng dần để không deadlock).
+ * Bản khoá theo thứ tự tham số (gây deadlock) chỉ có trong test: NaiveWalletTransfer.
  */
 @ApplicationModule(displayName = "Wallet", allowedDependencies = "common")
 package com.shoplab.wallet;
