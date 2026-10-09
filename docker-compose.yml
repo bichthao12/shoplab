@@ -4,7 +4,17 @@ services:
     container_name: shoplab-postgres
     # shared_buffers 1GB (mặc định 128MB): 1/4 RAM khi cấp cho Docker 4 GB, đủ giữ phần lớn index của bộ dữ liệu
     # lớn (scripts/seed-big-data.ps1) trong bộ nhớ của PostgreSQL.
-    command: ["postgres", "-c", "timezone=UTC", "-c", "log_timezone=UTC", "-c", "shared_buffers=1GB"]
+    # pg_stat_statements: cộng dồn số lần gọi, thời gian chạy của từng câu SQL (gộp các câu chỉ khác tham số), xem
+    # scripts/top-queries.ps1. Chỉ nạp được lúc PostgreSQL khởi động: đổi dòng này thì phải tạo lại container
+    # (docker compose up -d). track_io_timing: thêm thời gian chờ đọc / ghi đĩa của từng câu.
+    command: [
+      "postgres",
+      "-c", "timezone=UTC",
+      "-c", "log_timezone=UTC",
+      "-c", "shared_buffers=1GB",
+      "-c", "shared_preload_libraries=pg_stat_statements",
+      "-c", "track_io_timing=on"
+    ]
     # /dev/shm mặc định của Docker chỉ 64MB. Truy vấn song song đặt bảng băm, kết quả sắp xếp chung ở đây: tăng work_mem
     # rồi join 10 triệu dòng là lỗi "could not resize shared memory segment ... No space left on device".
     shm_size: 1g

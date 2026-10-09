@@ -125,6 +125,45 @@ Thí nghiệm tắt truy vấn song song để số dòng ước tính / thực 
 
 Autovacuum rồi cũng tự ANALYZE / VACUUM sau khi nạp nhiều dòng, nhưng không biết lúc nào: nếu nó chạy giữa lúc đang đo thì plan và thời gian đổi giữa chừng. Vì vậy script chạy tay ngay sau khi nạp.
 
+### Câu SQL tốn thời gian nhất: `pg_stat_statements` (`scripts/top-queries.ps1`)
+
+`pg_stat_statements` cộng dồn cho từng câu SQL: số lần chạy, tổng / trung bình / lâu nhất, số trang đọc. Các câu chỉ khác tham số được gộp thành một dòng (giá trị thay bằng `$1`, `$2`...). Sắp theo **tổng** thời gian là tìm câu đáng sửa nhất: một câu 0,1 ms chạy 28 nghìn lần tốn hơn một câu 30 ms chạy 10 lần.
+
+**Bật:** `docker-compose.yml` thêm `shared_preload_libraries=pg_stat_statements` (thư viện chỉ nạp được lúc PostgreSQL khởi động) và `track_io_timing=on` (thêm thời gian chờ đọc đĩa của từng câu). Script tự chạy `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` trong DB `shoplab`. Extension không nằm trong migration: nó là công cụ theo dõi, không phải schema của app, và cần quyền superuser.
+
+```powershell
+docker compose up -d     # tạo lại container theo cấu hình mới, dữ liệu giữ nguyên
+.\mvnw spring-boot:run "-Dspring-boot.run.arguments=--logging.level.sql=INFO --logging.level.tx=INFO"   # tắt log SQL cho app không chậm vì ghi log
+powershell -ExecutionPolicy Bypass -File .\scripts\top-queries.ps1     # mặc định -Minutes 3 -Parallel 16 -Top 3
+```
+
+Script gọi API thật (không chạy test):
+1. Lấy mẫu 2.000 user đang ACTIVE và 2.000 đơn có sẵn (đọc thẳng DB), tạo 50 sản phẩm tồn kho lớn qua API.
+2. `pg_stat_statements_reset()`: từ đây chỉ tính các câu chạy trong lúc gọi API.
+3. Gọi API trong `-Minutes` phút, lúc nào cũng có `-Parallel` request đang chạy, chọn ngẫu nhiên theo tỉ lệ: 35% `GET /api/orders?userId=` (đơn của tôi), 20% `GET /api/orders/{id}`, 15% `GET /api/users/{id}`, 10% `GET /api/products?category=`, 15% `POST /api/orders` (1–3 sản phẩm), 5% `POST /api/users`.
+4. In số request, lỗi, thời gian phản hồi của từng loại, rồi `-Top` câu có tổng thời gian chạy lớn nhất. Phần báo cáo nằm ở `scripts/top-queries.sql`, chạy riêng được (vd sau khi tự gọi API bằng Postman):
+   ```powershell
+   docker cp scripts/top-queries.sql shoplab-postgres:/tmp/
+   docker exec shoplab-postgres psql -U shoplab -d shoplab -v top=3 -f /tmp/top-queries.sql
+   ```
+
+**Kết quả đo** trên 10 triệu đơn, 3 phút, 16 request song song: 80.178 request (445 request/giây), không lỗi; PostgreSQL chạy 274 nghìn câu thuộc 19 loại, tổng 26,3 giây. Chạy hai lần, cả hai lần cùng 3 câu đứng đầu, số liệu gần như nhau:
+
+| Hạng | Câu SQL | Từ request | Tổng (ms) | % | Số lần | Trung bình (ms) | Trang đọc / lần |
+|---|---|---|---|---|---|---|---|
+| 1 | `UPDATE products SET stock = stock - $1 ... WHERE id = $2 AND active AND stock >= $3` | `POST /api/orders`, trừ kho cho từng dòng hàng | 7.335 | 27,9 | 23.884 | 0,307 | 5,2 |
+| 2 | `select ... from orders where user_id = $1 order by created_at desc, id desc fetch first $2 rows only` | `GET /api/orders?userId=` | 3.107 | 11,8 | 28.118 | 0,111 | 15,4 |
+| 3 | `insert into order_items (...)` | `POST /api/orders` | 2.909 | 11,1 | 23.884 | 0,122 | 13,1 |
+
+- **UPDATE products chủ yếu là chờ khoá dòng, không phải chạy chậm.** Câu này chỉ đọc 5 trang mà trung bình chậm gấp ba các câu khác. Lấy mẫu `pg_stat_activity` 400 lần trong lúc gọi API: 19 trên 25 lần bắt gặp nó đang chạy là lúc nó chờ khoá (`Lock:transactionid`), vì đơn khác vừa trừ cùng sản phẩm và giữ khoá dòng tới lúc COMMIT. 50 sản phẩm cho 16 request song song là nhiều "hàng hot"; chạy 8 request song song thì trung bình chỉ còn 0,21 ms. Thời gian chờ khoá được tính vào thời gian chạy của câu.
+- **Đơn của một user: 11 dòng mà đọc 15 trang.** Index `idx_orders_user_id_created_at` dẫn thẳng tới đơn của user, nhưng đơn của một người rải khắp bảng (`user_id` tương quan 0,28 với thứ tự trên đĩa) nên gần như mỗi đơn nằm ở một trang riêng; 13.825 trang không có sẵn trong shared buffers. Mỗi lần vẫn chỉ 0,11 ms; câu này đứng thứ hai vì đây là request nhiều nhất (35%).
+- **INSERT order_items ghi 13 trang mỗi lần:** ngoài trang của bảng còn cập nhật 3 index (khoá chính, `uk_order_items_order_product`, `idx_order_items_product_id`) và kiểm tra khoá ngoại sang `orders`.
+
+Nên biết khi đọc kết quả:
+- **COMMIT không có trong pg_stat_statements.** Khi lấy mẫu, phần lớn lần bắt gặp COMMIT là lúc nó chờ ghi WAL xuống đĩa (`IO:WalSync`), nhưng khoảng chờ này không cộng vào câu nào trong bảng. Khoá dòng của `UPDATE products` cũng được giữ suốt khoảng chờ đó.
+- Thời gian là thời gian chạy trong PostgreSQL (`total_exec_time`): không tính lập kế hoạch, đường truyền, hay phần việc của app. Vd đăng ký trung bình 449 ms là do băm BCrypt trong app; các câu SQL của nó đều dưới 0,3 ms.
+- Ngay sau khi khởi động lại Docker, dữ liệu chưa nằm trong bộ nhớ: lượt đầu chậm vì đọc đĩa (cột "Chờ đọc đĩa (ms)" lớn), câu đọc nhiều trang dễ lên đầu. Chạy thêm một lượt để so.
+
 ### Chạy test
 
 ```bash
@@ -216,6 +255,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `spring.datasource.hikari.connection-init-sql` | `SET lock_timeout = '5s'` | Không request nào chờ khoá DB quá 5 giây (→ 409 + `Retry-After`), thay vì giữ connection chờ vô hạn. Chạy mỗi khi Hikari mở connection mới, nên áp dụng cho mọi connection trong pool. Test: `OrderIdempotencyIntegrationTests.keyHeldByAnotherTransaction_returns409AfterLockTimeout` (bỏ dòng này thì request chờ mãi tới khi client hết giờ) |
 | `spring.jpa.properties.hibernate.jdbc.batch_size` (+ `order_inserts`, `order_updates`) | `50` | Gộp các câu INSERT / UPDATE cùng loại thành một lượt gửi, vd mọi dòng của một đơn hàng |
 | PostgreSQL `timezone` | `UTC` | Thời gian hiển thị trong psql cũng là UTC |
+| PostgreSQL `shared_preload_libraries` (`docker-compose.yml`) | `pg_stat_statements` | Cộng dồn số lần chạy, thời gian của từng câu SQL để tìm câu tốn nhất (`scripts/top-queries.ps1`). Chỉ nạp được lúc khởi động: đổi thì phải tạo lại container. Đi cùng `track_io_timing=on` để có thời gian chờ đọc đĩa |
 | PostgreSQL `shared_buffers` (`docker-compose.yml`) | `1GB` | Mặc định 128MB. Bằng 1/4 RAM khi cấp cho Docker 4 GB, giữ được phần lớn index của bộ dữ liệu lớn trong bộ nhớ PostgreSQL |
 | Container `shm_size` (`docker-compose.yml`) | `1g` | `/dev/shm` mặc định của Docker chỉ 64MB, truy vấn song song đặt bảng băm chung ở đó. Đã thử trên 10 triệu dòng: `SET work_mem = '256MB'` rồi join thì 64MB báo `could not resize shared memory segment ... No space left on device`, 1g chạy được |
 | `logging.level.sql` | `DEBUG` | Log từng câu SQL, của cả Hibernate (`org.hibernate.SQL`) lẫn `JdbcClient` (`org.springframework.jdbc.core`) |
