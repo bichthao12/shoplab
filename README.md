@@ -478,12 +478,12 @@ Chỉ có lớp 1 thì không đủ. Nhiều request gửi cùng lúc đều ch�
 
 | | `201` | `409 duplicate-email` | Người dùng có email này |
 |---|---|---|---|
-| Hiện tại (cả 2 lớp) | **1** | 49 (40 chặn ở lớp 1, 9 do DB chặn) | **1** |
-| Bỏ `uk_users_email` (chỉ lớp 1) | **10** | 40 | **10** |
-| Bỏ phần dịch lỗi DB (chỉ còn constraint) | 1 | 40; 9 request còn lại nhận `409 data-integrity` | 1 |
+| Hiện tại (cả 2 lớp) | **1** | 49 (cả 49 do DB chặn) | **1** |
+| Bỏ `uk_users_email` (chỉ lớp 1) | **50** | 0 | **50** |
+| Bỏ phần dịch lỗi DB (chỉ còn constraint) | 1 | các request do DB chặn nhận `409 data-integrity` thay vì `duplicate-email` | 1 |
 | Bỏ lớp 1 (chỉ còn constraint) | 1 | 49 | 1 |
 
-- **Tạo trùng tối đa bằng số connection của pool** (Hikari mặc định 10), giống bản ngây thơ của *Test bán chớp nhoáng*: mỗi request giữ một connection suốt transaction, nên chỉ 10 request cùng qua được lớp 1 trước khi request đầu tiên commit.
+- **Bỏ constraint thì cả 50 request đều tạo được người dùng.** Lớp 1 là một transaction chỉ đọc vài ms, sau đó băm mật khẩu ~80 ms ngoài transaction (xem *Không gọi API ngoài hay chờ lâu bên trong transaction*), nên cả 50 request đều kiểm tra xong trước khi request đầu tiên INSERT. Trước khi chuyển việc băm ra ngoài transaction, số đo là 40 chặn ở lớp 1, 9 do DB, và bỏ constraint thì "chỉ" 10 người dùng trùng: mỗi request giữ một connection suốt lúc băm, nên pool 10 connection vô tình giới hạn số request qua lớp 1 cùng lúc.
 - **Đảm bảo không trùng là nhờ constraint, không phải nhờ lớp 1.** Bỏ lớp 1, mọi test vẫn qua. Lớp 1 chỉ để trả lỗi sớm trong trường hợp thường gặp (đăng ký lại email đã có), không phải băm mật khẩu và không ghi lỗi vào log của PostgreSQL.
 - Trùng username thì lỗi xảy ra ở `INSERT INTO accounts`, **sau khi** đã `INSERT INTO users`. Transaction rollback nên dòng `users` đó cũng mất, không để lại hồ sơ không có tài khoản.
 
@@ -527,14 +527,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\duplicate-email.ps1
 ```
 
 ```
-== Case 1: 50 request đăng ký cùng email dup1791447327@example.com, username khác nhau, gửi cùng lúc
-   xong sau 382 ms
-   201: 10
-        Người 1 (id 12, email dup1791447327@example.com, username dup1791447327-1)
-        Người 2 (id 15, email dup1791447327@example.com, username dup1791447327-2)
+== Case 1: 50 request đăng ký cùng email dup1791511946@example.com, username khác nhau, gửi cùng lúc
+   xong sau 2470 ms
+   201: 50
+        Người 1 (id 40, email dup1791511946@example.com, username dup1791511946-1)
+        Người 2 (id 17, email dup1791511946@example.com, username dup1791511946-2)
         ...
-   409 duplicate-email: 40   ví dụ: Email 'dup1791447327@example.com' đã được đăng ký
-   SAI: 10 người dùng được tạo, mong đợi đúng 1
+   409 duplicate-email: 0
+   SAI: 50 người dùng được tạo, mong đợi đúng 1
 ...
 SAI: Case 1 không như mong đợi
 ```
@@ -769,6 +769,8 @@ bên ngoài ──► proxy ──► transferAll() ──this.transfer()──�
 |---|---|---|---|
 | `batch.transfer(...)` từ bên ngoài (qua proxy) | Có | Rollback, A vẫn 100 | (test chỉ chạy lượt lỗi) |
 | `transferAll` → `this.transfer(...)` (**bẫy**) | **Không** | **A = 70**: phần trừ 30 đã commit | **60** / 110 / **170**: mất 30 |
+| `BatchTransferRunner.transferAll` (bean khác) → `batch.transfer(...)` (**sửa: tách sang bean khác**) | Có | Rollback, A vẫn 100 | 90 / 110 / **200** |
+| `transferAllThroughProxy` → `self.transfer(...)` (**sửa: gọi qua proxy**) | Có | Rollback, A vẫn 100 | 90 / 110 / **200** |
 | `transferAllEachInOwnTransaction`: mỗi lượt trong `TransactionTemplate` (**sửa**) | Có | Rollback, A vẫn 100 | 90 / 110 / **200** |
 
 **Vì sao mất tiền mà không ai biết:** không có transaction thì mỗi lời gọi repository của Spring Data (`findById`, `save`) tự mở transaction riêng và **commit ngay**. Log `tx` của lượt lỗi khi gọi nội bộ, không có `BEGIN BatchTransferService.transfer` nào:
@@ -796,9 +798,9 @@ ROLLBACK BatchTransferService.transfer                  ← chưa có UPDATE nà
 
 **Cách sửa**, từ hay dùng nhất:
 
-1. **Tách method `@Transactional` sang bean khác** rồi gọi qua bean đó (vd `transferAll` ở một class, gọi `walletService.transfer(...)`): lời gọi đi qua proxy.
-2. **Tự mở transaction bằng `TransactionTemplate`** cho từng lượt (cách test dùng): rõ ràng, không phụ thuộc proxy.
-3. Tự inject chính mình (`@Lazy` + gọi `self.transfer(...)`) hoặc `AopContext.currentProxy()`: chạy được nhưng khó đọc, dễ bị người sau "dọn" mất.
+1. **Tách sang bean khác** (`BatchTransferRunner`, test `transferAllFromAnotherBean_keepsMoney`): vòng lặp nằm ở một bean, `transfer` ở bean kia. Spring tiêm vào proxy của bean kia, nên `transfers.transfer(...)` đi qua proxy. Cách nên dùng: nhìn code là thấy lời gọi đi sang bean khác, không cần nhớ quy tắc gì.
+2. **Gọi qua proxy** (`transferAllThroughProxy`, test `transferAllThroughProxy_keepsMoney`): bean tự inject chính mình (`@Lazy BatchTransferService self`) rồi gọi `self.transfer(...)` thay cho `this.transfer(...)`. Chạy được, nhưng người sau "dọn" `self.transfer` thành `transfer` là bẫy quay lại (thử rồi: A = 60.00, test đỏ). `AopContext.currentProxy()` cũng là cách gọi qua proxy, nhưng phải bật `exposeProxy`.
+3. **Tự mở transaction bằng `TransactionTemplate`** cho từng lượt (`transferAllEachInOwnTransaction`): rõ ràng, không phụ thuộc proxy.
 
 Bẫy này áp dụng cho mọi annotation chạy nhờ proxy: `@Transactional`, `@Async`, `@Cacheable`, `@Retryable`...; method `private` thì không bao giờ qua proxy.
 
@@ -808,6 +810,7 @@ Bẫy này áp dụng cho mọi annotation chạy nhờ proxy: `@Transactional`,
 |---|---|
 | Bản sửa gọi thẳng `transfer(...)`, bỏ `TransactionTemplate` | `transferAllEachInOwnTransaction_keepsMoney`: A expected 90.00 but was **60.00** |
 | Bỏ `@Transactional` trên `transfer` | `transfer_calledThroughProxy_rollsBack`: không còn proxy, lượt lỗi không rollback |
+| Bản "gọi qua proxy" đổi `self::transfer` thành `this::transfer` | `transferAllThroughProxy_keepsMoney`: A expected 90.00 but was **60.00** |
 
 ```bash
 ./mvnw test -Dtest=SelfInvocationTrapTests
@@ -818,7 +821,7 @@ Bẫy này áp dụng cho mọi annotation chạy nhờ proxy: `@Transactional`,
 Bản lỗi chỉ có trong test, app không có API nào đi vào nó, nên script **chạy test** `SelfInvocationTrapTests` qua Maven (cần Docker đang chạy, như khi chạy test), rồi đọc log `BEGIN` / `COMMIT` / `ROLLBACK`, SQL và các dòng `[self-invocation]` mà test ghi ra, in diễn biến từng lượt chuyển của 4 case theo thứ tự: qua proxy → bẫy → sửa → code thật.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\self-invocation-trap.ps1          # 4 case, mong đợi ĐÚNG
+powershell -ExecutionPolicy Bypass -File .\scripts\self-invocation-trap.ps1          # 6 case, mong đợi ĐÚNG
 powershell -ExecutionPolicy Bypass -File .\scripts\self-invocation-trap.ps1 -Break   # tự "phá" bản sửa, xem test bắt được
 ```
 
@@ -838,7 +841,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\self-invocation-trap.ps1 -Bre
    kết quả: [FAILED,TRANSFERRED]; transaction trong transfer: KHÔNG; A = 60.00, B = 110.00, tổng 170.00 → MẤT 30.00
    đúng như mong đợi
 
--- 3. SỬA: mỗi lượt chạy trong transaction mở bằng TransactionTemplate
+-- 3. SỬA (tách sang bean khác): BatchTransferRunner gọi batch.transfer(...) qua proxy
+   ...
+   kết quả: [FAILED,TRANSFERRED]; transaction trong transfer: CÓ; A = 90.00, B = 110.00, tổng 200.00
+   đúng như mong đợi
+
+-- 4. SỬA (gọi qua proxy): self.transfer(...) thay cho this.transfer(...)
+   ...
+   kết quả: [FAILED,TRANSFERRED]; transaction trong transfer: CÓ; A = 90.00, B = 110.00, tổng 200.00
+   đúng như mong đợi
+
+-- 5. SỬA: mỗi lượt chạy trong transaction mở bằng TransactionTemplate
    mong đợi: có transaction; lượt lỗi rollback, lượt kia vẫn chuyển (A 90, B 110, tổng 200)
    lượt: ví A → ví không tồn tại, 30.00   (trong transfer có transaction: CÓ)
      09:42:20.804  BEGIN BatchTransferService.transfer (TransactionTemplate)     ← mở transaction cho cả lượt
@@ -849,13 +862,44 @@ powershell -ExecutionPolicy Bypass -File .\scripts\self-invocation-trap.ps1 -Bre
    kết quả: [FAILED,TRANSFERRED]; transaction trong transfer: CÓ; A = 90.00, B = 110.00, tổng 200.00
    đúng như mong đợi
 ...
-ĐÚNG (4/4 case): gọi nội bộ this.transfer(...) không có transaction và làm mất 30;
-      qua proxy hoặc TransactionTemplate thì lượt lỗi rollback, tổng tiền giữ 200
+ĐÚNG (6/6 case): gọi nội bộ this.transfer(...) không có transaction và làm mất 30;
+      tách sang bean khác, gọi qua proxy hoặc TransactionTemplate thì lượt lỗi rollback, tổng tiền giữ 200
 ```
 
-`-Break` truyền `-Dshoplab.trap.break=true` cho test: `transferAllEachInOwnTransaction` bỏ `TransactionTemplate`, gọi thẳng `transfer(...)` như bản bẫy. Case 3 lúc đó ra `MẤT 30.00`, test đỏ ở `expected: 90.00 but was: 60.00`, và script kết luận `ĐÚNG: đã phá bản sửa và test bắt được`. Không cần sửa code, chạy lại không có `-Break` là về như cũ.
+`-Break` truyền `-Dshoplab.trap.break=true` cho test: `transferAllEachInOwnTransaction` bỏ `TransactionTemplate`, gọi thẳng `transfer(...)` như bản bẫy. Case 5 lúc đó ra `MẤT 30.00`, test đỏ ở `expected: 90.00 but was: 60.00`, và script kết luận `ĐÚNG: đã phá bản sửa và test bắt được`. Không cần sửa code, chạy lại không có `-Break` là về như cũ.
 
-Mã thoát `0` nếu đúng như mong đợi (không `-Break`: 4 test xanh; `-Break`: đúng test của bản sửa đỏ); `1` nếu không; `2` nếu không chạy được test (vd Docker chưa chạy). Trên macOS / Linux: `pwsh ./scripts/self-invocation-trap.ps1`.
+Mã thoát `0` nếu đúng như mong đợi (không `-Break`: mọi test xanh; `-Break`: đúng test của bản sửa đỏ); `1` nếu không; `2` nếu không chạy được test (vd Docker chưa chạy). Trên macOS / Linux: `pwsh ./scripts/self-invocation-trap.ps1`.
+
+### Không gọi API ngoài hay chờ lâu bên trong transaction
+
+Transaction giữ một connection của pool (10 connection) từ `BEGIN` tới `COMMIT`. Việc gì chậm mà không cần DB nằm trong khoảng đó thì connection bị giữ không, và request khác phải xếp hàng chờ connection. Rà toàn bộ `src/main`:
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Gọi API ngoài (`RestClient`, `RestTemplate`, `WebClient`, `HttpClient`, mail, message queue) | Không có |
+| `Thread.sleep`, chờ `Future` / `CompletableFuture`, `@Async`, event listener | Không có |
+| `spring.jpa.open-in-view` | `false`: không giữ `EntityManager` (và connection) suốt request |
+| Chờ khoá DB (`SELECT ... FOR UPDATE`, câu `UPDATE` cùng dòng, idempotency key) | Có, nhưng có giới hạn: `lock_timeout` 5 giây, deadlock bị phát hiện sau 1 giây |
+| Việc chậm không cần DB | **Có một chỗ, đã sửa:** `UserService.register` băm mật khẩu BCrypt (cố ý chậm, ~80 ms) bên trong transaction |
+
+**Sửa `register`:** tách thành 3 bước, chỉ bước 1 và 3 có transaction:
+
+```
+1. transaction ngắn, chỉ đọc: kiểm tra trùng email / username   (trùng → 409, khỏi băm)
+2. băm mật khẩu                                                (KHÔNG transaction, KHÔNG giữ connection)
+3. transaction ngắn: INSERT user + account                     (trùng do request khác chen vào → unique constraint chặn → 409)
+```
+
+`register` dùng `@Transactional(propagation = SUPPORTS)` để đè `@Transactional(readOnly = true)` của class (bản thân method không mở transaction; bên gọi đã có transaction, vd test, thì chạy chung), bước 1 và 3 dùng `TransactionTemplate`. Log thật, app đã chạy nóng:
+
+| | Transaction | Thời gian giữ connection |
+|---|---|---|
+| Trước | `BEGIN UserService.register` … `select` … *(băm ~77 ms)* … `insert` … `COMMIT` | ~88 ms |
+| Sau | `BEGIN … check duplicates` … `COMMIT` (5 ms) · *băm ~79 ms, không giữ gì* · `BEGIN … insert` … `COMMIT` (8 ms) | ~13 ms |
+
+Test `PasswordHashingOutsideTransactionTests`: bọc `PasswordEncoder` thật bằng spy, mỗi lần `encode` ghi lại có transaction không và pool đang cho mượn bao nhiêu connection. Mong đợi `transactionActive=false, activeConnections=0`; đăng ký trùng email thì `encode` không được gọi. Thử đưa `register` về bản cũ: test đỏ với `transactionActive=true, activeConnections=1`.
+
+Đánh đổi: bước 1 ngắn nên khi nhiều request **cùng email** đến cùng lúc, cả đám qua được bước 1 và đều băm mật khẩu trước khi unique constraint chặn ở bước 3 (đo: 50 request → 1 × `201`, 49 × `409`, cả 49 do DB chặn). Đăng ký lại một email **đã có** thì vẫn bị chặn trước khi băm.
 
 ### Cách hoạt động của Idempotency
 

@@ -2,6 +2,7 @@ package com.shoplab.wallet.internal;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -42,12 +43,18 @@ class BatchTransferService {
 
     private final WalletRepository repo;
     private final TransactionTemplate tx;
+    private final BatchTransferService self;   // proxy của chính bean này (xem transferAllThroughProxy)
 
     /** transfer ghi lại lần gọi gần nhất có chạy trong transaction không, để test kiểm tra. */
     private volatile boolean lastTransferHadTransaction;
 
-    BatchTransferService(WalletRepository repo, PlatformTransactionManager txManager) {
+    /**
+     * @param self chính bean này, nhưng là PROXY (có @Transactional) chứ không phải this. @Lazy: Spring đưa một
+     *             proxy trì hoãn, tới lần gọi đầu mới lấy bean thật, nên không vướng vòng phụ thuộc vào chính mình.
+     */
+    BatchTransferService(WalletRepository repo, PlatformTransactionManager txManager, @Lazy BatchTransferService self) {
         this.repo = repo;
+        this.self = self;
         this.tx = new TransactionTemplate(txManager);
         this.tx.setName("BatchTransferService.transfer (TransactionTemplate)");   // tên hiện trong log BEGIN / COMMIT
     }
@@ -76,6 +83,15 @@ class BatchTransferService {
         return runEach(commands, this::transfer);
     }
 
+    /**
+     * SỬA (gọi qua proxy): self.transfer(...) thay cho this.transfer(...). self là proxy Spring tạo, nên lời gọi
+     * đi qua proxy và @Transactional của transfer có hiệu lực. Chạy được, nhưng phải nhớ dùng self ở mọi chỗ:
+     * người sau "dọn" self.transfer thành transfer là bẫy quay lại. Tách sang bean khác (BatchTransferRunner) rõ hơn.
+     */
+    public List<Outcome> transferAllThroughProxy(List<TransferCommand> commands) {
+        return runEach(commands, self::transfer);
+    }
+
     /** SỬA: tự mở transaction cho từng lượt bằng TransactionTemplate, không trông vào @Transactional của transfer. */
     public List<Outcome> transferAllEachInOwnTransaction(List<TransferCommand> commands) {
         if (Boolean.getBoolean(BREAK_PROPERTY)) {
@@ -89,7 +105,7 @@ class BatchTransferService {
         return lastTransferHadTransaction;
     }
 
-    private static List<Outcome> runEach(List<TransferCommand> commands, Consumer<TransferCommand> transfer) {
+    static List<Outcome> runEach(List<TransferCommand> commands, Consumer<TransferCommand> transfer) {
         List<Outcome> outcomes = new ArrayList<>();
         for (TransferCommand command : commands) {
             try {

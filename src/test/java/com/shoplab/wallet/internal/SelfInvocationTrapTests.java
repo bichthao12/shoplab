@@ -32,7 +32,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  * qua proxy chỉ có một cặp BEGIN / ROLLBACK BatchTransferService.transfer; gọi nội bộ thì không có BEGIN nào cho
  * transfer, mỗi lời gọi repository tự BEGIN / COMMIT (SimpleJpaRepository.save ...).
  */
-@Import(BatchTransferService.class)
+@Import({BatchTransferService.class, BatchTransferRunner.class})
 class SelfInvocationTrapTests extends IntegrationTestBase {
 
     private static final long MISSING_WALLET = 999_999_999L;
@@ -40,6 +40,7 @@ class SelfInvocationTrapTests extends IntegrationTestBase {
     private static final Logger log = LoggerFactory.getLogger(SelfInvocationTrapTests.class);
 
     @Autowired BatchTransferService batch;   // proxy Spring tạo vì class có @Transactional
+    @Autowired BatchTransferRunner runner;   // bean khác, gọi batch.transfer qua proxy
     @Autowired WalletService walletService;
 
     private long a;
@@ -81,6 +82,30 @@ class SelfInvocationTrapTests extends IntegrationTestBase {
         assertThat(balanceOf(a)).isEqualByComparingTo("60.00");    // 100 - 30 (lượt lỗi, không rollback) - 10
         assertThat(balanceOf(b)).isEqualByComparingTo("110.00");
         assertThat(balanceOf(a).add(balanceOf(b))).isEqualByComparingTo("170.00");   // 30 biến mất
+    }
+
+    @Test
+    @DisplayName("SỬA (tách sang bean khác): BatchTransferRunner gọi transfer của bean kia qua proxy → lượt lỗi rollback, tổng giữ 200")
+    void transferAllFromAnotherBean_keepsMoney() {
+        List<Outcome> outcomes = runner.transferAll(payroll());
+        logResult(outcomes, batch.lastTransferHadTransaction());
+
+        assertThat(outcomes).containsExactly(Outcome.FAILED, Outcome.TRANSFERRED);
+        assertThat(balanceOf(a)).isEqualByComparingTo("90.00");    // lượt lỗi đã rollback: chỉ trừ 10
+        assertThat(balanceOf(b)).isEqualByComparingTo("110.00");
+        assertThat(batch.lastTransferHadTransaction()).isTrue();
+    }
+
+    @Test
+    @DisplayName("SỬA (gọi qua proxy): self.transfer(...) thay cho this.transfer(...) → lượt lỗi rollback, tổng giữ 200")
+    void transferAllThroughProxy_keepsMoney() {
+        List<Outcome> outcomes = batch.transferAllThroughProxy(payroll());
+        logResult(outcomes, batch.lastTransferHadTransaction());
+
+        assertThat(outcomes).containsExactly(Outcome.FAILED, Outcome.TRANSFERRED);
+        assertThat(balanceOf(a)).isEqualByComparingTo("90.00");
+        assertThat(balanceOf(b)).isEqualByComparingTo("110.00");
+        assertThat(batch.lastTransferHadTransaction()).isTrue();
     }
 
     @Test

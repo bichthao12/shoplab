@@ -5,7 +5,10 @@ import com.shoplab.common.StaleVersionException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.Assert;
 
 import java.nio.charset.StandardCharsets;
@@ -26,29 +29,50 @@ public class UserService {
 
     private final UserRepository repo;
     private final PasswordEncoder passwordEncoder;
+    private final TransactionTemplate checkTx;    // chỉ đọc: kiểm tra trùng trước khi băm
+    private final TransactionTemplate insertTx;   // ghi user + account
 
-    public UserService(UserRepository repo, PasswordEncoder passwordEncoder) {
+    public UserService(UserRepository repo, PasswordEncoder passwordEncoder, PlatformTransactionManager txManager) {
         this.repo = repo;
         this.passwordEncoder = passwordEncoder;
+        this.checkTx = new TransactionTemplate(txManager);
+        this.checkTx.setReadOnly(true);
+        this.checkTx.setName("UserService.register: check duplicates");   // tên hiện trong log BEGIN / COMMIT
+        this.insertTx = new TransactionTemplate(txManager);
+        this.insertTx.setName("UserService.register: insert");
     }
 
     // ---------- ĐĂNG KÝ: tạo User + Account ----------
-    @Transactional
+    /**
+     * Tạo User + Account. BCrypt cố ý chậm (~80ms), nên băm NGOÀI transaction để không giữ connection DB
+     * trong lúc băm (pool chỉ có 10 connection, đăng ký dồn dập sẽ làm mọi API khác phải chờ connection):
+     * <ol>
+     *   <li>transaction ngắn, chỉ đọc: kiểm tra trùng email / username. Trùng thì khỏi băm;</li>
+     *   <li>băm mật khẩu: không có transaction, không giữ connection;</li>
+     *   <li>transaction ngắn: INSERT. Request khác đăng ký cùng email / username chen vào giữa bước 1 và 3
+     *       thì unique constraint chặn, và saveAndFlush vẫn trả lỗi trùng (409).</li>
+     * </ol>
+     * SUPPORTS đè @Transactional(readOnly = true) của class: bản thân method không mở transaction. Bên gọi đã có
+     * transaction (vd test) thì bước 1 và 3 chạy chung transaction đó.
+     */
+    @Transactional(propagation = Propagation.SUPPORTS)
     public User register(RegisterUserCommand command) {
         checkPasswordLength(command.password());
-
         String email = User.normalizeEmail(command.email());
-        if (repo.existsByEmail(email)) {
-            throw new DuplicateEmailException(email);
-        }
         String username = Account.normalizeUsername(command.username());
-        if (repo.existsByAccountUsername(username)) {
-            throw new DuplicateUsernameException(username);
-        }
 
-        // Băm sau cùng: BCrypt cố ý chậm, không tốn CPU cho request đằng nào cũng bị từ chối
-        User user = new User(command, passwordEncoder.encode(command.password()));
-        return saveAndFlush(user);
+        checkTx.executeWithoutResult(status -> {
+            if (repo.existsByEmail(email)) {
+                throw new DuplicateEmailException(email);
+            }
+            if (repo.existsByAccountUsername(username)) {
+                throw new DuplicateUsernameException(username);
+            }
+        });
+
+        String passwordHash = passwordEncoder.encode(command.password());
+
+        return insertTx.execute(status -> saveAndFlush(new User(command, passwordHash)));
     }
 
     // ---------- HỒ SƠ ----------

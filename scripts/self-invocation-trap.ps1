@@ -1,8 +1,8 @@
 ﻿<#
 .SYNOPSIS
   Chạy test bẫy gọi nội bộ của @Transactional (SelfInvocationTrapTests) và in diễn biến từng cách gọi:
-  qua proxy (có transaction), this.transfer(...) (không có transaction, mất tiền), bản sửa (TransactionTemplate),
-  và code thật WalletService.transfer khi bị gọi không qua proxy.
+  qua proxy (có transaction), this.transfer(...) (không có transaction, mất tiền), ba cách sửa (tách sang bean khác,
+  gọi qua proxy self.transfer(...), TransactionTemplate), và code thật WalletService.transfer khi bị gọi không qua proxy.
 
 .DESCRIPTION
   Kịch bản: chuyển "lương" từ ví A (100) theo hai lượt: A → ví không tồn tại 30 (lỗi ở bước tìm ví đích, SAU khi
@@ -15,7 +15,7 @@
 
   -Break: tự "phá" bản sửa (bỏ TransactionTemplate, gọi thẳng transfer(...) như bản bẫy) để xem test có bắt được không.
 
-  Thoát với mã 0 nếu mọi thứ đúng như mong đợi (không -Break: cả 4 test xanh; -Break: đúng test của bản sửa đỏ
+  Thoát với mã 0 nếu mọi thứ đúng như mong đợi (không -Break: mọi test xanh; -Break: đúng test của bản sửa đỏ
   vì mất tiền); 1 nếu không; 2 nếu không chạy được test.
 
 .EXAMPLE
@@ -54,19 +54,29 @@ $cases = [ordered]@{
         Expect = 'KHÔNG có transaction; lượt lỗi vẫn trừ 30 của A → mất 30 (A 60, B 110, tổng 170)'
         Check  = { param($r) $r.Outcome -eq '[FAILED,TRANSFERRED]' -and $r.Tx -eq 'false' -and $r.A -eq 60 -and $r.B -eq 110 }
     }
+    'transferAllFromAnotherBean_keepsMoney' = @{
+        Title  = '3. SỬA (tách sang bean khác): BatchTransferRunner gọi batch.transfer(...) qua proxy'
+        Expect = 'có transaction; lượt lỗi rollback, lượt kia vẫn chuyển (A 90, B 110, tổng 200)'
+        Check  = { param($r) $r.Outcome -eq '[FAILED,TRANSFERRED]' -and $r.Tx -eq 'true' -and $r.A -eq 90 -and $r.B -eq 110 }
+    }
+    'transferAllThroughProxy_keepsMoney' = @{
+        Title  = '4. SỬA (gọi qua proxy): self.transfer(...) thay cho this.transfer(...)'
+        Expect = 'có transaction; lượt lỗi rollback, lượt kia vẫn chuyển (A 90, B 110, tổng 200)'
+        Check  = { param($r) $r.Outcome -eq '[FAILED,TRANSFERRED]' -and $r.Tx -eq 'true' -and $r.A -eq 90 -and $r.B -eq 110 }
+    }
     $fixCase = @{
-        Title  = '3. SỬA: mỗi lượt chạy trong transaction mở bằng TransactionTemplate'
+        Title  = '5. SỬA: mỗi lượt chạy trong transaction mở bằng TransactionTemplate'
         Expect = 'có transaction; lượt lỗi rollback, lượt kia vẫn chuyển (A 90, B 110, tổng 200)'
         Check  = { param($r) $r.Outcome -eq '[FAILED,TRANSFERRED]' -and $r.Tx -eq 'true' -and $r.A -eq 90 -and $r.B -eq 110 }
     }
     'realTransferWithoutProxy_failsFastOnLockQuery' = @{
-        Title  = '4. Code thật: WalletService.transfer(ví A → ví B, 10) bị gọi không qua proxy'
+        Title  = '6. Code thật: WalletService.transfer(ví A → ví B, 10) bị gọi không qua proxy'
         Expect = 'lỗi ngay ở câu khoá SELECT ... FOR UPDATE (cần transaction), không ví nào bị đổi'
         Check  = { param($r) $r.Outcome -match 'TransactionRequiredException' -and $r.A -eq 100 -and $r.B -eq 100 }
     }
 }
 if ($Break) {
-    $cases[$fixCase].Title = '3. SỬA, nhưng ĐÃ BỊ PHÁ (-Break): bỏ TransactionTemplate, gọi thẳng transfer(...)'
+    $cases[$fixCase].Title = '5. SỬA, nhưng ĐÃ BỊ PHÁ (-Break): bỏ TransactionTemplate, gọi thẳng transfer(...)'
 }
 
 # Chạy test một lần, trả về các dòng output của Maven (gồm log của app trong test)
@@ -235,7 +245,7 @@ if ($result.ExitCode -eq 0) {
 Write-Host ''
 
 if ($Break) {
-    # Phá bản sửa: đúng là chỉ case 3 khác mong đợi và Maven báo đỏ thì test có tác dụng
+    # Phá bản sửa: đúng là chỉ case TransactionTemplate khác mong đợi và Maven báo đỏ thì test có tác dụng
     if ($result.ExitCode -ne 0 -and $caseFailures.Count -eq 1 -and $caseFailures[0] -eq $fixCase) {
         $r = $parsed[$fixCase].Result
         Write-Host "ĐÚNG: đã phá bản sửa và test bắt được: A = $($r.A) thay vì 90.00, mất $(200 - $r.A - $r.B)" -ForegroundColor Green
@@ -245,8 +255,8 @@ if ($Break) {
     exit 1
 }
 if ($result.ExitCode -eq 0 -and $caseFailures.Count -eq 0) {
-    Write-Host 'ĐÚNG (4/4 case): gọi nội bộ this.transfer(...) không có transaction và làm mất 30;' -ForegroundColor Green
-    Write-Host '      qua proxy hoặc TransactionTemplate thì lượt lỗi rollback, tổng tiền giữ 200' -ForegroundColor Green
+    Write-Host "ĐÚNG ($($cases.Count)/$($cases.Count) case): gọi nội bộ this.transfer(...) không có transaction và làm mất 30;" -ForegroundColor Green
+    Write-Host '      tách sang bean khác, gọi qua proxy hoặc TransactionTemplate thì lượt lỗi rollback, tổng tiền giữ 200' -ForegroundColor Green
     exit 0
 }
 Write-Host "SAI: $($caseFailures.Count) case không như mong đợi$(if ($caseFailures.Count) { ': ' + ($caseFailures -join ', ') })" `
