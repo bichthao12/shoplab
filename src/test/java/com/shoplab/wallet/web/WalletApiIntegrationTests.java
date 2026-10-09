@@ -8,9 +8,13 @@ import org.junit.jupiter.api.Test;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.net.http.HttpResponse;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -62,6 +66,30 @@ class WalletApiIntegrationTests extends IntegrationTestBase {
         assertThat(retry.body()).isEqualTo(first.body());
         assertThat(balanceOf(walletId)).isEqualByComparingTo("100.00");
         assertProblem(deposit(walletId, "1", null), 400);
+    }
+
+    @Test
+    @DisplayName("Tạo ví lọt qua bước kiểm tra trước (ví của người này đang được tạo, chưa commit) → DB chặn, vẫn trả 409 duplicate-wallet")
+    void duplicateWalletCaughtByDatabase_returnsDuplicateWallet() throws Exception {
+        long userId = createUser("a@example.com", "A", "a", "ACTIVE");
+
+        try (Connection other = dataSource.getConnection()) {
+            other.setAutoCommit(false);
+            try (PreparedStatement ps = other.prepareStatement("INSERT INTO wallets (user_id, balance) VALUES (?, 0)")) {
+                ps.setLong(1, userId);
+                ps.executeUpdate();     // chưa commit: request bên dưới không thấy ví này ở bước existsByUserId
+            }
+
+            CompletableFuture<HttpResponse<String>> pending = CompletableFuture.supplyAsync(() ->
+                    send("POST", "/api/wallets", """
+                            {"userId":%d}
+                            """.formatted(userId), null));
+            awaitSessionWaitingForLock();   // request đã tới INSERT và đang chờ unique index uk_wallets_user
+            other.commit();
+
+            assertProblem(pending.get(30, TimeUnit.SECONDS), 409, "duplicate-wallet");
+        }
+        assertThat(count("wallets")).isEqualTo(1);
     }
 
     // =====================================================================

@@ -378,6 +378,9 @@ Vì vậy server so `version` client gửi với version hiện tại trước k
    Response có `expectedVersion` và `currentVersion`; client tải lại hồ sơ rồi sửa lại.
 2. **Hai request cùng version chạy cùng lúc**: cả hai qua được bước 1. `@Version` vẫn chặn khi flush
    (`UPDATE ... WHERE version = ?` → 0 dòng) → **409** `concurrent-modification`. Chỉ một request thắng.
+   Test `profileChangedBetweenCheckAndWrite_versionColumnReturns409` ép đúng nhánh này: một connection khác sửa hồ sơ
+   (chưa commit) trong lúc request đã qua bước 1 và đang chờ ở câu `UPDATE`. Bỏ handler
+   `ObjectOptimisticLockingFailureException` trong `GlobalExceptionHandler` thì request này thành 500 và test đỏ.
 
 ```json
 {
@@ -951,6 +954,22 @@ Tiền tố: `https://shoplab.dev/errors/`
 | `internal` | 500 | Lỗi hệ thống |
 
 Các lỗi có sẵn của Spring MVC (JSON sai, thiếu header, 404 đường dẫn, 405, 415) dùng `type` mặc định `about:blank` nhưng vẫn cùng cấu trúc và có `timestamp`.
+
+### Vi phạm unique: luôn 409, không bao giờ 500
+
+Mỗi ràng buộc unique mà API có thể chạm tới đều có hai lớp: service kiểm tra trước (trả lỗi rõ nghĩa), và nếu nhiều request cùng lọt qua thì service bắt lỗi DB theo **tên constraint** (`DbConstraints.isViolated`) để trả đúng loại lỗi. Lỗi unique nào service chưa dịch thì `GlobalExceptionHandler` vẫn trả `409 data-integrity` (`DataIntegrityViolationException`, gồm cả `DuplicateKeyException` khi đi qua `JdbcClient`), không rơi xuống 500.
+
+| Ràng buộc | Khi nào vi phạm | Lỗi | Test cho trường hợp DB chặn (lọt qua bước kiểm tra trước) |
+|---|---|---|---|
+| `uk_users_email` | Đăng ký trùng email (không phân biệt hoa/thường) | 409 `duplicate-email` | `duplicateEmailCaughtByDatabase_returnsDuplicateEmail`, `sameEmailAtOnce_registersExactlyOne` |
+| `uk_accounts_username` | Đăng ký trùng username | 409 `duplicate-username` | `sameUsernameAtOnce_registersExactlyOne` |
+| `uk_products_sku` | Tạo, hoặc `PATCH` sang SKU đã có | 409 `duplicate-sku` | `duplicateSkuCaughtByDatabase_returnsDuplicateSku` (tạo), `duplicateSkuOnPatchCaughtByDatabase_returnsDuplicateSku` (`PATCH`) |
+| `uk_wallets_user` | Tạo ví thứ hai cho cùng người dùng | 409 `duplicate-wallet` | `duplicateWalletCaughtByDatabase_returnsDuplicateWallet` |
+| `uk_order_items_order_product` | Không chạm được qua API: dòng trùng sản phẩm được gộp trước khi ghi | — | `OrderModuleTests` (gộp dòng trùng) |
+| `uk_accounts_user`, khoá chính | Không chạm được qua API (mỗi người dùng tạo đúng một tài khoản, id lấy từ sequence) | 409 `data-integrity` nếu có | — |
+| `idempotency_keys` (khoá chính) | `INSERT ... ON CONFLICT DO NOTHING`, không ném lỗi | — | `OrderIdempotencyIntegrationTests` |
+
+"Phá" để thấy lớp nào chặn gì: bỏ phần dịch `uk_wallets_user` trong `WalletService` thì request vẫn nhận **409**, chỉ đổi thành `data-integrity` (test đỏ vì sai `type`); bỏ thêm handler `DataIntegrityViolationException` thì mới thành **500**.
 
 ### Lý do chọn quy ước này
 

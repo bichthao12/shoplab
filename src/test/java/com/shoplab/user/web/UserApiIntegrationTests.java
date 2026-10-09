@@ -229,6 +229,36 @@ class UserApiIntegrationTests extends IntegrationTestBase {
     }
 
     @Test
+    @DisplayName("Hồ sơ bị sửa xen vào giữa lúc so version và lúc ghi → @Version chặn: 409 concurrent-modification dạng Problem Details, không ghi đè")
+    void profileChangedBetweenCheckAndWrite_versionColumnReturns409() throws Exception {
+        long id = idOf(json(register("a@example.com", "alice")));
+
+        try (Connection other = dataSource.getConnection()) {
+            other.setAutoCommit(false);
+            try (PreparedStatement ps = other.prepareStatement(
+                    "UPDATE users SET full_name = 'Người khác sửa', version = version + 1 WHERE id = ?")) {
+                ps.setLong(1, id);
+                ps.executeUpdate();   // chưa commit: request bên dưới vẫn đọc được version 0, nên qua bước so version
+            }
+
+            CompletableFuture<HttpResponse<String>> pending = CompletableFuture.supplyAsync(() ->
+                    send("PATCH", "/api/users/" + id, """
+                            {"fullName":"Tên của tôi","version":0}
+                            """, null));
+            awaitSessionWaitingForLock();   // request đã tới UPDATE ... WHERE version = 0 và đang chờ dòng bị khoá
+            other.commit();                 // version thành 1: câu UPDATE của request không còn khớp dòng nào
+
+            HttpResponse<String> r = pending.get(30, TimeUnit.SECONDS);
+            assertProblem(r, 409, "concurrent-modification");   // kiểm tra cả Content-Type application/problem+json
+            assertThat(json(r)).containsKeys("title", "status", "detail", "instance")
+                    .doesNotContainKey("currentVersion");      // nhánh @Version, không phải bước so version
+        }
+        Map<String, Object> user = json(send("GET", "/api/users/" + id, null, null));
+        assertThat(user.get("fullName")).isEqualTo("Người khác sửa");
+        assertThat(user.get("version")).isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("20 PATCH cùng lúc, cùng đọc version 0 → đúng 1 lượt thành công, 19 lượt 409, không lượt nào ghi đè lượt khác")
     void concurrentUpdatesWithSameVersion_onlyOneWins() throws Exception {
         long id = idOf(json(register("a@example.com", "alice")));

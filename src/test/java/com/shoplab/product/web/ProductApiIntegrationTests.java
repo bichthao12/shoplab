@@ -154,6 +154,49 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
     }
 
     @Test
+    @DisplayName("Tạo hoặc PATCH sang SKU đã có (kể cả có khoảng trắng) → 409 duplicate-sku, không sản phẩm nào đổi")
+    void duplicateSku_onCreateAndPatch_returns409() {
+        createProduct("DUP-001", 100_000, 1);
+        long other = createProduct("DUP-002", 100_000, 1);
+
+        assertProblem(send("POST", "/api/products", """
+                {"sku":" DUP-001 ","name":"Trùng","category":"test","price":1,"stock":1}
+                """, null), 409, "duplicate-sku");
+        assertProblem(send("PATCH", "/api/products/" + other, """
+                {"sku":"DUP-001","version":0}
+                """, null), 409, "duplicate-sku");
+
+        assertThat(count("products")).isEqualTo(2);
+        assertThat(json(send("GET", "/api/products/" + other, null, null)).get("sku")).isEqualTo("DUP-002");
+    }
+
+    @Test
+    @DisplayName("PATCH sang SKU lọt qua bước kiểm tra trước (SKU đó đang được tạo, chưa commit) → DB chặn, vẫn trả 409 duplicate-sku")
+    void duplicateSkuOnPatchCaughtByDatabase_returnsDuplicateSku() throws Exception {
+        long productId = createProduct("RACE-PATCH-OLD", 100_000, 1);
+
+        try (Connection other = dataSource.getConnection()) {
+            other.setAutoCommit(false);
+            try (PreparedStatement ps = other.prepareStatement("""
+                    INSERT INTO products (sku, name, category, price, stock)
+                    VALUES ('RACE-PATCH', 'Bản đến trước', 'test', 1, 1)
+                    """)) {
+                ps.executeUpdate();     // chưa commit: request bên dưới không thấy dòng này ở bước existsBySkuAndIdNot
+            }
+
+            CompletableFuture<HttpResponse<String>> pending = CompletableFuture.supplyAsync(() ->
+                    send("PATCH", "/api/products/" + productId, """
+                            {"sku":"RACE-PATCH","version":0}
+                            """, null));
+            awaitSessionWaitingForLock();   // request đã tới UPDATE và đang chờ unique index
+            other.commit();
+
+            assertProblem(pending.get(30, TimeUnit.SECONDS), 409, "duplicate-sku");
+        }
+        assertThat(json(send("GET", "/api/products/" + productId, null, null)).get("sku")).isEqualTo("RACE-PATCH-OLD");
+    }
+
+    @Test
     @DisplayName("SKU trùng lọt qua bước kiểm tra trước (2 request cùng lúc) → DB chặn, vẫn trả 409 duplicate-sku")
     void duplicateSkuCaughtByDatabase_returnsDuplicateSku() throws Exception {
         try (Connection other = dataSource.getConnection()) {
