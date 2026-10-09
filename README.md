@@ -252,6 +252,48 @@ Instant to = day.plusDays(1).atStartOfDay(shopZone).toInstant();    // 00:00 hô
 // where o.createdAt >= :from and o.createdAt < :to
 ```
 
+### Partial index cho đơn PENDING, covering index cho tổng tiền theo user (`scripts/partial-covering-index-lab.sql`)
+
+App chưa có câu nào cần hai loại index này. Thí nghiệm dùng hai câu thường gặp ở một shop thật:
+- **Job tự huỷ đơn chưa thanh toán:** lấy 1.000 đơn PENDING cũ nhất (quá 1 ngày), và đếm số đơn đang treo.
+- **Tổng tiền đã mua của một user:** `count(*), sum(total_amount)` của các đơn COMPLETED.
+
+Thí nghiệm chạy trên bảng thật. Đầu tiên VACUUM ANALYZE `orders`, vì Index Only Scan cần visibility map đầy đủ (đơn tạo qua API sau lần VACUUM cuối chưa được đánh dấu). Sau đó với từng phương án: dựng index thử, đo, rồi bỏ index, **trong cùng một câu lệnh**. Lỗi hay Ctrl+C giữa chừng thì cả câu rollback, bảng thật không giữ lại index nào. Lúc dựng index, bảng `orders` không ghi được trong 10–30 giây, nên tắt app hoặc đừng chạy tải cùng lúc.
+```powershell
+docker cp scripts/partial-covering-index-lab.sql shoplab-postgres:/tmp/
+docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/partial-covering-index-lab.sql
+```
+
+**A. Partial index** `CREATE INDEX ... ON orders (created_at) WHERE status = 'PENDING'`: chỉ đơn PENDING (khoảng 2% bảng) được đưa vào index.
+
+| Phương án | Kích thước | Dựng | Job: 1.000 đơn cũ nhất | Đếm đơn treo (201 nghìn đơn) |
+|---|---|---|---|---|
+| A0. Chỉ index sẵn có | | | `idx_orders_created_at` đọc từ đơn cũ nhất, **bỏ 49.325 dòng**: 1.112 trang, 11,3 ms | `idx_orders_status` rồi **ghé bảng 201 nghìn lần** để xem `created_at`: **117.297 trang**, 184 ms (6 giây khi chưa có trong bộ nhớ) |
+| A1. Index thường `(status, created_at)` | 386 MB | 17,1 giây | bỏ 0 dòng, 603 trang, 1,5 ms | Index Only Scan, 783 trang, 45 ms |
+| A2. Partial `(created_at) WHERE status = 'PENDING'` | **5,2 MB** | **1,2 giây** | bỏ 0 dòng, 600 trang, 0,8 ms | Index Only Scan, 559 trang, 41 ms |
+
+- **Partial nhanh ngang index thường mà nhỏ hơn 74 lần**, dựng nhanh hơn 14 lần. Index chỉ chứa đơn PENDING, nên đặt hay sửa một đơn không phải PENDING không phải ghi gì vào index.
+- **Không có index phù hợp**, job phải đọc 50 nghìn dòng mới đủ 1.000 đơn PENDING. Với một job chạy thật, đơn PENDING cũ bị huỷ dần, nên lần sau phải đọc qua nhiều đơn không phải PENDING hơn nữa mới gặp đơn cần. Với partial index, việc này không phụ thuộc bảng lớn cỡ nào.
+- **Job vẫn tốn khoảng 600 trang** dù chỉ cần 1.000 dòng: index tìm đúng đơn, nhưng cột `id` nằm ở bảng, và các đơn PENDING nằm rải khắp bảng.
+- **Partial index chỉ dùng được khi câu truy vấn chắc chắn nằm trong điều kiện của index.** Đã thử:
+  - Câu `status = 'PAID'`: không dùng được, quay về `idx_orders_status`.
+  - Câu có tham số `status = $1` (JDBC và Hibernate gửi giá trị kiểu này), `$1 = 'PENDING'`:
+    - **custom plan** (plan lập riêng cho giá trị đó) dùng được index partial;
+    - **generic plan** (plan lập một lần cho mọi giá trị; PostgreSQL có thể chuyển sang sau 5 lần chạy) không biết `$1` là gì, nên không dùng được, và quay về đọc `idx_orders_created_at` rồi lọc `status = $1`.
+  - Vì vậy với câu cần partial index, viết thẳng giá trị `'PENDING'` vào câu SQL (trong JPQL: dùng hằng số) thay vì truyền tham số.
+
+**B. Covering index:** index chứa sẵn mọi cột câu truy vấn cần, PostgreSQL trả kết quả từ index (Index Only Scan) mà không phải ghé bảng. Cột trong `INCLUDE` chỉ nằm ở lá của index, không tham gia sắp xếp hay tìm kiếm, nhưng đọc được để lọc (`status`) và tính (`total_amount`).
+
+| Phương án | Kích thước | Tổng tiền, user 1.384 đơn | Tổng tiền, user 10 đơn |
+|---|---|---|---|
+| B0. Chỉ index sẵn có `(user_id, created_at DESC, id DESC)` | 388 MB (có sẵn) | Index Scan, **ghé bảng từng đơn**: **1.389 trang**, 2,15 ms | 14 trang, 0,065 ms |
+| B1. Thêm `(user_id) INCLUDE (status, total_amount)` | +464 MB | Index Only Scan, Heap Fetches 0: **18 trang**, 0,37 ms | 8 trang, 0,053 ms |
+| B2. Thay index hiện có bằng `(user_id, created_at DESC, id DESC) INCLUDE (status, total_amount)` | 637 MB (thay 388 MB, tức +249 MB) | Index Only Scan, Heap Fetches 0: 21 trang, 0,38 ms | 8 trang, 0,045 ms |
+
+- **Lợi ích nằm ở user nhiều đơn:** từ 1.389 xuống 18 trang (ít hơn 77 lần). Với user 10 đơn thì chỉ từ 14 xuống 8 trang.
+- **Giá phải trả là dung lượng.** B1 tới 464 MB, lớn hơn cả index `(user_id)` thường (86 MB): index có `INCLUDE` không gộp được các khoá trùng (deduplication), nên mỗi đơn là một mục riêng. B2 dùng lại index đang có nên chỉ thêm 249 MB, và vẫn phục vụ câu "đơn của tôi" như cũ, vì các cột khoá không đổi. Nhưng index của câu đó to ra, trên máy ít RAM thì càng khó nằm hết trong bộ nhớ.
+- **Kết luận:** chỉ thêm covering index khi câu tổng tiền thật sự chạy nhiều; dùng `top-queries.ps1` (pg_stat_statements) để biết. Nếu thêm thì chọn B2 (sửa index hiện có) thay vì B1 (thêm một index nữa). Index Only Scan chỉ không phải ghé bảng ở những trang đã được VACUUM đánh dấu all-visible.
+
 ### Chạy test
 
 ```bash
