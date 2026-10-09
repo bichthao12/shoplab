@@ -169,6 +169,50 @@ Nên biết khi đọc kết quả:
 - Thời gian là thời gian chạy trong PostgreSQL (`total_exec_time`): không tính lập kế hoạch, đường truyền, hay phần việc của app. Vd đăng ký trung bình 449 ms là do băm BCrypt trong app; các câu SQL của nó đều dưới 0,3 ms.
 - Ngay sau khi khởi động lại Docker, dữ liệu chưa nằm trong bộ nhớ: lượt đầu chậm vì đọc đĩa (cột "Chờ đọc đĩa (ms)" lớn), câu đọc nhiều trang dễ lên đầu. Chạy thêm một lượt để so.
 
+### Index ghép `(user_id, created_at)` so với index đơn `(user_id)` (`scripts/composite-index-lab.sql`)
+
+Câu tốn nhiều thời gian DB nhất ở trên là "đơn của tôi" (`GET /api/orders?userId=`):
+```sql
+SELECT ... FROM orders WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 20
+```
+Thí nghiệm chép `orders` (10 triệu đơn) sang schema `index_lab`, chạy VACUUM ANALYZE, rồi lần lượt với từng index: dựng index → đo 4 câu → bỏ index. Mỗi lúc bản chép chỉ có đúng một index, nên planner chỉ có thể dùng index đó hoặc đọc cả bảng. Ngoài hai index cần so, đo thêm index app đang dùng (migration V11) làm mốc. Không đụng bảng thật, chạy khoảng 1 phút:
+
+```powershell
+docker cp scripts/composite-index-lab.sql shoplab-postgres:/tmp/
+docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/composite-index-lab.sql
+```
+
+| Index | Kích thước | Dựng (10 triệu dòng) |
+|---|---|---|
+| A. `(user_id)` | 86 MB | 6,2 giây |
+| B. `(user_id, created_at)` | 302 MB | 9,5 giây |
+| C. `(user_id, created_at DESC, id DESC)`, app đang dùng | 388 MB | 10,9 giây |
+
+Kết quả đo (dữ liệu đã nằm sẵn trong bộ nhớ, thời gian là trung vị 5 lần, tắt truy vấn song song). User 37450 có 10 đơn, gần trung vị; user 1 có nhiều đơn nhất, 1.384 đơn.
+
+| Câu | Index | Plan | Dòng đọc | Trang | ms |
+|---|---|---|---|---|---|
+| 1. Đơn của tôi, trang đầu, user 10 đơn | A | Limit → Sort → Index Scan | 10 | 13 | 0,048 |
+| | B | Limit → Incremental Sort → Index Scan Backward | 10 | 14 | 0,067 |
+| | C | Limit → Index Scan | 10 | 14 | 0,030 |
+| 2. Đơn của tôi, trang đầu, user 1.384 đơn | A | Limit → Sort (top-N heapsort) → Index Scan | **1.384** | **1.383** | **0,828** |
+| | B | Limit → Incremental Sort → Index Scan Backward | 21 | 24 | 0,047 |
+| | C | Limit → Index Scan | 20 | 24 | 0,031 |
+| 3. Đơn 30 ngày gần nhất, user 1.384 đơn | A | Sort → Index Scan, **bỏ 1.344 dòng** vì sai ngày | 40 | **1.383** | 0,624 |
+| | B | Incremental Sort → Index Scan Backward | 40 | 44 | 0,059 |
+| | C | Index Scan | 40 | 44 | 0,034 |
+| 4. Đếm đơn (câu đếm khi phân trang), user 1.384 đơn | A | Aggregate → Index Only Scan | 1.384 | **10** | 0,168 |
+| | B | Aggregate → Index Only Scan | 1.384 | 14 | 0,219 |
+| | C | Aggregate → Index Only Scan | 1.384 | 16 | 0,243 |
+
+- **Index ghép cho phép dừng sớm.** Với index đơn, các dòng của một user nằm trong index theo thứ tự lưu, không theo `created_at`. Muốn lấy 20 đơn mới nhất, PostgreSQL phải đọc **hết** 1.384 đơn, sắp xếp, rồi bỏ 1.364 đơn. Với index ghép, dòng của một user đã xếp sẵn theo `created_at`, nên chỉ cần đọc từ đầu tới đủ 20 dòng rồi dừng. *Use The Index, Luke* gọi đây là pipelined top-N. Số trang giảm từ 1.383 xuống 24, tức 57 lần. Khi dữ liệu không nằm sẵn trong bộ nhớ, như máy Windows ở mục trên (khoảng 0,8 ms một trang), 1.383 trang là hơn 1 giây, còn 24 trang chỉ khoảng 20 ms.
+- **User ít đơn thì gần như không khác.** Với 10 đơn, cả ba index đều đọc 13–14 trang, vì sắp xếp 10 dòng gần như không tốn gì. Phần lớn user chỉ có khoảng 9 đơn, nên đổi index thì thời gian trung bình gần như không đổi. Cái được là những user nhiều đơn hết bị chậm hẳn.
+- **Cột thứ hai lọc được khoảng giá trị.** Ở câu 3, index ghép đi thẳng tới đúng 40 đơn trong 30 ngày (cột đầu so sánh bằng, cột sau lọc khoảng). Index đơn phải đọc cả 1.384 đơn rồi bỏ 1.344.
+- **B so với C:** B đọc được theo chiều ngược (`Index Scan Backward`) nên vẫn cho `created_at DESC`. Nhưng câu còn sắp phụ theo `id DESC` để thứ tự giữa các trang cố định, mà B không có `id`, nên PostgreSQL phải thêm `Incremental Sort` (sắp lại trong nhóm cùng `created_at`) và đọc thêm 1 dòng để biết nhóm đã hết. C khớp đúng `ORDER BY` nên không phải sắp gì. Hai cột cùng chiều DESC thì `(user_id, created_at, id)` đọc ngược cũng y như C; `DESC` trong định nghĩa index chỉ cần khi các cột sắp ngược chiều nhau (vd `created_at DESC, id ASC`).
+- **Index đơn chỉ thắng ở kích thước và câu đếm.** A nhỏ gần 4 lần vì mỗi `user_id` lặp khoảng 10 lần, PostgreSQL gộp các khoá trùng thành một (deduplication). Khoá ghép thì mỗi dòng một giá trị khác nhau, không gộp được. Câu đếm chỉ cần `user_id`, nên index nhỏ hơn thì đọc ít trang hơn (10 so với 16), nhưng chênh lệch không đáng kể.
+- **Kết luận: giữ index C (V11), không thêm index đơn.** Index ghép dùng được cho cả điều kiện chỉ có `user_id = ?` (cột đầu của index), nên có thêm A chỉ tốn chỗ và làm mỗi lần ghi đơn phải cập nhật thêm một index.
+- **Phần còn lại là trang của bảng.** Ngay với C, 10 dòng vẫn tốn 14 trang: khoảng 4 trang index, còn lại mỗi đơn một trang bảng, vì đơn của một user nằm rải khắp bảng. Index chỉ quyết định đọc ít hay nhiều **dòng**; muốn giảm trang của bảng thì cần cách khác, vd index chứa sẵn mọi cột câu cần (covering index), hay xếp lại bảng theo user.
+
 ### Chạy test
 
 ```bash
