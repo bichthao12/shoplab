@@ -80,4 +80,19 @@ public class OrderController {
             }) Pageable pageable) {
         return new PagedModel<>(orderService.listByUser(userId, pageable).map(OrderSummaryResponse::from));
     }
+
+    /**
+     * GET /api/orders/with-items?userId=1&page=0&size=100 → như danh sách ở trên, nhưng mỗi đơn kèm dòng hàng
+     * (cùng dạng GET /api/orders/{id}). Trang bao nhiêu đơn cũng chỉ 2–3 câu SQL (OrderService.listByUserWithItems).
+     */
+    @GetMapping("/with-items")
+    public PagedModel<OrderResponse> listByUserWithItems(
+            @RequestParam long userId,
+            @PageableDefault(size = 20)
+            @SortDefault.SortDefaults({
+                    @SortDefault(sort = "createdAt", direction = Sort.Direction.DESC),
+                    @SortDefault(sort = "id", direction = Sort.Direction.DESC)
+            }) Pageable pageable) {
+        return new PagedModel<>(orderService.listByUserWithItems(userId, pageable).map(OrderResponse::from));
+    }
 }

@@ -15,7 +15,7 @@
   -Attempts lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt.
 
   Cần git và Docker (test dựng PostgreSQL bằng Testcontainers), như khi chạy test. Mỗi kịch bản một lượt Maven,
-  cả 12 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
+  cả 13 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu mọi kịch bản xanh với bản sửa và đỏ với bản lỗi; 1 nếu không; 2 nếu không chạy được.
 
 .EXAMPLE
@@ -90,6 +90,10 @@ $all = @(
        Title = 'Không chờ lâu trong transaction'
        Bug = 'băm mật khẩu bên trong transaction'
        Tests = @('PasswordHashingOutsideTransactionTests#register_hashesPasswordOutsideTransaction') }
+    @{ Id = 'n-plus-one'; Patch = '13-n-plus-one.patch'
+       Title = 'N+1: danh sách đơn kèm dòng hàng'
+       Bug = 'mỗi đơn tự nạp dòng hàng của nó (order.getItems().size() trong vòng lặp)'
+       Tests = @('OrderListWithItemsTests') }
 )
 
 # powershell -File truyền "-Scenario a,b" thành MỘT chuỗi "a,b": tự tách theo dấu phẩy

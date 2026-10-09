@@ -310,7 +310,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests`, `WalletModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `PasswordHashingOutsideTransactionTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `SelfInvocationTrapTests`, `WalletApiIntegrationTests`, `IsolationLevelTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `PasswordHashingOutsideTransactionTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `SelfInvocationTrapTests`, `WalletApiIntegrationTests`, `IsolationLevelTests`, `OrderListWithItemsTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
@@ -324,7 +324,7 @@ Mỗi Spring context của test giữ một pool 10 connection. Testcontainers d
 Mỗi kịch bản có test bảo vệ, và một bản lỗi viết dưới dạng patch trong `scripts/bugs/` (bản lỗi không nằm trong code chính hay code test). Script copy `pom.xml`, `mvnw`, `.mvn`, `src` ra thư mục tạm (không đụng thư mục làm việc), chạy test bảo vệ của mọi kịch bản trên code hiện tại (mong đợi **xanh**), rồi lần lượt áp từng patch, chạy test bảo vệ của kịch bản đó (mong đợi **đỏ**) và gỡ patch.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 12 kịch bản, ~5–10 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 13 kịch bản, ~5–10 phút
 powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadlock,self-invocation # chỉ vài kịch bản
 ```
 
@@ -342,6 +342,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `unique-500` | `10`: không dịch `uk_wallets_user`, không có handler dự phòng | `GlobalExceptionHandlerTests#untranslatedDataIntegrityViolation_returnsGeneric409`, `WalletApiIntegrationTests#duplicateWalletCaughtByDatabase_returnsDuplicateWallet` | `500` thay vì `409` |
 | `self-invocation` | `11`: cả ba cách sửa quay về `this.transfer(...)` | 3 test sửa của `SelfInvocationTrapTests` | A = **60.00** thay vì 90.00 (mất 30) |
 | `hash-in-transaction` | `12`: `register` là một transaction, băm mật khẩu bên trong | `PasswordHashingOutsideTransactionTests#register_hashesPasswordOutsideTransaction` | lúc băm `transactionActive=true, activeConnections=1` |
+| `n-plus-one` | `13`: mỗi đơn tự nạp dòng hàng (`order.getItems().size()` trong vòng lặp) | `OrderListWithItemsTests` | **102 câu SQL** cho trang 100 đơn (22 câu cho trang 20 đơn) thay vì 3 |
 
 ```
 == Ma trận
@@ -350,8 +351,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
    deadlock             XANH         ĐỎ
    ...
    hash-in-transaction  XANH         ĐỎ
+   n-plus-one           XANH         ĐỎ
 
-ĐÚNG (12/12): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
+ĐÚNG (13/13): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
 ```
 
 - **Kịch bản race** (`oversell`, `stock-adjustment`): không ép thứ tự thì lỗi không phải lần nào cũng lộ (bản ngây thơ bán vượt: 5 lần chạy cho 6, 10, 9, **1**, 10 đơn). Bản lỗi được chạy tối đa `-Attempts` lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt; script in ra lần thứ mấy thì đỏ.
@@ -370,6 +372,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 - **Lost update khi sửa sản phẩm:** `scripts\product-lost-update.ps1` (xem mục *Sửa sản phẩm: bắt buộc gửi `version`*).
 - **Nhập / trừ tồn kho cùng lúc với đơn hàng, gửi lại cùng key:** `scripts\stock-adjustment.ps1` (xem mục *Điều chỉnh tồn kho*).
 - **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).
+- **Đếm số câu SQL của danh sách 100 đơn kèm dòng hàng (N+1):** `scripts\n-plus-one.ps1` (xem mục *N+1*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -388,6 +391,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | PostgreSQL `shared_preload_libraries` (`docker-compose.yml`) | `pg_stat_statements` | Cộng dồn số lần chạy, thời gian của từng câu SQL để tìm câu tốn nhất (`scripts/top-queries.ps1`). Chỉ nạp được lúc khởi động: đổi thì phải tạo lại container. Đi cùng `track_io_timing=on` để có thời gian chờ đọc đĩa |
 | PostgreSQL `shared_buffers` (`docker-compose.yml`) | `1GB` | Mặc định 128MB. Bằng 1/4 RAM khi cấp cho Docker 4 GB, giữ được phần lớn index của bộ dữ liệu lớn trong bộ nhớ PostgreSQL |
 | Container `shm_size` (`docker-compose.yml`) | `1g` | `/dev/shm` mặc định của Docker chỉ 64MB, truy vấn song song đặt bảng băm chung ở đó. Đã thử trên 10 triệu dòng: `SET work_mem = '256MB'` rồi join thì 64MB báo `could not resize shared memory segment ... No space left on device`, 1g chạy được |
+| `spring.jpa.properties.hibernate.generate_statistics` | `true` | Thống kê của Hibernate: hết mỗi request log số câu JDBC đã chạy (`Logging session metrics`), thấy ngay N+1. Logger `org.hibernate.session.metrics` nằm trong nhóm `sql` (khai báo lại nhóm có sẵn của Spring Boot để thêm logger này) |
 | `logging.level.sql` | `DEBUG` | Log từng câu SQL, của cả Hibernate (`org.hibernate.SQL`) lẫn `JdbcClient` (`org.springframework.jdbc.core`) |
 | `logging.level.tx` | `DEBUG` | Log `BEGIN` / `COMMIT` / `ROLLBACK` của mỗi transaction mới (`common.config.TransactionLogging`) |
 
@@ -581,6 +585,7 @@ Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nế
 | `POST` | `/api/orders` (bắt buộc header `Idempotency-Key`) | **201** + `Location` | xem bảng bên dưới |
 | `GET` | `/api/orders/{id}` | **200** | 404 |
 | `GET` | `/api/orders?userId=1&page=0&size=20` | **200**: đơn của người dùng, mới nhất trước, có phân trang, không kèm dòng hàng | 400 thiếu `userId` · 400 `sort` theo trường không tồn tại |
+| `GET` | `/api/orders/with-items?userId=1&page=0&size=100` | **200**: như trên nhưng mỗi đơn kèm dòng hàng (cùng dạng `GET /api/orders/{id}`); trang bao nhiêu đơn cũng chỉ 3 câu SQL (xem mục *N+1*) | như trên |
 
 Ví dụ:
 
@@ -611,6 +616,37 @@ Idempotency-Key: 3f1c2a9e-7b4d-4c1e-9a55-0d2f6b8e1a77
 | Sản phẩm không tồn tại / ngừng bán | **422** | `invalid-order` |
 | Không đủ hàng | **409** | Kèm `sku`, `requested`, `available` |
 | Request khác cùng key đang chạy quá 5 giây | **409** | Header `Retry-After: 1`, gửi lại với **cùng** key |
+
+#### N+1: danh sách đơn kèm dòng hàng (`GET /api/orders/with-items`)
+
+Cách viết tự nhiên nhất là lấy trang đơn, rồi để từng đơn tự nạp dòng hàng của nó (vd `order.getItems().size()`, hay để Jackson đọc `items` khi còn session). Mỗi đơn lúc đó chạy thêm một câu `SELECT ... FROM order_items WHERE order_id = ?`, nên trang 100 đơn tốn **1 + 100 câu** (cộng 1 câu đếm cho phân trang): đó là N+1. `OrderService.listByUserWithItems` làm theo hai bước, số câu không phụ thuộc số đơn trong trang:
+
+1. `findByUserId(userId, pageable)`: một câu lấy đúng một trang đơn (`LIMIT`), cộng một câu `count(*)` khi trang đầy.
+2. `fetchItems(ids)`: một câu `select distinct o ... left join fetch o.items where o.id in :ids` nạp dòng hàng cho cả trang. Các đơn đó đã nằm trong persistence context, nên Hibernate điền `items` vào đúng các object đó.
+
+Không gộp hai bước thành một câu `join fetch` có phân trang: `LIMIT` áp lên số dòng **sau** khi join (đơn × dòng hàng), không phải số đơn, nên Hibernate phải nạp **mọi** đơn của người dùng rồi cắt trang trong bộ nhớ (cảnh báo `HHH90003004`).
+
+**Đếm số câu SQL:**
+- Thống kê Hibernate (`spring.jpa.properties.hibernate.generate_statistics=true`): hết mỗi request, log của app có khối `Logging session metrics`, ngay sau dòng `COMMIT OrderService.listByUserWithItems`:
+  ```
+  org.hibernate.session.metrics : HHH000401: Logging session metrics:
+      ... ns preparing 3 JDBC statements
+      ... ns executing 3 JDBC statements
+  ```
+  Hibernate 7 log khối này ở mức DEBUG. Logger của nó (`org.hibernate.session.metrics`) được thêm vào nhóm `sql`, nên tắt log SQL (`--logging.level.sql=INFO`) là tắt luôn khối này.
+- Test `OrderListWithItemsTests`: tạo 100 đơn, mỗi đơn 2 dòng hàng; gọi API; đọc `Statistics.getPrepareStatementCount()` của Hibernate; khẳng định không quá 3 câu.
+- Script gọi API thật trên app đang chạy, đếm bằng `pg_stat_statements` ở phía DB (cần PostgreSQL đã nạp `pg_stat_statements`, xem mục *Câu SQL tốn thời gian nhất*):
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File .\scripts\n-plus-one.ps1     # -Orders 20 để thử trang khác
+  ```
+  Script đăng ký một người dùng mới, tạo 2 sản phẩm, đặt 100 đơn qua API, reset `pg_stat_statements`, gọi `GET /api/orders/with-items?size=100` đúng một lần, rồi in từng câu SQL và số lần chạy.
+
+| | Trang 100 đơn | Trang 20 đơn |
+|---|---|---|
+| Bản N+1 (`scripts/bugs/13-n-plus-one.patch`) | **102 câu**: 1 trang đơn + 1 đếm + 100 lần nạp dòng hàng | **22 câu** |
+| Bản hiện tại | **3 câu**: trang đơn, đếm, nạp dòng hàng của cả trang | **3 câu** |
+
+Đã thử: test đếm được 3 câu với bản hiện tại. Áp patch N+1 (`scripts\red-green.ps1 -Scenario n-plus-one`) thì test đỏ với 102 và 22 câu. Script trên app thật in đúng 3 câu đọc dữ liệu (không tính `BEGIN READ ONLY`), khớp con số trong khối `Logging session metrics` của log.
 
 ### Người dùng – `/api/users`
 
