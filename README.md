@@ -213,6 +213,45 @@ Kết quả đo (dữ liệu đã nằm sẵn trong bộ nhớ, thời gian là 
 - **Kết luận: giữ index C (V11), không thêm index đơn.** Index ghép dùng được cho cả điều kiện chỉ có `user_id = ?` (cột đầu của index), nên có thêm A chỉ tốn chỗ và làm mỗi lần ghi đơn phải cập nhật thêm một index.
 - **Phần còn lại là trang của bảng.** Ngay với C, 10 dòng vẫn tốn 14 trang: khoảng 4 trang index, còn lại mỗi đơn một trang bảng, vì đơn của một user nằm rải khắp bảng. Index chỉ quyết định đọc ít hay nhiều **dòng**; muốn giảm trang của bảng thì cần cách khác, vd index chứa sẵn mọi cột câu cần (covering index), hay xếp lại bảng theo user.
 
+### Viết lại `DATE(created_at) = …` thành khoảng thời gian (`scripts/date-range-lab.sql`)
+
+```sql
+-- Bọc cột trong hàm: index trên created_at không dùng để tìm được
+WHERE DATE(created_at) = '2026-09-09'
+-- Khoảng nửa mở trên chính cột, ghi rõ múi giờ của ngày
+WHERE created_at >= '2026-09-09 00:00+07' AND created_at < '2026-09-10 00:00+07'
+```
+
+Index `idx_orders_created_at` xếp theo giá trị `created_at`, không theo `DATE(created_at)`. Với điều kiện bọc trong hàm, PostgreSQL không biết đi tới đâu trong index, nên phải đọc mọi dòng, tính `DATE()` cho từng dòng rồi so sánh. Viết thành khoảng thì điều kiện nằm thẳng trên cột: index đi tới đầu khoảng và đọc tới cuối khoảng. Dùng khoảng **nửa mở** (`>=` đầu ngày, `<` đầu ngày hôm sau). Không dùng `BETWEEN ... AND '... 23:59:59'`, vì sẽ bỏ sót đơn lúc 23:59:59.5; còn `BETWEEN` tới 00:00 hôm sau thì lấy thừa đơn đúng nửa đêm.
+
+Thí nghiệm chạy thẳng trên bảng thật (chỉ đọc, dùng index sẵn có), khoảng 15 giây:
+```powershell
+docker cp scripts/date-range-lab.sql shoplab-postgres:/tmp/
+docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/date-range-lab.sql
+```
+
+Kết quả (ngày 2026-09-09, dữ liệu đã nằm sẵn trong bộ nhớ, thời gian là trung vị 5 lần, tắt truy vấn song song):
+
+| Câu | Cách viết | Plan | Dòng khớp | Dòng bỏ | Trang | ms |
+|---|---|---|---|---|---|---|
+| Đếm đơn trong ngày | `DATE(created_at) = ngày` | Index Only Scan **cả index** `idx_orders_created_at` | 13.699 | **10.018.333** | **57.890** | **1.451** |
+| | khoảng | Index Only Scan `idx_orders_created_at`, chỉ đoạn của ngày đó | 13.699 | 0 | 41 | 1,8 |
+| Đơn trong ngày của user 1 (1.384 đơn) | `DATE(created_at) = ngày` | Index Scan `idx_orders_user_id_created_at`, chỉ theo `user_id` | 1 | 1.383 | 1.389 | 1,44 |
+| | khoảng | Index Scan `idx_orders_user_id_created_at`, theo `user_id` và khoảng ngày | 1 | 0 | 5 | 0,04 |
+
+- **Đếm đơn trong ngày:** cùng 13.699 đơn, nhưng `DATE()` phải đọc cả 10 triệu dòng; nhanh hơn khoảng 800 lần khi viết thành khoảng. 57.890 trang gồm 27.580 trang index và `Heap Fetches: 32049`. Đó là khoảng 32 nghìn đơn tạo qua API (`top-queries.ps1`) sau lần VACUUM cuối, chưa được đánh dấu all-visible. Autovacuum chỉ tự VACUUM khi số dòng mới lên tới khoảng 20% bảng (2 triệu dòng), nên với bảng lớn, visibility map có thể cũ khá lâu.
+- **Đơn trong ngày của một user:** với `DATE()`, index ghép chỉ dùng được cột `user_id`, đọc hết 1.384 đơn của user rồi bỏ 1.383. Với khoảng, cả hai cột của index đều được dùng: 5 trang.
+- **`DATE()` còn cho kết quả sai múi giờ.** `created_at` là `timestamptz`, và `DATE(created_at)` cắt ngày theo múi giờ của **phiên làm việc**. Phiên của app và psql ở đây là UTC (`docker-compose.yml` đặt `timezone=UTC`), còn ngày của shop là giờ Việt Nam (+07), bắt đầu lúc 17:00 UTC hôm trước. Đo được: trong phiên UTC, `DATE(created_at) = '2026-09-09'` ra 13.699 đơn, **cùng số lượng nhưng 3.996 đơn (29%) không thuộc ngày 09/09 giờ Việt Nam**. Tổng cộng trông có vẻ đúng, mà nội dung thì sai. Khoảng có ghi `+07` cho cùng một kết quả ở mọi phiên.
+- **Index trên `DATE(created_at)` không tạo được:** `functions in index expression must be marked IMMUTABLE`. Kết quả của `DATE()` trên `timestamptz` đổi theo múi giờ của phiên, mà index thì phải cho cùng kết quả mọi lúc. Ghi rõ múi giờ thì tạo được: `((created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date)`. Nhưng như vậy là thêm một index nữa (thêm chỗ, thêm việc mỗi lần ghi), và câu truy vấn phải viết đúng y biểu thức đó. Viết thành khoảng thì dùng luôn index đang có.
+
+Trong code Java (`createdAt` là `Instant`), đổi ngày của shop thành khoảng trước khi truy vấn:
+```java
+ZoneId shopZone = ZoneId.of("Asia/Ho_Chi_Minh");
+Instant from = day.atStartOfDay(shopZone).toInstant();              // 00:00 giờ Việt Nam
+Instant to = day.plusDays(1).atStartOfDay(shopZone).toInstant();    // 00:00 hôm sau
+// where o.createdAt >= :from and o.createdAt < :to
+```
+
 ### Chạy test
 
 ```bash
