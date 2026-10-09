@@ -34,6 +34,64 @@ App chạy ở `http://localhost:8080`. Flyway tự áp dụng mọi migration t
 
 Chạy class `TestShoplabApplication` (trong `src/test/java`): app tự dựng PostgreSQL bằng Testcontainers, không cần cấu hình datasource.
 
+### Dữ liệu lớn: 1 triệu user, 10 triệu đơn (`scripts/seed-big-data.ps1`)
+
+Cho thí nghiệm index: bảng phải đủ lớn thì `EXPLAIN ANALYZE` mới thấy khác biệt giữa có và không có index. Dữ liệu sinh thẳng trong PostgreSQL bằng `generate_series` (không gọi API, không chạy test); toàn bộ cách sinh nằm trong `scripts/seed-big-data.sql`, script PowerShell chỉ kiểm tra điều kiện rồi chạy file đó bằng psql trong container.
+
+**1. Cấp cho Docker ít nhất 4 GB RAM**
+
+- Docker Desktop trên Windows chạy bằng WSL 2 (mặc định): RAM do WSL quyết định (mặc định một nửa RAM máy). Muốn đặt cố định, tạo `%UserProfile%\.wslconfig`:
+  ```ini
+  [wsl2]
+  memory=4GB
+  ```
+  rồi chạy `wsl --shutdown` và mở lại Docker Desktop.
+- Docker Desktop dùng Hyper-V, hoặc macOS: *Settings → Resources → Memory*.
+- Kiểm tra: `docker info --format "{{.MemTotal}}"`. Cấp 4 GB thì lệnh báo khoảng 3,8 GB (kernel của máy ảo giữ một phần), nên script chỉ dừng khi dưới 3,5 GB (`-SkipMemoryCheck` để bỏ qua khi sinh ít).
+
+Vì sao 4 GB: bảng `orders` 1,3 GB cộng 4 index 0,9 GB; PostgreSQL trong compose giữ `shared_buffers=1GB`; lúc nạp, bước gắn tên người đặt vào 10 triệu đơn và xếp theo id dùng thêm vài trăm MB. Chạy thử trong container giới hạn 4 GB: bộ nhớ container (tính cả page cache) cao nhất 2,3 GB khi sinh, 2,8 GB khi chạy thêm một phép join 10 triệu × 10 triệu dòng.
+
+**2. Chạy**
+
+```powershell
+docker compose up -d     # docker-compose.yml vừa đổi (shared_buffers, shm_size): lệnh này tạo lại container, dữ liệu giữ nguyên
+.\mvnw spring-boot:run   # chạy một lần để Flyway tạo bảng, khởi động xong thì Ctrl+C
+powershell -ExecutionPolicy Bypass -File .\scripts\seed-big-data.ps1
+```
+
+- **Xoá sạch** `users`, `accounts`, `wallets`, `orders`, `order_items`, `idempotency_keys` rồi sinh lại (giữ `products`). DB đang có dữ liệu thì script hỏi lại, `-Force` để bỏ qua.
+- **App phải tắt** trong lúc sinh (script và file .sql đều kiểm tra): Hibernate giữ sẵn dải 50 id lấy trước từ sequence. App chạy trong lúc sinh thì dải đó trùng id vừa sinh, lần đăng ký tiếp theo trả 409 vì trùng khoá chính (đã thử). Sinh xong, chạy lại app thì app lấy dải mới, sau id lớn nhất.
+- **Một transaction:** lỗi giữa chừng thì rollback hết, DB như cũ, kể cả các index đã tạm bỏ (đã thử: ép lỗi ở bước sinh đơn, và để psql khác giữ khoá bảng `orders` cho tới khi hết `lock_timeout` 10 giây).
+- Mất khoảng 2 phút (máy 4 CPU: 2 phút 08 giây), cần khoảng 5 GB đĩa trống cho Docker. Thử nhanh: `-Users 10000 -Orders 100000 -SkipMemoryCheck` (2 giây).
+- Không có PowerShell (macOS, Linux):
+  ```bash
+  docker cp scripts/seed-big-data.sql shoplab-postgres:/tmp/
+  docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/seed-big-data.sql   # thêm -v users=10000 -v orders=100000 để thử nhỏ
+  ```
+
+**3. Dữ liệu sinh ra** (số đo của lần chạy trên)
+
+| Bảng | Nội dung |
+|---|---|
+| `users` 1.000.000 | Đăng ký rải đều trong 3 năm gần nhất, id tăng theo thời gian. Tên Việt theo tỉ lệ họ thật (Nguyễn 38%, Trần 11%, Lê 9,6%...), nam nữ mỗi bên một nửa. Email chữ thường `<tên>.<họ><id>@gmail.com` (75%), yahoo.com, outlook.com...; 70% có số điện thoại |
+| `accounts` 1.000.000 | Mỗi user một tài khoản, username = phần trước `@` của email, mật khẩu chung `shoplab-seed` (BCrypt); 97% ACTIVE, 2% LOCKED, 1% DISABLED |
+| `orders` 10.000.000 | Ngày đặt rải đều trong 2 năm gần nhất: mỗi ngày 13.697–13.700 đơn. id tăng theo ngày đặt như đơn thật. Người đặt là user đã đăng ký trước ngày đặt, user lâu năm đặt nhiều hơn: trung vị 9 đơn mỗi user, p99 46, nhiều nhất 1.427, 8,9% user chưa có đơn. Tên, email trên đơn chụp từ hồ sơ như app làm. Đơn không có dòng hàng (`order_items`) |
+
+Trạng thái theo tuổi đơn như một shop thật: chỉ đơn mới vài ngày còn PAID / SHIPPED; đơn cũ đã COMPLETED hoặc CANCELLED, trừ một ít đơn treo PENDING (chưa thanh toán, không ai huỷ).
+
+| Tuổi đơn | PENDING | PAID | SHIPPED | COMPLETED | CANCELLED |
+|---|---|---|---|---|---|
+| dưới 1 ngày | 40% | 40% | 15% | | 5% |
+| 1–7 ngày | 3% | 10% | 50% | 30% | 7% |
+| trên 7 ngày | 2% | | | 90% | 8% |
+| **Cả bảng (đo được)** | **2,06%** (206.028) | 0,14% (13.567) | 0,43% (43.057) | 89,39% | 7,99% |
+
+Kích thước: `orders` 1.284 MB, index `idx_orders_user_id_created_at` 387 MB, `orders_pkey` và `idx_orders_created_at` mỗi cái 214 MB, `idx_orders_status` 67 MB; `users` 112 MB, `accounts` 159 MB.
+
+Nên biết khi đọc `EXPLAIN` trên bộ dữ liệu này:
+- `orders` nằm trên đĩa đúng theo thứ tự `created_at` (tương quan 1,0 trong `pg_stats`), còn `user_id` gần như rải ngẫu nhiên (0,28): đọc đơn trong một khoảng ngày chạm ít trang của bảng, đọc đơn của một user thì gần như mỗi đơn một trang.
+- Script chạy `VACUUM (FREEZE, ANALYZE)` sau khi nạp: planner có thống kê mới; visibility map đầy đủ nên Index Only Scan không phải đọc bảng (`Heap Fetches: 0`); câu SELECT đầu tiên không phải tự ghi lại cả bảng (đánh dấu dòng đã commit) làm sai thời gian đo.
+
 ### Chạy test
 
 ```bash
@@ -125,6 +183,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `spring.datasource.hikari.connection-init-sql` | `SET lock_timeout = '5s'` | Không request nào chờ khoá DB quá 5 giây (→ 409 + `Retry-After`), thay vì giữ connection chờ vô hạn. Chạy mỗi khi Hikari mở connection mới, nên áp dụng cho mọi connection trong pool. Test: `OrderIdempotencyIntegrationTests.keyHeldByAnotherTransaction_returns409AfterLockTimeout` (bỏ dòng này thì request chờ mãi tới khi client hết giờ) |
 | `spring.jpa.properties.hibernate.jdbc.batch_size` (+ `order_inserts`, `order_updates`) | `50` | Gộp các câu INSERT / UPDATE cùng loại thành một lượt gửi, vd mọi dòng của một đơn hàng |
 | PostgreSQL `timezone` | `UTC` | Thời gian hiển thị trong psql cũng là UTC |
+| PostgreSQL `shared_buffers` (`docker-compose.yml`) | `1GB` | Mặc định 128MB. Bằng 1/4 RAM khi cấp cho Docker 4 GB, giữ được phần lớn index của bộ dữ liệu lớn trong bộ nhớ PostgreSQL |
+| Container `shm_size` (`docker-compose.yml`) | `1g` | `/dev/shm` mặc định của Docker chỉ 64MB, truy vấn song song đặt bảng băm chung ở đó. Đã thử trên 10 triệu dòng: `SET work_mem = '256MB'` rồi join thì 64MB báo `could not resize shared memory segment ... No space left on device`, 1g chạy được |
 | `logging.level.sql` | `DEBUG` | Log từng câu SQL, của cả Hibernate (`org.hibernate.SQL`) lẫn `JdbcClient` (`org.springframework.jdbc.core`) |
 | `logging.level.tx` | `DEBUG` | Log `BEGIN` / `COMMIT` / `ROLLBACK` của mỗi transaction mới (`common.config.TransactionLogging`) |
 

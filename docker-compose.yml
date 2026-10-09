@@ -2,7 +2,12 @@ services:
   postgres:
     image: postgres:17-alpine
     container_name: shoplab-postgres
-    command: ["postgres", "-c", "timezone=UTC", "-c", "log_timezone=UTC"]
+    # shared_buffers 1GB (mặc định 128MB): 1/4 RAM khi cấp cho Docker 4 GB, đủ giữ phần lớn index của bộ dữ liệu
+    # lớn (scripts/seed-big-data.ps1) trong bộ nhớ của PostgreSQL.
+    command: ["postgres", "-c", "timezone=UTC", "-c", "log_timezone=UTC", "-c", "shared_buffers=1GB"]
+    # /dev/shm mặc định của Docker chỉ 64MB. Truy vấn song song đặt bảng băm, kết quả sắp xếp chung ở đây: tăng work_mem
+    # rồi join 10 triệu dòng là lỗi "could not resize shared memory segment ... No space left on device".
+    shm_size: 1g
     environment:
       POSTGRES_DB: shoplab
       POSTGRES_USER: shoplab
