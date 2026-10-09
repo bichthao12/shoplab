@@ -90,7 +90,40 @@ Kích thước: `orders` 1.284 MB, index `idx_orders_user_id_created_at` 387 MB,
 
 Nên biết khi đọc `EXPLAIN` trên bộ dữ liệu này:
 - `orders` nằm trên đĩa đúng theo thứ tự `created_at` (tương quan 1,0 trong `pg_stats`), còn `user_id` gần như rải ngẫu nhiên (0,28): đọc đơn trong một khoảng ngày chạm ít trang của bảng, đọc đơn của một user thì gần như mỗi đơn một trang.
-- Script chạy `VACUUM (FREEZE, ANALYZE)` sau khi nạp: planner có thống kê mới; visibility map đầy đủ nên Index Only Scan không phải đọc bảng (`Heap Fetches: 0`); câu SELECT đầu tiên không phải tự ghi lại cả bảng (đánh dấu dòng đã commit) làm sai thời gian đo.
+
+**4. VACUUM ANALYZE sau khi nạp**
+
+Bước cuối của script, `VACUUM (FREEZE, ANALYZE) users, accounts, orders` chạy sau COMMIT, chuẩn bị đủ cho mọi thí nghiệm `EXPLAIN` sau đó:
+- **ANALYZE** ghi thống kê từng cột vào `pg_stats` (giá trị phổ biến kèm tần suất, histogram). Không có thì planner đoán `status = '...'` khớp 0,5% số dòng, dù là PENDING (2%) hay COMPLETED (89%).
+- **VACUUM** đánh dấu trang all-visible trong visibility map. Index Only Scan chỉ bỏ qua bảng ở những trang đã đánh dấu; trang chưa đánh dấu thì vẫn phải ghé bảng xem dòng còn hợp lệ không (`Heap Fetches`).
+- **FREEZE** đánh dấu sẵn mọi dòng vừa nạp: câu SELECT đầu tiên không phải tự ghi hint bit vào cả bảng, sau này cũng không có lượt VACUUM chống wraparound nào ghi lại cả bảng giữa lúc đang đo.
+
+Ngay sau bước này script in bảng kiểm tra (số cột có thống kê, % trang all-visible của từng bảng) và một `EXPLAIN` mong đợi `Index Only Scan ... Heap Fetches: 0`.
+
+Đo trước và sau trên cùng 10 triệu đơn: `scripts/vacuum-analyze-lab.sql` chép `orders` sang schema `vacuum_lab` (tắt autovacuum trên bản chép), đo hai câu `SELECT count(*) FROM orders WHERE status = ...` sau từng lệnh, rồi xoá schema. Không đụng bảng thật, chạy khoảng 30 giây:
+
+```powershell
+docker cp scripts/vacuum-analyze-lab.sql shoplab-postgres:/tmp/
+docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/vacuum-analyze-lab.sql
+```
+
+| Bước | Câu đếm | Cách đọc | Ước tính | Thực tế | Heap Fetches | Trang đọc | Thời gian |
+|---|---|---|---|---|---|---|---|
+| Chưa ANALYZE, chưa VACUUM | PENDING | Bitmap Heap Scan | 50.000 | 205.590 | | 116.780 | 609 ms |
+| | COMPLETED | Bitmap Heap Scan | 50.000 | 8.938.929 | | 171.743 | 2.270 ms |
+| Sau ANALYZE | PENDING | Index Only Scan | 198.331 | 205.590 | **205.590** | 116.780 | 188 ms |
+| | COMPLETED | Seq Scan | 8.959.223 | 8.938.929 | | 164.352 | 1.740 ms |
+| Sau VACUUM | PENDING | Index Only Scan | 198.333 | 205.590 | **0** | **182** | **21 ms** |
+| | COMPLETED | Index Only Scan | 8.959.333 | 8.938.929 | 0 | 7.649 | 952 ms |
+
+Thí nghiệm tắt truy vấn song song để số dòng ước tính / thực tế là của cả câu; mỗi câu chạy một lần trước khi đo để dữ liệu đã nằm trong bộ nhớ.
+- **ANALYZE sửa ước tính:** từ 50.000 (đoán 0,5%) thành 198 nghìn và 8,96 triệu, sát thực tế. Với COMPLETED, planner thôi đi qua index (Bitmap Heap Scan đọc index rồi vẫn đọc cả bảng, 2,3 giây) mà đọc thẳng cả bảng (1,7 giây).
+- **VACUUM mở đường cho Index Only Scan:** trước VACUUM, Index Only Scan vẫn ghé bảng cho cả 205.590 dòng, chạm 116.780 trang, tức 71% bảng vì đơn PENDING rải khắp bảng. Sau VACUUM không ghé lần nào, chỉ đọc 182 trang index: nhanh gấp 9 lần.
+- **Câu đọc đầu tiên sau khi nạp tự ghi:** trên bản chép vừa tạo, `SELECT count(*)` lần đầu sửa 162.304 / 164.352 trang (ghi hint bit) và mất 2,4 giây; lần hai không sửa trang nào, 1,4 giây. Lúc đó planner còn đoán bảng có 986 nghìn dòng (chưa có thống kê, đoán theo số trang).
+
+**Bẫy: transaction mở từ trước khi nạp xong.** VACUUM chỉ đánh dấu all-visible những dòng mà mọi transaction đang chạy đều thấy. Một psql hay công cụ DB đang `BEGIN` dở từ trước lúc script COMMIT thì không thấy dữ liệu mới, nên VACUUM không đánh dấu được trang nào. Đã thử: 0% trang all-visible, planner bỏ hẳn Index Only Scan (dùng Bitmap Heap Scan). Script phát hiện trường hợp này và in cảnh báo kèm phiên đang giữ transaction; đóng phiên đó rồi chạy `VACUUM users, accounts, orders;` là đủ (đã thử: lên 100%, `Heap Fetches: 0`).
+
+Autovacuum rồi cũng tự ANALYZE / VACUUM sau khi nạp nhiều dòng, nhưng không biết lúc nào: nếu nó chạy giữa lúc đang đo thì plan và thời gian đổi giữa chừng. Vì vậy script chạy tay ngay sau khi nạp.
 
 ### Chạy test
 

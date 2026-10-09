@@ -212,12 +212,48 @@ SELECT setval('orders_id_seq', max(id)) AS orders_id_seq FROM orders;
 COMMIT;
 
 \echo
-\echo '== 7/7 VACUUM (FREEZE, ANALYZE)'
--- ANALYZE: thống kê mới cho planner. VACUUM: dựng visibility map (Index Only Scan không phải đọc bảng) và đánh dấu
--- sẵn các dòng, để câu SELECT đầu tiên không phải tự ghi lại cả bảng làm sai lệch thời gian đo.
+\echo '== 7/7 VACUUM ANALYZE (kèm FREEZE)'
+-- Phải chạy sau COMMIT (VACUUM không chạy trong transaction, và chỉ đánh dấu được dòng mọi transaction đều thấy).
+--   ANALYZE  ghi thống kê từng cột (pg_stats: giá trị phổ biến, tần suất, histogram) → planner ước tính đúng số dòng.
+--            Chưa có thì status = 'COMPLETED' bị đoán 0,5% thay vì 89%, chọn sai cách đọc.
+--   VACUUM   đánh dấu trang all-visible trong visibility map → Index Only Scan lấy kết quả từ index, không ghé bảng.
+--            Chưa có thì Index Only Scan vẫn ghé bảng cho từng dòng (Heap Fetches = số dòng).
+--   FREEZE   đánh dấu sẵn mọi dòng: câu SELECT đầu tiên không phải tự ghi hint bit vào cả bảng, và sau này không có
+--            lượt VACUUM chống wraparound nào phải ghi lại cả bảng giữa lúc đang đo.
+-- Đo trước / sau từng lệnh: scripts/vacuum-analyze-lab.sql
 VACUUM (FREEZE, ANALYZE) users, accounts, orders;
 
 \timing off
+\echo
+\echo '== Kiểm tra VACUUM ANALYZE'
+SELECT c.relname AS "Bảng",
+       (SELECT count(*) FROM pg_stats s WHERE s.schemaname = 'public' AND s.tablename = c.relname)
+           AS "Cột có thống kê (ANALYZE)",
+       c.reltuples::bigint AS "Planner biết số dòng",
+       round(100.0 * c.relallvisible / greatest(c.relpages, 1), 1) AS "% trang all-visible (VACUUM)"
+FROM pg_class c
+WHERE c.oid IN ('users'::regclass, 'accounts'::regclass, 'orders'::regclass)
+ORDER BY c.relname;
+
+-- Index Only Scan đọc được thẳng từ index: mong đợi Heap Fetches: 0
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*) FROM orders WHERE status = 'PENDING';
+
+SELECT bool_and(c.relallvisible >= 0.99 * c.relpages) AS all_visible
+FROM pg_class c
+WHERE c.oid IN ('users'::regclass, 'accounts'::regclass, 'orders'::regclass) \gset
+\if :all_visible
+\else
+    -- Dòng vừa nạp chỉ được đánh dấu all-visible khi không còn transaction nào bắt đầu trước lúc COMMIT ở trên
+    -- (transaction đó không được thấy chúng). Thường là một psql / công cụ DB đang BEGIN dở.
+    \echo
+    \echo 'CẢNH BÁO: VACUUM chưa đánh dấu được hết các trang: planner bỏ Index Only Scan, hoặc dùng mà vẫn phải ghé bảng (Heap Fetches > 0).'
+    \echo 'Có transaction mở từ trước khi nạp xong (các phiên dưới đây). Đóng nó (COMMIT / ROLLBACK, hoặc tắt công cụ), rồi chạy:'
+    \echo '    VACUUM users, accounts, orders;'
+    SELECT pid, application_name, state, xact_start, left(query, 60) AS query
+    FROM pg_stat_activity
+    WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'
+      AND (backend_xmin IS NOT NULL OR backend_xid IS NOT NULL);
+\endif
 \echo
 \echo '== Kết quả'
 SELECT status AS "Trạng thái", count(*) AS "Số đơn",

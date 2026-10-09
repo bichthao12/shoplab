@@ -9,6 +9,8 @@
     - users / accounts: tên Việt theo tỉ lệ họ thật, email chữ thường không trùng, mật khẩu chung "shoplab-seed".
     - orders: ngày đặt rải đều trong 2 năm gần nhất, id tăng theo ngày đặt; khoảng 2% PENDING, 89% COMPLETED,
       8% CANCELLED, còn lại PAID / SHIPPED (đơn mới vài ngày).
+    - nạp xong chạy VACUUM ANALYZE (thống kê cho planner, visibility map cho Index Only Scan) rồi in bảng kiểm tra;
+      cảnh báo nếu một transaction mở từ trước khi nạp xong làm VACUUM không đánh dấu được trang nào.
 
   XOÁ SẠCH users, accounts, wallets, orders, order_items, idempotency_keys trước khi sinh (giữ products). Có dữ liệu
   thì hỏi lại trước khi xoá, trừ khi có -Force. Mọi bước nằm trong một transaction: lỗi giữa chừng thì DB như cũ.
