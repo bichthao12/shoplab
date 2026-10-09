@@ -29,6 +29,16 @@ App chạy ở `http://localhost:8080`. Flyway tự áp dụng mọi migration t
 | `docker compose down` | Dừng DB, **giữ** dữ liệu |
 | `docker compose down -v` | Dừng DB và **xoá** dữ liệu (reset) |
 | `docker exec -it shoplab-postgres psql -U shoplab -d shoplab` | Mở psql |
+| `powershell -ExecutionPolicy Bypass -File .\scripts\clear-data.ps1` | Xoá **dữ liệu** của mọi bảng, giữ các bảng và lịch sử migration (xem bên dưới) |
+
+**Xoá dữ liệu, giữ bảng: `scripts/clear-data.ps1`.** Script `TRUNCATE` mọi bảng trong schema `public` bằng một câu lệnh, trừ `flyway_schema_history`, nên app vẫn khởi động bình thường mà không chạy lại migration nào. Bảng thêm bằng migration sau này cũng tự được tính vào. Trước khi xoá, script in số dòng của từng bảng rồi hỏi lại; `-Force` để bỏ qua câu hỏi. Đã thử: xoá 12,1 triệu dòng (bộ dữ liệu lớn) mất 0,3 giây.
+- **Mặc định giữ nguyên sequence:** id mới tiếp tục từ số cũ, chạy lúc app đang chạy cũng được.
+- **`-ResetIds`:** đặt lại mọi sequence (`TRUNCATE ... RESTART IDENTITY`), id mới lại bắt đầu từ 1 (đã thử: người dùng đăng ký đầu tiên sau đó có id 1). Cần **tắt app** trước (script kiểm tra), vì app đang giữ sẵn một dải id lấy trước từ sequence.
+- Khác `docker compose down -v`: lệnh đó xoá cả volume, tức cả bảng, lịch sử migration và extension `pg_stat_statements`; lần chạy app sau Flyway phải tạo lại từ đầu.
+- Không có PowerShell:
+  ```bash
+  docker exec shoplab-postgres psql -U shoplab -d shoplab -c "TRUNCATE accounts, idempotency_keys, order_items, orders, products, users, wallets"
+  ```
 
 ### Chạy app không cần Docker Compose
 
