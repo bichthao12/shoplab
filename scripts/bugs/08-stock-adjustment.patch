@@ -1,0 +1,33 @@
+diff --git a/src/main/java/com/shoplab/product/internal/ProductRepository.java b/src/main/java/com/shoplab/product/internal/ProductRepository.java
+index bff5508..56f3b34 100644
+--- a/src/main/java/com/shoplab/product/internal/ProductRepository.java
++++ b/src/main/java/com/shoplab/product/internal/ProductRepository.java
+@@ -35,4 +35,12 @@ interface ProductRepository extends JpaRepository<Product, Long> {
+             WHERE id = :id AND stock + :delta >= 0
+             """, nativeQuery = true)
+     int adjustStock(@Param("id") long id, @Param("delta") int delta);
++
++    // BẢN LỖI: đọc rồi ghi con số tuyệt đối
++    @Query(value = "SELECT stock FROM products WHERE id = :id", nativeQuery = true)
++    Integer findStock(@Param("id") long id);
++
++    @Modifying
++    @Query(value = "UPDATE products SET stock = :stock, updated_at = now() WHERE id = :id", nativeQuery = true)
++    int setStock(@Param("id") long id, @Param("stock") int stock);
+ }
+diff --git a/src/main/java/com/shoplab/product/internal/ProductService.java b/src/main/java/com/shoplab/product/internal/ProductService.java
+index dd786f9..39d194a 100644
+--- a/src/main/java/com/shoplab/product/internal/ProductService.java
++++ b/src/main/java/com/shoplab/product/internal/ProductService.java
+@@ -92,7 +92,10 @@ public class ProductService {
+      */
+     @Transactional
+     public Product adjustStock(AdjustStockCommand command) {
+-        int updated = repo.adjustStock(command.productId(), command.delta());
++        // BẢN LỖI: đọc tồn kho → cộng ở Java → ghi con số tuyệt đối; lượt chạy cùng lúc ghi đè nhau
++        Integer current = repo.findStock(command.productId());
++        int updated = current == null || current + command.delta() < 0 ? 0
++                : repo.setStock(command.productId(), current + command.delta());
+         Product p = findOrThrow(command.productId());   // đọc sau câu UPDATE: thấy tồn kho mới
+         if (updated == 0) {
+             throw new InsufficientStockException(p.getSku(), -command.delta(), p.getStock());

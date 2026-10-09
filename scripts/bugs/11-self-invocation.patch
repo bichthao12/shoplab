@@ -1,0 +1,34 @@
+diff --git a/src/test/java/com/shoplab/wallet/internal/BatchTransferRunner.java b/src/test/java/com/shoplab/wallet/internal/BatchTransferRunner.java
+index 5dcd64c..5f49d93 100644
+--- a/src/test/java/com/shoplab/wallet/internal/BatchTransferRunner.java
++++ b/src/test/java/com/shoplab/wallet/internal/BatchTransferRunner.java
+@@ -21,6 +21,6 @@ class BatchTransferRunner {
+     }
+ 
+     List<Outcome> transferAll(List<TransferCommand> commands) {
+-        return BatchTransferService.runEach(commands, transfers::transfer);
++        return transfers.transferAll(commands);   // BẢN LỖI: vòng lặp quay về BatchTransferService, gọi this.transfer
+     }
+ }
+diff --git a/src/test/java/com/shoplab/wallet/internal/BatchTransferService.java b/src/test/java/com/shoplab/wallet/internal/BatchTransferService.java
+index 8f465d7..4711295 100644
+--- a/src/test/java/com/shoplab/wallet/internal/BatchTransferService.java
++++ b/src/test/java/com/shoplab/wallet/internal/BatchTransferService.java
+@@ -89,7 +89,7 @@ class BatchTransferService {
+      * người sau "dọn" self.transfer thành transfer là bẫy quay lại. Tách sang bean khác (BatchTransferRunner) rõ hơn.
+      */
+     public List<Outcome> transferAllThroughProxy(List<TransferCommand> commands) {
+-        return runEach(commands, self::transfer);
++        return runEach(commands, this::transfer);   // BẢN LỖI: "dọn" self thành this → gọi nội bộ
+     }
+ 
+     /** SỬA: tự mở transaction cho từng lượt bằng TransactionTemplate, không trông vào @Transactional của transfer. */
+@@ -98,7 +98,7 @@ class BatchTransferService {
+             log.warn("[self-invocation] BREAK: {}=true, bo TransactionTemplate, goi thang transfer(...)", BREAK_PROPERTY);
+             return runEach(commands, this::transfer);
+         }
+-        return runEach(commands, command -> tx.executeWithoutResult(status -> transfer(command)));
++        return runEach(commands, this::transfer);   // BẢN LỖI: bỏ TransactionTemplate → gọi nội bộ
+     }
+ 
+     boolean lastTransferHadTransaction() {

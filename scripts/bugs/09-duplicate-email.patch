@@ -1,0 +1,8 @@
+diff --git a/src/main/resources/db/migration/V13__bug_drop_uk_users_email.sql b/src/main/resources/db/migration/V13__bug_drop_uk_users_email.sql
+new file mode 100644
+index 0000000..9734b8d
+--- /dev/null
++++ b/src/main/resources/db/migration/V13__bug_drop_uk_users_email.sql
+@@ -0,0 +1,2 @@
++-- BẢN LỖI: bỏ unique constraint của email, chỉ còn bước kiểm tra trước (existsByEmail) trong code
++ALTER TABLE users DROP CONSTRAINT uk_users_email;

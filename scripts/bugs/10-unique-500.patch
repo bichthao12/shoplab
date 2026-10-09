@@ -1,0 +1,26 @@
+diff --git a/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java b/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
+index 890d1e1..fdfc3fa 100644
+--- a/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
++++ b/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
+@@ -106,7 +106,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+      * Vi phạm ràng buộc DB mà service sở hữu dữ liệu chưa dịch sang lỗi nghiệp vụ.
+      * Các trường hợp đã biết (trùng SKU, trùng email...) được dịch ngay trong service.
+      */
+-    @ExceptionHandler(DataIntegrityViolationException.class)
++    // BẢN LỖI: không có handler dự phòng cho lỗi ràng buộc DB → lỗi chưa được dịch thành 500
+     public ProblemDetail handleDataIntegrity(DataIntegrityViolationException ex) {
+         log.warn("Data integrity violation: {}", ex.getMostSpecificCause().getMessage());
+         return problem(HttpStatus.CONFLICT, "data-integrity", "Data Integrity Violation",
+diff --git a/src/main/java/com/shoplab/wallet/internal/WalletService.java b/src/main/java/com/shoplab/wallet/internal/WalletService.java
+index b1ba967..40181ea 100644
+--- a/src/main/java/com/shoplab/wallet/internal/WalletService.java
++++ b/src/main/java/com/shoplab/wallet/internal/WalletService.java
+@@ -41,7 +41,7 @@ public class WalletService {
+             return repo.saveAndFlush(new Wallet(userId));
+         } catch (DataIntegrityViolationException ex) {
+             // Hai request tạo ví cho cùng người dùng lọt qua bước kiểm tra trước: DB chặn bằng uk_wallets_user
+-            if (DbConstraints.isViolated(ex, UK_WALLETS_USER)) {
++            if (false && DbConstraints.isViolated(ex, UK_WALLETS_USER)) {   // BẢN LỖI: không dịch uk_wallets_user
+                 throw new DuplicateWalletException(userId);
+             }
+             throw ex;

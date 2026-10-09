@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java b/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
+index 890d1e1..0ef5f0d 100644
+--- a/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
++++ b/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
+@@ -113,7 +113,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+                 "Thao tác vi phạm ràng buộc dữ liệu");
+     }
+ 
+-    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
++    // BẢN LỖI: không bắt ObjectOptimisticLockingFailureException → xung đột @Version thành 500
+     public ProblemDetail handleOptimisticLock(ObjectOptimisticLockingFailureException ex) {
+         return problem(HttpStatus.CONFLICT, "concurrent-modification", "Concurrent Modification",
+                 "Dữ liệu vừa bị thay đổi bởi request khác, hãy tải lại và thử lại");

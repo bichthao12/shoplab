@@ -1,0 +1,28 @@
+diff --git a/src/main/java/com/shoplab/product/internal/DefaultProductInventory.java b/src/main/java/com/shoplab/product/internal/DefaultProductInventory.java
+index 29deba9..6627729 100644
+--- a/src/main/java/com/shoplab/product/internal/DefaultProductInventory.java
++++ b/src/main/java/com/shoplab/product/internal/DefaultProductInventory.java
+@@ -47,14 +47,20 @@ class DefaultProductInventory implements ProductInventory {
+             int quantity = line.getValue();
+             Assert.isTrue(quantity > 0, () -> "quantity phải > 0, nhận được " + quantity);
+ 
++            // BẢN LỖI: đọc tồn kho → kiểm tra → trừ ở Java → ghi con số đã tính (không khoá, không điều kiện)
++            Integer stock = jdbc.sql("SELECT stock FROM products WHERE id = :id AND active")
++                    .param("id", productId).query(Integer.class).optional().orElse(null);
++            if (stock == null || stock < quantity) {
++                throw whyNotReserved(productId, quantity);
++            }
+             List<ReservedItem> updated = jdbc.sql("""
+                             UPDATE products
+-                            SET stock = stock - :quantity, updated_at = now()
+-                            WHERE id = :id AND active AND stock >= :quantity
++                            SET stock = :stock, updated_at = now()
++                            WHERE id = :id
+                             RETURNING id, sku, name, price
+                             """)
+                     .param("id", productId)
+-                    .param("quantity", quantity)
++                    .param("stock", stock - quantity)
+                     .query((rs, i) -> new ReservedItem(
+                             rs.getLong("id"), rs.getString("sku"), rs.getString("name"), rs.getBigDecimal("price"),
+                             quantity))

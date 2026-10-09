@@ -1,0 +1,13 @@
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index 40d2173..97e1a8c 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -3,7 +3,7 @@ spring.datasource.username=shoplab
+ spring.datasource.password=shoplab
+ # Mọi connection chờ khoá DB tối đa 5 giây (key idempotency đang được giữ, sản phẩm đang bị đơn khác khoá...).
+ # Quá hạn → lỗi 55P03 → 409 + Retry-After, thay vì giữ connection chờ vô hạn.
+-spring.datasource.hikari.connection-init-sql=SET lock_timeout = '5s'
++# BẢN LỖI: không giới hạn thời gian chờ khoá (đã bỏ connection-init-sql=SET lock_timeout = '5s')
+ 
+ spring.jpa.properties.hibernate.jdbc.time_zone=UTC
+ # Gộp nhiều câu INSERT / UPDATE cùng loại thành một lượt gửi (cần id lấy từ sequence, IDENTITY không gộp được)

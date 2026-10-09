@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java b/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
+index 890d1e1..21dcd7d 100644
+--- a/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
++++ b/src/main/java/com/shoplab/common/web/GlobalExceptionHandler.java
+@@ -74,7 +74,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+     public ResponseEntity<ProblemDetail> handleLockTimeout(PessimisticLockingFailureException ex) {
+         if (hasSqlState(ex, PG_DEADLOCK_DETECTED)) {
+             // Ghi kèm mã 40P01: log của Hibernate có mã này, nhưng truy vấn qua JdbcClient thì không
+-            log.warn("Deadlock detected (SQLState {}): {}", PG_DEADLOCK_DETECTED, ex.getMostSpecificCause().getMessage());
++            log.warn("Deadlock detected: {}", ex.getMostSpecificCause().getMessage());   // BẢN LỖI: log không có mã 40P01
+             ProblemDetail pd = problem(HttpStatus.CONFLICT, "deadlock", "Deadlock Detected",
+                     "Thao tác bị huỷ vì tranh chấp khoá với một thao tác khác (deadlock), hãy thử lại");
+             return ResponseEntity.status(HttpStatus.CONFLICT)

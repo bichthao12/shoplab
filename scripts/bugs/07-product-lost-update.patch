@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/shoplab/product/internal/ProductService.java b/src/main/java/com/shoplab/product/internal/ProductService.java
+index dd786f9..bc187b6 100644
+--- a/src/main/java/com/shoplab/product/internal/ProductService.java
++++ b/src/main/java/com/shoplab/product/internal/ProductService.java
+@@ -63,7 +63,7 @@ public class ProductService {
+     @Transactional
+     public Product update(Long id, UpdateProductCommand changes) {
+         Product p = findOrThrow(id);
+-        StaleVersionException.check("Sản phẩm", p, changes.expectedVersion());
++        // BẢN LỖI: không so version client gửi với version hiện tại → client đọc từ trước ghi đè được
+ 
+         if (changes.sku() != null) {
+             // Kiểm tra trùng TRƯỚC khi sửa entity: sửa trước thì Hibernate sẽ flush SKU mới ngay khi chạy query này

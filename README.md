@@ -48,10 +48,53 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests`, `WalletModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `SelfInvocationTrapTests`, `WalletApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `PasswordHashingOutsideTransactionTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `SelfInvocationTrapTests`, `WalletApiIntegrationTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
-| Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
+
+**Không lúc xanh lúc đỏ:** toàn bộ 126 test chạy 5 lần liên tiếp đều xanh (mỗi lần ~46 giây); riêng nhóm test đồng thời (deadlock, bán chớp nhoáng, 20 request cùng lúc, bẫy gọi nội bộ...) chạy thêm 10 lần, cũng đều xanh. Test đồng thời không trông vào may rủi: chỗ cần thứ tự xấu nhất thì test ép bằng chốt chờ (`CountDownLatch`), proxy chờ giữa hai lần khoá, hoặc một connection khác giữ khoá rồi chờ request tới đúng câu lệnh (`awaitSessionWaitingForLock`).
+
+Mỗi Spring context của test giữ một pool 10 connection. Testcontainers dựng PostgreSQL riêng cho mỗi context nên không sao; nếu cho cả bộ test dùng chung **một** PostgreSQL thì cần `max_connections` lớn hơn 100 (mặc định), vì bộ test dựng 10 context có DB.
+
+#### Đỏ với bản lỗi, xanh với bản sửa: `scripts/red-green.ps1`
+
+Mỗi kịch bản có test bảo vệ, và một bản lỗi viết dưới dạng patch trong `scripts/bugs/` (bản lỗi không nằm trong code chính hay code test). Script copy `pom.xml`, `mvnw`, `.mvn`, `src` ra thư mục tạm (không đụng thư mục làm việc), chạy test bảo vệ của mọi kịch bản trên code hiện tại (mong đợi **xanh**), rồi lần lượt áp từng patch, chạy test bảo vệ của kịch bản đó (mong đợi **đỏ**) và gỡ patch.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 12 kịch bản, ~5–10 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadlock,self-invocation # chỉ vài kịch bản
+```
+
+| Kịch bản | Bản lỗi (`scripts/bugs/`) | Test bảo vệ | Bản lỗi làm test đỏ ra sao (đo thật) |
+|---|---|---|---|
+| `oversell` | `01`: đọc kho → kiểm tra → trừ ở Java → ghi con số | `FlashSaleIntegrationTests`, `NaiveStockDeductionTests#real_conditionalUpdate_sellsExactlyTheStock` | 1.000 lượt mua kho 1 → **10 đơn**; 8 người mua kho 5 → **8** người mua được |
+| `deadlock` | `02`: khoá hai ví theo thứ tự tham số | `TransferDeadlockTests#oppositeTransfers_lockingInIdOrder_bothSucceed` | `[TRANSFERRED, DEADLOCK]` thay vì cả hai chuyển xong |
+| `deadlock-log` | `03`: log deadlock không có mã | `GlobalExceptionHandlerTests#deadlock_isReportedSeparatelyFromLockTimeout` | log không chứa `SQLState 40P01` |
+| `lock-timeout` | `04`: bỏ `SET lock_timeout` | `OrderIdempotencyIntegrationTests#keyHeldByAnotherTransaction_returns409AfterLockTimeout` | request chờ khoá mãi, client hết giờ |
+| `profile-lost-update` | `05`: không so `version` client gửi (hồ sơ) | `UserApiIntegrationTests#updateProfile_staleVersion_returns409` | `200` thay vì `409`, ghi đè thay đổi của người khác |
+| `version-409` | `06`: không bắt `ObjectOptimisticLockingFailureException` | `UserApiIntegrationTests#profileChangedBetweenCheckAndWrite_versionColumnReturns409` | `500` thay vì `409` |
+| `product-lost-update` | `07`: không so `version` client gửi (sản phẩm) | `ProductApiIntegrationTests#patch_staleVersion_returns409` | `200` thay vì `409` |
+| `stock-adjustment` | `08`: đọc kho → cộng ở Java → ghi con số tuyệt đối | `ProductApiIntegrationTests#restocksAndOrdersAtOnce_loseNoUpdate` | kho **10** thay vì 20: mất lượt nhập / đặt hàng |
+| `duplicate-email` | `09`: migration bỏ `uk_users_email`, chỉ còn kiểm tra trước | `UserApiIntegrationTests#duplicateEmailCaughtByDatabase_returnsDuplicateEmail`, `#sameEmailAtOnce_registersExactlyOne` | 20 đăng ký cùng email → **20** người dùng |
+| `unique-500` | `10`: không dịch `uk_wallets_user`, không có handler dự phòng | `GlobalExceptionHandlerTests#untranslatedDataIntegrityViolation_returnsGeneric409`, `WalletApiIntegrationTests#duplicateWalletCaughtByDatabase_returnsDuplicateWallet` | `500` thay vì `409` |
+| `self-invocation` | `11`: cả ba cách sửa quay về `this.transfer(...)` | 3 test sửa của `SelfInvocationTrapTests` | A = **60.00** thay vì 90.00 (mất 30) |
+| `hash-in-transaction` | `12`: `register` là một transaction, băm mật khẩu bên trong | `PasswordHashingOutsideTransactionTests#register_hashesPasswordOutsideTransaction` | lúc băm `transactionActive=true, activeConnections=1` |
+
+```
+== Ma trận
+   Kịch bản             Bản sửa      Bản lỗi
+   oversell             XANH         ĐỎ
+   deadlock             XANH         ĐỎ
+   ...
+   hash-in-transaction  XANH         ĐỎ
+
+ĐÚNG (12/12): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
+```
+
+- **Kịch bản race** (`oversell`, `stock-adjustment`): không ép thứ tự thì lỗi không phải lần nào cũng lộ (bản ngây thơ bán vượt: 5 lần chạy cho 6, 10, 9, **1**, 10 đơn). Bản lỗi được chạy tối đa `-Attempts` lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt; script in ra lần thứ mấy thì đỏ.
+- **Patch gắn với code hiện tại.** Code đổi mà patch không áp được nữa thì script báo `PATCH KHÔNG ÁP ĐƯỢC` cho kịch bản đó; sửa lại bản lỗi rồi tạo lại patch bằng `git diff`.
+- Cần git và Docker (như khi chạy test). Mã thoát `0` nếu mọi kịch bản xanh với bản sửa và đỏ với bản lỗi; `1` nếu không; `2` nếu không chạy được. `-KeepTemp` giữ lại thư mục tạm để xem.
 
 ### Test thủ công
 
@@ -61,6 +104,7 @@ Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác
 - **Deadlock chuyển tiền:** `scripts\transfer-deadlock.ps1` (xem mục *Deadlock*).
 - **Lost update khi sửa hồ sơ:** `scripts\profile-lost-update.ps1` (xem mục *Sửa hồ sơ: bắt buộc gửi `version`*).
 - **Bẫy gọi nội bộ `@Transactional`:** `scripts\self-invocation-trap.ps1` (chạy test, cần Docker; xem mục *Bẫy @Transactional: gọi nội bộ*).
+- **Đỏ với bản lỗi, xanh với bản sửa cho mọi kịch bản:** `scripts\red-green.ps1` (chạy test, cần Docker; xem mục *Đỏ với bản lỗi, xanh với bản sửa*).
 - **Lost update khi sửa sản phẩm:** `scripts\product-lost-update.ps1` (xem mục *Sửa sản phẩm: bắt buộc gửi `version`*).
 - **Nhập / trừ tồn kho cùng lúc với đơn hàng, gửi lại cùng key:** `scripts\stock-adjustment.ps1` (xem mục *Điều chỉnh tồn kho*).
 - **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).

@@ -1,0 +1,20 @@
+diff --git a/src/main/java/com/shoplab/wallet/internal/WalletService.java b/src/main/java/com/shoplab/wallet/internal/WalletService.java
+index b1ba967..9a02e03 100644
+--- a/src/main/java/com/shoplab/wallet/internal/WalletService.java
++++ b/src/main/java/com/shoplab/wallet/internal/WalletService.java
+@@ -78,12 +78,9 @@ public class WalletService {
+         if (fromWalletId == toWalletId) {
+             throw new InvalidTransferException("Không chuyển tiền cho chính ví id = " + fromWalletId);
+         }
+-        long firstId = Math.min(fromWalletId, toWalletId);
+-        Wallet first = lock(firstId);                                 // id nhỏ trước
+-        Wallet second = lock(Math.max(fromWalletId, toWalletId));     // id lớn sau
+-
+-        Wallet from = firstId == fromWalletId ? first : second;
+-        Wallet to = firstId == fromWalletId ? second : first;
++        // BẢN LỖI: khoá theo thứ tự tham số (ví nguồn trước), A→B và B→A khoá ngược chiều nhau → deadlock
++        Wallet from = lock(fromWalletId);
++        Wallet to = lock(toWalletId);
+         from.withdraw(command.amount());
+         to.deposit(command.amount());
+         repo.flush();   // version, updatedAt trả về là giá trị mới

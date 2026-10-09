@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/shoplab/user/internal/UserService.java b/src/main/java/com/shoplab/user/internal/UserService.java
+index cb5bfbf..aeac265 100644
+--- a/src/main/java/com/shoplab/user/internal/UserService.java
++++ b/src/main/java/com/shoplab/user/internal/UserService.java
+@@ -55,7 +55,7 @@ public class UserService {
+      * SUPPORTS đè @Transactional(readOnly = true) của class: bản thân method không mở transaction. Bên gọi đã có
+      * transaction (vd test) thì bước 1 và 3 chạy chung transaction đó.
+      */
+-    @Transactional(propagation = Propagation.SUPPORTS)
++    @Transactional   // BẢN LỖI: cả register là một transaction → băm mật khẩu (~80ms) trong lúc giữ connection
+     public User register(RegisterUserCommand command) {
+         checkPasswordLength(command.password());
+         String email = User.normalizeEmail(command.email());

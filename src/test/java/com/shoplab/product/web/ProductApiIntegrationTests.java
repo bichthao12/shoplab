@@ -239,6 +239,24 @@ class ProductApiIntegrationTests extends IntegrationTestBase {
     }
 
     @Test
+    @DisplayName("PATCH với version cũ (đã có người sửa sau lần đọc) → 409 concurrent-modification kèm currentVersion, không ghi đè")
+    void patch_staleVersion_returns409() {
+        long productId = createProduct("VER-005", 100_000, 10);
+        assertThat(send("PATCH", "/api/products/" + productId, """
+                {"price":90000,"version":0}
+                """, null).statusCode()).isEqualTo(200);
+
+        HttpResponse<String> stale = send("PATCH", "/api/products/" + productId, """
+                {"name":"Tên sửa trên form cũ","version":0}
+                """, null);
+
+        assertProblem(stale, 409, "concurrent-modification");
+        assertThat(json(stale)).containsEntry("expectedVersion", 0).containsEntry("currentVersion", 1);
+        assertThat(json(send("GET", "/api/products/" + productId, null, null)))
+                .containsEntry("name", "Sản phẩm VER-005").containsEntry("version", 1);
+    }
+
+    @Test
     @DisplayName("PATCH có stock → 400, chỉ đường sang stock-adjustments; tồn kho giữ nguyên")
     void patchStock_returns400PointingToStockAdjustments() {
         long productId = createProduct("VER-002", 100_000, 10);
