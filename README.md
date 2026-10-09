@@ -131,8 +131,12 @@ Autovacuum rồi cũng tự ANALYZE / VACUUM sau khi nạp nhiều dòng, nhưng
 
 **Bật:** `docker-compose.yml` thêm `shared_preload_libraries=pg_stat_statements` (thư viện chỉ nạp được lúc PostgreSQL khởi động) và `track_io_timing=on` (thêm thời gian chờ đọc đĩa của từng câu). Script tự chạy `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` trong DB `shoplab`. Extension không nằm trong migration: nó là công cụ theo dõi, không phải schema của app, và cần quyền superuser.
 
+Lỗi `pg_stat_statements must be loaded via "shared_preload_libraries"`: container vẫn chạy theo `docker-compose.yml` cũ (vd chạy `docker compose up -d` trước khi `git pull`, hoặc bật lại container từ Docker Desktop). Kiểm tra bằng `docker inspect shoplab-postgres --format "{{json .Config.Cmd}}"`: không có `shared_preload_libraries=pg_stat_statements` thì chạy `git pull` rồi `docker compose up -d --force-recreate`. Extension đã tạo trước đó không cần tạo lại.
+
 ```powershell
-docker compose up -d     # tạo lại container theo cấu hình mới, dữ liệu giữ nguyên
+git pull origin master
+docker compose up -d --force-recreate     # tạo lại container theo cấu hình mới, dữ liệu giữ nguyên
+docker exec shoplab-postgres psql -U shoplab -d shoplab -c "SHOW shared_preload_libraries"   # phải ra pg_stat_statements
 .\mvnw spring-boot:run "-Dspring-boot.run.arguments=--logging.level.sql=INFO --logging.level.tx=INFO"   # tắt log SQL cho app không chậm vì ghi log
 powershell -ExecutionPolicy Bypass -File .\scripts\top-queries.ps1     # mặc định -Minutes 3 -Parallel 16 -Top 3
 ```

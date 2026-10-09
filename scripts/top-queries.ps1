@@ -5,8 +5,8 @@
 
 .DESCRIPTION
   Gọi API thật (không chạy test). Cần:
-    1. PostgreSQL của docker compose đã nạp pg_stat_statements: docker compose up -d với docker-compose.yml hiện tại
-       (đổi cấu hình thì lệnh này tạo lại container, dữ liệu giữ nguyên).
+    1. PostgreSQL của docker compose đã nạp pg_stat_statements: docker compose up -d --force-recreate với
+       docker-compose.yml hiện tại (tạo lại container theo cấu hình mới, dữ liệu giữ nguyên).
     2. Nên có dữ liệu lớn (scripts/seed-big-data.ps1): ít dữ liệu thì câu nào cũng nhanh, khó thấy câu nào đáng sửa.
     3. App đang chạy, nên tắt log SQL để app không chậm vì ghi log:
          .\mvnw spring-boot:run "-Dspring-boot.run.arguments=--logging.level.sql=INFO --logging.level.tx=INFO"
@@ -114,8 +114,10 @@ if ($preload.ExitCode -ne 0) {
     Stop-Script "Không chạy được psql trong container $container. Chạy: docker compose up -d`n  $($preload.Lines -join "`n  ")"
 }
 if (($preload.Lines -join '') -notmatch 'pg_stat_statements') {
-    Stop-Script ("PostgreSQL chưa nạp pg_stat_statements (shared_preload_libraries = '$($preload.Lines -join '')').`n" +
-                 "  Chạy: docker compose up -d   (tạo lại container theo docker-compose.yml mới, dữ liệu giữ nguyên)")
+    Stop-Script ("PostgreSQL chưa nạp pg_stat_statements (shared_preload_libraries = '$($preload.Lines -join '')'):`n" +
+                 "  container đang chạy theo docker-compose.yml cũ. Lấy bản mới rồi tạo lại container (dữ liệu giữ nguyên):`n" +
+                 "    git pull origin master`n" +
+                 "    docker compose up -d --force-recreate")
 }
 [void](Invoke-Sql 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements')
 Write-Host 'pg_stat_statements: đã nạp, extension đã tạo' -ForegroundColor Green
