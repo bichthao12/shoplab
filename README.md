@@ -310,7 +310,7 @@ Test đặt theo package của từng module, gồm 5 loại:
 | Unit test | `ProductTest`, `OrderTest`, `UserTest`, `CreateOrderCommandTest`, `RequestFingerprintTest`, `ConcurrentlyTest` | Không Spring, không DB |
 | Test slice | `GlobalExceptionHandlerTests` (`@WebMvcTest`) | Chỉ một tầng |
 | Test riêng từng module | `ProductModuleTests`, `OrderModuleTests`, `UserModuleTests`, `WalletModuleTests` (`@ApplicationModuleTest`) | Chỉ một module (kèm `common`); API của module khác được mock |
-| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `PasswordHashingOutsideTransactionTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `SelfInvocationTrapTests`, `WalletApiIntegrationTests`, `IsolationLevelTests`, `OrderListWithItemsTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
+| Integration test | `OrderIdempotencyIntegrationTests`, `OrderApiIntegrationTests`, `ProductApiIntegrationTests`, `UserApiIntegrationTests`, `PasswordHashingOutsideTransactionTests`, `SqlLoggingTests`, `NaiveStockDeductionTests`, `FlashSaleIntegrationTests`, `NaiveFlashSaleTests`, `TransferDeadlockTests`, `SelfInvocationTrapTests`, `WalletApiIntegrationTests`, `IsolationLevelTests`, `OrderListWithItemsTests`, `NPlusOneFixesTests` | Cả app trên cổng ngẫu nhiên + PostgreSQL thật (Testcontainers), gồm cả kịch bản đồng thời và rollback |
 | Test cấu trúc | `ModularityTests` (Spring Modulith + ArchUnit), `DatabaseModularityTests` | Đọc bytecode, kiểm tra ranh giới module và phân tầng trong module; đọc schema, kiểm tra không có khoá ngoại chéo module |
 
 Kịch bản đồng thời dùng `Concurrently.run(n, i -> ...)`: chạy N tác vụ, mỗi tác vụ trên một virtual thread, và một `CountDownLatch(N)` làm vạch xuất phát (mỗi luồng `countDown()` rồi `await()`), nên không tác vụ nào chạy trước khi đủ N luồng sẵn sàng. Kết quả trả theo thứ tự `i`; quá 60 giây thì báo `TimeoutException` và ngắt các tác vụ còn chạy.
@@ -342,7 +342,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `unique-500` | `10`: không dịch `uk_wallets_user`, không có handler dự phòng | `GlobalExceptionHandlerTests#untranslatedDataIntegrityViolation_returnsGeneric409`, `WalletApiIntegrationTests#duplicateWalletCaughtByDatabase_returnsDuplicateWallet` | `500` thay vì `409` |
 | `self-invocation` | `11`: cả ba cách sửa quay về `this.transfer(...)` | 3 test sửa của `SelfInvocationTrapTests` | A = **60.00** thay vì 90.00 (mất 30) |
 | `hash-in-transaction` | `12`: `register` là một transaction, băm mật khẩu bên trong | `PasswordHashingOutsideTransactionTests#register_hashesPasswordOutsideTransaction` | lúc băm `transactionActive=true, activeConnections=1` |
-| `n-plus-one` | `13`: mỗi đơn tự nạp dòng hàng (`order.getItems().size()` trong vòng lặp) | `OrderListWithItemsTests` | **102 câu SQL** cho trang 100 đơn (22 câu cho trang 20 đơn) thay vì 3 |
+| `n-plus-one` | `13`: mỗi đơn tự nạp dòng hàng (`order.getItems().size()` trong vòng lặp) | `OrderListWithItemsTests` | **102 câu SQL** cho trang 100 đơn (22 câu cho trang 20 đơn) thay vì 2 |
 
 ```
 == Ma trận
@@ -585,7 +585,7 @@ Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nế
 | `POST` | `/api/orders` (bắt buộc header `Idempotency-Key`) | **201** + `Location` | xem bảng bên dưới |
 | `GET` | `/api/orders/{id}` | **200** | 404 |
 | `GET` | `/api/orders?userId=1&page=0&size=20` | **200**: đơn của người dùng, mới nhất trước, có phân trang, không kèm dòng hàng | 400 thiếu `userId` · 400 `sort` theo trường không tồn tại |
-| `GET` | `/api/orders/with-items?userId=1&page=0&size=100` | **200**: như trên nhưng mỗi đơn kèm dòng hàng (cùng dạng `GET /api/orders/{id}`); trang bao nhiêu đơn cũng chỉ 3 câu SQL (xem mục *N+1*) | như trên |
+| `GET` | `/api/orders/with-items?userId=1&page=0&size=100` | **200**: như trên nhưng mỗi đơn kèm dòng hàng (cùng dạng `GET /api/orders/{id}`); trang bao nhiêu đơn cũng chỉ 2 câu SQL (xem mục *N+1*) | như trên |
 
 Ví dụ:
 
@@ -619,22 +619,47 @@ Idempotency-Key: 3f1c2a9e-7b4d-4c1e-9a55-0d2f6b8e1a77
 
 #### N+1: danh sách đơn kèm dòng hàng (`GET /api/orders/with-items`)
 
-Cách viết tự nhiên nhất là lấy trang đơn, rồi để từng đơn tự nạp dòng hàng của nó (vd `order.getItems().size()`, hay để Jackson đọc `items` khi còn session). Mỗi đơn lúc đó chạy thêm một câu `SELECT ... FROM order_items WHERE order_id = ?`, nên trang 100 đơn tốn **1 + 100 câu** (cộng 1 câu đếm cho phân trang): đó là N+1. `OrderService.listByUserWithItems` làm theo hai bước, số câu không phụ thuộc số đơn trong trang:
+Cách viết tự nhiên nhất là lấy trang đơn, rồi để từng đơn tự nạp dòng hàng của nó (vd `order.getItems().size()`, hay để Jackson đọc `items` khi còn session). Mỗi đơn lúc đó chạy thêm một câu `SELECT ... FROM order_items WHERE order_id = ?`, nên trang 100 đơn tốn **1 + 100 câu** (cộng 1 câu đếm cho phân trang): đó là N+1.
 
-1. `findByUserId(userId, pageable)`: một câu lấy đúng một trang đơn (`LIMIT`), cộng một câu `count(*)` khi trang đầy.
-2. `fetchItems(ids)`: một câu `select distinct o ... left join fetch o.items where o.id in :ids` nạp dòng hàng cho cả trang. Các đơn đó đã nằm trong persistence context, nên Hibernate điền `items` vào đúng các object đó.
+App dùng `@EntityGraph` trên chính câu phân trang (`OrderRepository.findWithItemsByUserId`):
+```java
+@EntityGraph(attributePaths = "items")
+Page<Order> findWithItemsByUserId(Long userId, Pageable pageable);
+```
+Hibernate 7 sinh **một** câu: phân trang trên riêng bảng `orders` trong một subquery, rồi mới join `order_items`. Giới hạn vì vậy áp lên số đơn, không phải số dòng sau khi join:
+```sql
+select ... from (select ... from orders o1_0 where o1_0.user_id = ?
+                 order by o1_0.created_at desc, o1_0.id desc offset ? rows fetch first ? rows only) o1_0
+left join order_items i1_0 on o1_0.id = i1_0.order_id
+order by o1_0.created_at desc, o1_0.id desc, i1_0.id
+```
+Hibernate 5, 6 không làm vậy: gặp phân trang trên câu có fetch collection, chúng nạp **mọi** đơn của người dùng rồi mới cắt trang trong bộ nhớ, kèm cảnh báo `HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory`. Khi đó phải dùng nạp theo lô, hoặc tách làm hai bước (bảng dưới).
 
-Không gộp hai bước thành một câu `join fetch` có phân trang: `LIMIT` áp lên số dòng **sau** khi join (đơn × dòng hàng), không phải số đơn, nên Hibernate phải nạp **mọi** đơn của người dùng rồi cắt trang trong bộ nhớ (cảnh báo `HHH90003004`).
+**So sánh các cách sửa** (`order.internal.NPlusOneFixesTests`): trang 2 (20 đơn) của người dùng có 100 đơn, mỗi đơn 2 dòng hàng. Đếm bằng thống kê Hibernate: số câu SQL, số đơn và dòng hàng đã nạp vào bộ nhớ. Một trang đúng chỉ cần 20 đơn, 40 dòng hàng.
+
+| Cách | Câu SQL | Đơn / dòng hàng nạp | Ghi chú |
+|---|---|---|---|
+| N+1: lấy trang, rồi `order.getItems().size()` từng đơn | **22** | 20 / 40 | trang, đếm, 20 lần `... from order_items where order_id = ?` |
+| **`@EntityGraph(attributePaths = "items")` trên câu phân trang** (app dùng) | **2** | 20 / 40 | trang đơn kèm dòng hàng, đếm |
+| `JOIN FETCH` trong câu phân trang (`@Query` + `countQuery`) | 2 | 20 / 40 | như `@EntityGraph`; phải viết câu đếm riêng vì Spring Data không tự suy ra câu đếm từ câu có fetch join |
+| Nạp theo lô (batch size 100): code y như N+1 | 3 | 20 / 40 | lần đầu chạm `items` của một đơn, Hibernate nạp `items` của mọi đơn trong session bằng một câu `... where order_id = any (?)` |
+| Hai bước: trang đơn, rồi `JOIN FETCH` dòng hàng `where o.id in :ids` | 3 | 20 / 40 | cách sửa quen thuộc trên Hibernate 5, 6 |
+
+Không cách sửa nào có cảnh báo `HHH90003004` (test kiểm tra điều đó).
+
+- **`@EntityGraph` và `JOIN FETCH`** cho ít câu nhất. `@EntityGraph` không phải viết JPQL, câu đếm Spring Data tự sinh. Hợp với một màn hình cụ thể cần dữ liệu đi kèm.
+- **Nạp theo lô** không đổi code gọi, sửa N+1 cho **mọi** chỗ chạm vào quan hệ đó. Bật bằng `@BatchSize(size = 100)` trên `Order.items`, hoặc `spring.jpa.properties.hibernate.default_batch_fetch_size=100` cho mọi quan hệ. Nạp dòng hàng cho N đơn tốn ⌈N/100⌉ câu (trang 20 đơn: 1 câu). Phần chạm vào `items` vẫn phải nằm trong transaction (app tắt `open-in-view`). App chưa bật nạp theo lô: nếu bật toàn cục, bản N+1 trong patch 13 cũng sẽ chỉ còn 3 câu, và test bảo vệ không còn bắt được N+1.
+- **Hai bước** tốn thêm một câu, nhưng không phụ thuộc vào việc Hibernate có đẩy phân trang vào subquery hay không.
 
 **Đếm số câu SQL:**
 - Thống kê Hibernate (`spring.jpa.properties.hibernate.generate_statistics=true`): hết mỗi request, log của app có khối `Logging session metrics`, ngay sau dòng `COMMIT OrderService.listByUserWithItems`:
   ```
   org.hibernate.session.metrics : HHH000401: Logging session metrics:
-      ... ns preparing 3 JDBC statements
-      ... ns executing 3 JDBC statements
+      ... ns preparing 2 JDBC statements
+      ... ns executing 2 JDBC statements
   ```
   Hibernate 7 log khối này ở mức DEBUG. Logger của nó (`org.hibernate.session.metrics`) được thêm vào nhóm `sql`, nên tắt log SQL (`--logging.level.sql=INFO`) là tắt luôn khối này.
-- Test `OrderListWithItemsTests`: tạo 100 đơn, mỗi đơn 2 dòng hàng; gọi API; đọc `Statistics.getPrepareStatementCount()` của Hibernate; khẳng định không quá 3 câu.
+- Test `OrderListWithItemsTests`: tạo 100 đơn, mỗi đơn 2 dòng hàng; gọi API; khẳng định không quá 2 câu (thống kê Hibernate), và trang 20 đơn chỉ nạp đúng 20 đơn vào bộ nhớ (nạp cả 100 rồi cắt trong bộ nhớ thì test đỏ).
 - Script gọi API thật trên app đang chạy, đếm bằng `pg_stat_statements` ở phía DB (cần PostgreSQL đã nạp `pg_stat_statements`, xem mục *Câu SQL tốn thời gian nhất*):
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\scripts\n-plus-one.ps1     # -Orders 20 để thử trang khác
@@ -644,9 +669,9 @@ Không gộp hai bước thành một câu `join fetch` có phân trang: `LIMIT`
 | | Trang 100 đơn | Trang 20 đơn |
 |---|---|---|
 | Bản N+1 (`scripts/bugs/13-n-plus-one.patch`) | **102 câu**: 1 trang đơn + 1 đếm + 100 lần nạp dòng hàng | **22 câu** |
-| Bản hiện tại | **3 câu**: trang đơn, đếm, nạp dòng hàng của cả trang | **3 câu** |
+| Bản hiện tại (`@EntityGraph`) | **2 câu**: trang đơn kèm dòng hàng, đếm | **2 câu** |
 
-Đã thử: test đếm được 3 câu với bản hiện tại. Áp patch N+1 (`scripts\red-green.ps1 -Scenario n-plus-one`) thì test đỏ với 102 và 22 câu. Script trên app thật in đúng 3 câu đọc dữ liệu (không tính `BEGIN READ ONLY`), khớp con số trong khối `Logging session metrics` của log.
+Đã thử: test đếm được 2 câu với bản hiện tại. Áp patch N+1 (`scripts\red-green.ps1 -Scenario n-plus-one`) thì test đỏ với 102 và 22 câu. Script trên app thật in đúng 2 câu đọc dữ liệu (không tính `BEGIN READ ONLY`), khớp con số trong khối `Logging session metrics` của log.
 
 ### Người dùng – `/api/users`
 

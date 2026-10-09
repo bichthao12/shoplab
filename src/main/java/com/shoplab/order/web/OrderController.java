@@ -83,7 +83,8 @@ public class OrderController {
 
     /**
      * GET /api/orders/with-items?userId=1&page=0&size=100 → như danh sách ở trên, nhưng mỗi đơn kèm dòng hàng
-     * (cùng dạng GET /api/orders/{id}). Trang bao nhiêu đơn cũng chỉ 2–3 câu SQL (OrderService.listByUserWithItems).
+     * (cùng dạng GET /api/orders/{id}). Trang bao nhiêu đơn cũng chỉ 1 câu SQL, cộng câu đếm khi trang đầy
+     * (OrderService.listByUserWithItems).
      */
     @GetMapping("/with-items")
     public PagedModel<OrderResponse> listByUserWithItems(

@@ -77,18 +77,14 @@ public class OrderService {
     }
 
     /**
-     * Đơn của một người dùng, kèm dòng hàng. Số câu SQL không phụ thuộc số đơn trong trang:
-     * 1 câu lấy trang đơn (+1 câu đếm khi trang đầy) + 1 câu nạp dòng hàng của cả trang.
-     * Để từng đơn tự nạp dòng hàng của nó (vd order.getItems().size() trong vòng lặp) là N+1:
-     * trang 100 đơn thành 1 + 100 câu (scripts/bugs/13-n-plus-one.patch).
+     * Đơn của một người dùng, kèm dòng hàng: 1 câu SQL lấy trang đơn cùng dòng hàng (+1 câu đếm khi trang đầy), trang
+     * bao nhiêu đơn cũng vậy (OrderRepository.findWithItemsByUserId). Để từng đơn tự nạp dòng hàng của nó
+     * (vd order.getItems().size() trong vòng lặp) là N+1: trang 100 đơn thành 1 + 100 câu
+     * (scripts/bugs/13-n-plus-one.patch).
      * @return trang đơn, items đã nạp sẵn (đọc được cả sau khi transaction kết thúc)
      */
     @Transactional(readOnly = true)
     public Page<Order> listByUserWithItems(long userId, Pageable pageable) {
-        Page<Order> page = orderRepo.findByUserId(userId, pageable);
-        if (page.hasContent()) {
-            orderRepo.fetchItems(page.map(Order::getId).getContent());
-        }
-        return page;
+        return orderRepo.findWithItemsByUserId(userId, pageable);
     }
 }

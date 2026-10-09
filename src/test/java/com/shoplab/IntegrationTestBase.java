@@ -182,6 +182,27 @@ public abstract class IntegrationTestBase {
         return userId;
     }
 
+    /**
+     * count đơn PENDING của userId, mỗi đơn một dòng hàng cho mỗi sản phẩm đang có (tạo sản phẩm trước); đơn sau mới
+     * hơn đơn trước 1 phút. Tạo bằng SQL cho nhanh (100 đơn qua API mất vài giây).
+     */
+    protected void createOrdersWithItems(long userId, int count) {
+        jdbc.sql("""
+                        INSERT INTO orders (user_id, customer_name, customer_email, status, total_amount, created_at)
+                        SELECT :userId, 'Nguyễn Văn A', 'a.nguyen@example.com', 'PENDING', 0,
+                               now() - (:count + 1 - g) * interval '1 minute'
+                        FROM generate_series(1, :count) AS g
+                        """)
+                .param("userId", userId).param("count", count).update();
+        jdbc.sql("""
+                        INSERT INTO order_items (order_id, product_id, sku, product_name, quantity, unit_price)
+                        SELECT o.id, p.id, p.sku, p.name, 1, p.price
+                        FROM orders o CROSS JOIN products p
+                        WHERE o.user_id = :userId
+                        """)
+                .param("userId", userId).update();
+    }
+
     /** Người đặt mặc định: Nguyễn Văn A, tài khoản ACTIVE. Chỉ tạo khi test thật sự cần. */
     protected long customerId() {
         if (customerId == null) {

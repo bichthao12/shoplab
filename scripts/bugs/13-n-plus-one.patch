@@ -1,17 +1,16 @@
 diff --git a/src/main/java/com/shoplab/order/internal/OrderService.java b/src/main/java/com/shoplab/order/internal/OrderService.java
-index a60a0d8..5f388c8 100644
+index c10ebc2..9956361 100644
 --- a/src/main/java/com/shoplab/order/internal/OrderService.java
 +++ b/src/main/java/com/shoplab/order/internal/OrderService.java
-@@ -86,9 +86,9 @@ public class OrderService {
+@@ -85,6 +85,10 @@ public class OrderService {
+      */
      @Transactional(readOnly = true)
      public Page<Order> listByUserWithItems(long userId, Pageable pageable) {
-         Page<Order> page = orderRepo.findByUserId(userId, pageable);
--        if (page.hasContent()) {
--            orderRepo.fetchItems(page.map(Order::getId).getContent());
--        }
+-        return orderRepo.findWithItemsByUserId(userId, pageable);
++        Page<Order> page = orderRepo.findByUserId(userId, pageable);
 +        // BẢN LỖI (N+1): chạm vào items của từng đơn để nạp trước khi rời transaction, mỗi đơn một câu
 +        // SELECT ... FROM order_items WHERE order_id = ?
 +        page.forEach(order -> order.getItems().size());
-         return page;
++        return page;
      }
  }

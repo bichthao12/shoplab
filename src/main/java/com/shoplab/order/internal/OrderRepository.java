@@ -2,12 +2,11 @@ package com.shoplab.order.internal;
 
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
-import java.util.Collection;
-import java.util.List;
 import java.util.Optional;
 
 /** Chỉ dùng trong package order. */
@@ -25,17 +24,14 @@ interface OrderRepository extends JpaRepository<Order, Long> {
     Page<Order> findByUserId(Long userId, Pageable pageable);
 
     /**
-     * Nạp dòng hàng cho các đơn đã lấy về, bằng MỘT câu cho cả danh sách. Các đơn đó đã nằm trong persistence context
-     * nên Hibernate điền items vào đúng các object đó. Gọi sau câu phân trang chứ không join fetch ngay trong câu
-     * phân trang: LIMIT áp lên số dòng sau khi join (đơn × dòng hàng), nên Hibernate phải nạp mọi đơn của người dùng
-     * rồi cắt trang trong bộ nhớ.
+     * Đơn của một người dùng kèm dòng hàng, một trang, bằng MỘT câu SQL (cộng câu đếm khi trang đầy).
+     * @EntityGraph thêm left join order_items vào câu phân trang. Hibernate 7 đặt phần phân trang (ORDER BY, OFFSET,
+     * FETCH FIRST) vào một subquery chỉ trên orders rồi mới join order_items, nên giới hạn áp lên số đơn chứ không
+     * phải số dòng sau khi join. Hibernate 5, 6 thì nạp mọi đơn của người dùng rồi cắt trang trong bộ nhớ (cảnh báo
+     * HHH90003004). So sánh với JOIN FETCH, nạp theo lô...: NPlusOneFixesTests.
      */
-    @Query("""
-            select distinct o from ShopOrder o
-            left join fetch o.items
-            where o.id in :ids
-            """)
-    List<Order> fetchItems(@Param("ids") Collection<Long> ids);
+    @EntityGraph(attributePaths = "items")
+    Page<Order> findWithItemsByUserId(Long userId, Pageable pageable);
 
     /** Có đơn nào chứa sản phẩm này không (dùng index idx_order_items_product_id). */
     boolean existsByItemsProductId(Long productId);

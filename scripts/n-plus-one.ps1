@@ -8,14 +8,14 @@
   (như scripts/top-queries.ps1: docker compose up -d --force-recreate với docker-compose.yml hiện tại).
     1. Đăng ký một người dùng mới, tạo 2 sản phẩm, đặt -Orders đơn (mặc định 100), mỗi đơn 2 sản phẩm, đều qua API.
     2. pg_stat_statements_reset(), rồi gọi GET /api/orders/with-items?userId=...&size=<Orders> đúng một lần.
-    3. Đọc pg_stat_statements: từng câu SQL và số lần chạy. Mong đợi 3 câu (trang đơn, đếm, nạp dòng hàng của cả trang)
-       chứ không phải 1 + 100. Log của app có cùng con số trong khối "Logging session metrics" (thống kê Hibernate):
-       "... ns executing 3 JDBC statements".
+    3. Đọc pg_stat_statements: từng câu SQL và số lần chạy. Mong đợi 2 câu (trang đơn kèm dòng hàng, đếm) chứ không
+       phải 1 + 100. Log của app có cùng con số trong khối "Logging session metrics" (thống kê Hibernate):
+       "... ns executing 2 JDBC statements".
   Đừng gọi app hay DB từ nơi khác trong lúc chạy: pg_stat_statements đếm mọi câu SQL chạy trên DB.
   Bản N+1 để so sánh (chạy test, bản lỗi chạy 102 câu): scripts/red-green.ps1 -Scenario n-plus-one
   Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
 
-  Thoát với mã 0 nếu không quá 3 câu SQL; 1 nếu nhiều hơn; 2 nếu không chạy được.
+  Thoát với mã 0 nếu không quá 2 câu SQL; 1 nếu nhiều hơn; 2 nếu không chạy được.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\scripts\n-plus-one.ps1
@@ -35,7 +35,7 @@ Add-Type -AssemblyName System.Net.Http
 $container = 'shoplab-postgres'
 $psql = @('exec', $container, 'psql', '-X', '-U', 'shoplab', '-d', 'shoplab')
 $run = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()   # mã của lần chạy: email, username, SKU không trùng lần trước
-$maxStatements = 3
+$maxStatements = 2
 
 function Invoke-Docker([string[]]$dockerArgs) {
     # stderr của lệnh ngoài thành ErrorRecord khi gộp 2>&1; tạm đổi ErrorActionPreference để PS 5.1 không dừng script
