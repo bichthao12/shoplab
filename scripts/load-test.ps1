@@ -447,17 +447,30 @@ function Write-Row($r) {
     if ($r.Degraded -gt 0) {
         Write-Host ("    thiếu nguồn phụ: lịch sử thanh toán ×{0}, gợi ý ×{1}" -f $r.MissingPayments, $r.MissingRecommendations) -ForegroundColor Yellow
     }
-    # Vài mẫu (giờ máy này) để so với log của app
+    if ($r.ErrNetwork -gt 0 -and $r.Err503 -eq 0 -and $r.ErrOther -eq 0) {
+        Write-Host '    Chỉ có lỗi không có response: request không tới được app, hoặc app không trả lời trong 30 giây. Nếu log' -ForegroundColor Yellow
+        Write-Host '    của app bên dưới không có WARN / ERROR lúc đo thì app không thấy các request này: lỗi nằm ở chặng giữa k6 và' -ForegroundColor Yellow
+        Write-Host '    app (mạng của Docker Desktop khi k6 chạy trong Docker, hàng chờ kết nối của Tomcat), không phải ở app.' -ForegroundColor Yellow
+    }
+    # Vài mẫu (giờ máy này) để so với log của app: lúc gửi = lúc có kết quả - thời gian chờ
     foreach ($s in @($r.Samples | Select-Object -First 4)) {
         $f = @{}
         foreach ($m in [regex]::Matches($s, '(\w+)=(\S*)')) { $f[$m.Groups[1].Value] = $m.Groups[2].Value }
-        $at = $f['t']
-        try { $at = ([DateTimeOffset]::Parse($f['t'], [System.Globalization.CultureInfo]::InvariantCulture)).ToLocalTime().ToString('HH:mm:ss.fff') } catch { }
-        $what = "status $($f['status']) $($f['type'])"
-        if ($s -like 'DETAIL_DEGRADED*') { $what = "thiếu $($f['missing'])" }
+        $sent = '?'
+        try {
+            $done = [DateTimeOffset]::Parse($f['t'], [System.Globalization.CultureInfo]::InvariantCulture)
+            $sent = $done.AddMilliseconds(-[double]$f['ms']).ToLocalTime().ToString('HH:mm:ss.fff')
+        } catch { }
         $errText = ''
         if ($s -match 'error=(.+)$' -and $Matches[1].Trim()) { $errText = " ($($Matches[1].Trim()))" }
-        Write-Host ("    vd {0} đơn {1}: {2} sau {3} ms{4}" -f $at, $f['id'], $what.Trim(), $f['ms'], $errText)
+        if ($s -like 'DETAIL_DEGRADED*') {
+            $what = "thiếu $($f['missing'])"
+        } elseif ($f['status'] -eq '0') {
+            $what = 'không có response'
+        } else {
+            $what = ("status $($f['status']) $($f['type'])").Trim()
+        }
+        Write-Host ("    vd gửi {0}, đơn {1}: {2} sau {3} ms{4}" -f $sent, $f['id'], $what, $f['ms'], $errText)
     }
 }
 

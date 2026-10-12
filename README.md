@@ -1077,6 +1077,12 @@ Máy chưa cài k6 thì script chạy k6 bằng Docker (image `grafana/k6:1.3.0`
   - GC dừng lâu nhất (`jdk.GCPhasePause`);
   - số lần luồng ảo bị ghim vào luồng hệ điều hành từ 20 ms (`jdk.VirtualThreadPinned`), kèm đỉnh stack. Java 21 ghim luồng ảo khi nó chờ bên trong `synchronized`. Bị ghim nhiều thì vài luồng hệ điều hành bên dưới bị chiếm hết và mọi luồng ảo khác phải chờ.
   - Đã thử ở đây với luồng ảo, 400 VU: GC dừng lâu nhất khoảng 50 ms, 0 lần bị ghim. Mở file `.jfr` bằng JDK Mission Control để xem kỹ hơn.
+- **Lỗi "không có response" (`status 0`) khi k6 chạy trong Docker.** Trên một máy Windows, lượt tham khảo 400 VU từng có 26 lỗi loại này, cùng một lúc:
+  - đều là request **đầu tiên** của 26 người dùng ảo: kết nối qua `host.docker.internal` không mở được (`dial: i/o timeout`), k6 chờ đủ 30 giây (`request timeout`) rồi bỏ;
+  - log app sạch: app không hề thấy các request này;
+  - 26 người dùng ảo kẹt suốt lượt 30 giây, nên thông lượng chỉ 881,6 thay vì khoảng 950 req/s: (400 − 26) / 0,416 s ≈ 900.
+  
+  Lỗi nằm ở chặng mạng của Docker Desktop khi 400 kết nối mở cùng lúc, không phải ở app. Cài k6 chạy thẳng trên Windows (`winget install k6 --source winget`) để bỏ chặng này; script tự dùng k6 cài sẵn.
 
 Kết quả (máy 4 CPU, 2 triệu đơn; ms là thời gian k6 chờ):
 

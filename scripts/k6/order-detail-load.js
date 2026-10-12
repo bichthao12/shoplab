@@ -29,8 +29,8 @@ const missingPayments = new Counter('detail_missing_payment_history');
 const missingRecommendations = new Counter('detail_missing_recommendations');
 
 // Mỗi người dùng ảo in tối đa một lỗi và một trang thiếu nguồn phụ (dòng DETAIL_ERROR / DETAIL_DEGRADED dạng
-// khoá=giá trị, chỉ ký tự ASCII, có thời điểm UTC để so với log của app), đủ để biết chuyện gì xảy ra mà không làm
-// ngập output
+// khoá=giá trị, chỉ ký tự ASCII; t: lúc có kết quả (UTC), ms: thời gian chờ), đủ để biết chuyện gì xảy ra mà không
+// làm ngập output
 let errorLogged = false;
 let degradedLogged = false;
 
@@ -76,9 +76,12 @@ export function setup() {
 
 export function detail(data) {
     const id = data.ids[Math.floor(Math.random() * data.ids.length)];
+    const started = Date.now();
     const res = http.get(`${BASE_URL}/api/orders/${id}/detail`, { tags: { name: 'detail' }, timeout: '30s' });
+    const elapsed = Date.now() - started;   // res.timings.duration là 0 khi không có response, nên tự đo
     detailRequests.add(1);
-    detailDuration.add(res.timings.duration);
+    // Không có response (hết giờ, không kết nối được): tính đúng thời gian đã chờ, không phải 0
+    detailDuration.add(res.status === 0 ? elapsed : res.timings.duration);
     if (res.status !== 200) {
         detailNot200.add(1);
         if (res.status === 0) {
@@ -91,7 +94,7 @@ export function detail(data) {
         if (!errorLogged) {
             errorLogged = true;
             console.warn(`DETAIL_ERROR t=${new Date().toISOString()} id=${id} status=${res.status}`
-                + ` ms=${Math.round(res.timings.duration)} type=${problemType(res)} error=${res.error || ''}`);
+                + ` ms=${elapsed} type=${problemType(res)} error=${res.error || ''}`);
         }
     } else if (res.body.indexOf('"unavailable":[]') < 0) {
         detailDegraded.add(1);
@@ -101,7 +104,7 @@ export function detail(data) {
         if (!degradedLogged) {
             degradedLogged = true;
             console.warn(`DETAIL_DEGRADED t=${new Date().toISOString()} id=${id} status=200`
-                + ` ms=${Math.round(res.timings.duration)} missing=${missing.join(',')}`);
+                + ` ms=${elapsed} missing=${missing.join(',')}`);
         }
     }
 }
