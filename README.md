@@ -489,7 +489,56 @@ Không đi qua API, không cần app. App chạy cùng lúc cũng được, như
 **Kết luận:**
 - Thêm index cho một câu đọc cụ thể, và xem bằng `EXPLAIN` rằng câu đó dùng nó.
 - Index trùng hệt, hay trùng phần đầu của index khác, thì bỏ.
-- Index nghi không dùng thì theo dõi `idx_scan` một thời gian rồi mới bỏ bằng `DROP INDEX CONCURRENTLY`. Lệnh này không khoá ghi; bỏ nhầm thì dựng lại được bằng `CREATE INDEX CONCURRENTLY`.
+- Index nghi không dùng thì theo dõi `idx_scan` một thời gian rồi mới bỏ bằng `DROP INDEX CONCURRENTLY` (`scripts/unused-indexes.ps1`, mục bên dưới). Lệnh này không khoá ghi; bỏ nhầm thì dựng lại được bằng `CREATE INDEX CONCURRENTLY`.
+
+### Tìm và xoá index không ai dùng (`scripts/unused-indexes.ps1`)
+
+Script đọc `pg_stat_user_indexes` của schema `public`: `idx_scan` là số lần index được dùng để đọc, `last_idx_scan` là lần cuối. Chỉ chạy SQL qua `docker exec psql`, không gọi API, không chạy test. Mặc định chỉ liệt kê. `-Drop` mới xoá: script hỏi lại trước (trừ khi có `-Force`), xoá bằng `DROP INDEX CONCURRENTLY` (không khoá ghi bảng), và lưu lệnh dựng lại từng index vào một file trong thư mục tạm.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\unused-indexes.ps1                       # chỉ liệt kê
+powershell -ExecutionPolicy Bypass -File .\scripts\unused-indexes.ps1 -Drop                 # xoá, hỏi lại trước
+powershell -ExecutionPolicy Bypass -File .\scripts\unused-indexes.ps1 -Drop -MinHours 0     # DB thí nghiệm: không đòi thống kê đủ 24 giờ
+```
+
+**`idx_scan = 0` chưa đủ để xoá.** Script xét thêm:
+
+| Kết luận | Trường hợp |
+|---|---|
+| GIỮ | `UNIQUE` / khoá chính: giữ ràng buộc dữ liệu, không chỉ để đọc nhanh |
+| GIỮ | index của bảng `flyway_schema_history` |
+| GIỮ | **index do migration của app tạo** (script tìm tên index trong `src/main/resources/db/migration`). Xoá tay chỉ có tác dụng trên DB này; DB mới (test, máy khác) chạy migration lại có nó. Muốn bỏ thì viết migration `DROP INDEX`, sau khi xem câu nào cần nó |
+| XOÁ | index hỏng: `CREATE INDEX CONCURRENTLY` lỗi giữa chừng, không câu nào dùng được |
+| XOÁ | **trùng:** một index được giữ có cùng các cột, hoặc các cột của index này là phần đầu các cột của nó |
+| XOÁ | `idx_scan = 0`, nếu thống kê đã đếm ít nhất `-MinHours` giờ (mặc định 24). Chưa đủ thì ghi "chưa đủ lâu" và giữ |
+| GIỮ | được dùng; hoặc là index duy nhất phục vụ một khoá ngoại (xoá thì mỗi lần xoá / sửa dòng ở bảng cha, PostgreSQL phải đọc cả bảng con) |
+
+**Bẫy đã gặp khi thử: index trùng hệt chia nhau lượt dùng.** Có hai index giống nhau thì planner dùng **index tạo sau**. Index gốc của migration vì vậy có `idx_scan = 0`, còn bản trùng thêm tay lấy hết lượt dùng. Chỉ nhìn `idx_scan` thì sẽ xoá nhầm index gốc, giữ bản trùng. Script so cấu trúc trước: xoá bản trùng, giữ index gốc, và ghi lý do "`idx_scan = 0` vì planner dùng bản trùng ... thay".
+
+**Những gì `idx_scan` không biết:**
+- Chỉ đếm từ lần reset thống kê gần nhất (`pg_stat_reset()`), và mất khi PostgreSQL tắt không sạch (vd Docker bị tắt đột ngột). Index vừa dựng lại (như sau `seed-big-data.ps1`) đếm lại từ 0. Script in khoảng thời gian thống kê chắc chắn đã đếm, và đòi ít nhất `-MinHours` giờ.
+- Chỉ đếm trên server này: index có thể đang được dùng trên replica.
+- Câu hiếm khi chạy (báo cáo cuối tháng, xoá sản phẩm) vẫn cần index của nó, dù hôm nay `idx_scan = 0`. Ví dụ `idx_order_items_product_id` chỉ được dùng khi xoá sản phẩm.
+- Kết nối đang rảnh (kết nối của app trong pool) ghi số đếm chậm tới khoảng 10 giây. Đã thử: vừa gọi `GET /api/orders/{id}` xong, `orders_pkey` vẫn 0; 10 giây sau là 3.
+
+**Đã thử trên DB thật** (2 triệu đơn): thêm 5 index thừa vào `orders`, chạy `cursor-api-check.ps1` và vài `GET /api/orders/{id}`, rồi chạy script:
+```
+Kết luận Bảng  Index                         idx_scan Kích thước Lý do
+XOÁ      orders extra_created_at                     6 43 MB      trùng hệt idx_orders_created_at
+XOÁ      orders extra_customer_email                 0 22 MB      không câu nào dùng (idx_scan = 0)
+XOÁ      orders extra_total_amount                   0 43 MB      không câu nào dùng (idx_scan = 0)
+XOÁ      orders extra_user_id                        1 17 MB      các cột là phần đầu của idx_orders_user_id_created_at
+XOÁ      orders extra_user_id_created_at            10 77 MB      trùng hệt idx_orders_user_id_created_at
+GIỮ      orders idx_orders_created_at                0 43 MB      do V1__init.sql tạo; idx_scan = 0 vì planner dùng bản trùng extra_created_at thay
+GIỮ      orders idx_orders_user_id_created_at        0 77 MB      do V11__orders_user_id.sql tạo; idx_scan = 0 vì planner dùng bản trùng extra_user_id_created_at thay
+...
+5 index có thể xoá (202 MB).
+```
+Kết quả sau khi thử:
+- Chạy `-Drop`: xoá đúng 5 index thừa, giải phóng 202 MB, lưu lệnh dựng lại vào `shoplab-dropped-indexes-<thời điểm>.sql` trong thư mục tạm. File đó chạy được bằng `psql -f` để dựng lại.
+- Sau khi xoá, `cursor-api-check.ps1` vẫn `ĐÚNG (10/10)`. Hai index gốc lại có lượt dùng (`idx_scan` 5 và 11), và chạy script lần nữa: "Không có index nào để xoá".
+- Hai nhánh an toàn cũng đã thử:
+  - không có `-MinHours 0` thì index có `idx_scan = 0` được giữ, ghi "thống kê mới đếm 0.1 giờ (cần 24)";
+  - trả lời khác `yes` khi script hỏi lại thì không đổi gì, mã thoát 2.
 
 ### Chạy test
 
