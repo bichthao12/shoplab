@@ -1,7 +1,7 @@
 diff --git a/src/main/java/com/shoplab/order/internal/OrderDetailService.java b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
 --- a/src/main/java/com/shoplab/order/internal/OrderDetailService.java
 +++ b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
-@@ -70,31 +70,14 @@
+@@ -74,31 +74,15 @@
          long started = System.nanoTime();
          Map<String, Duration> timings = new ConcurrentHashMap<>();
  
@@ -10,7 +10,13 @@ diff --git a/src/main/java/com/shoplab/order/internal/OrderDetailService.java b/
 -        CompletableFuture<List<ProductInfo>> products = order.thenCompose(o -> call("products", timings, requiredTimeout,
 -                false, () -> catalog.findByIds(o.getItems().stream().map(OrderItem::getProductId).distinct().toList())));
 -        CompletableFuture<List<PaymentEvent>> payments = call("paymentHistory", timings, optionalTimeout, true,
--                () -> paymentHistory.findByOrderId(orderId));
++        // BẢN LỖI: gọi lần lượt từng nguồn trên luồng của request, nguồn sau chờ nguồn trước xong: cả trang mất tổng
++        // thời gian các nguồn (khoảng 720 ms) thay vì nguồn chậm nhất (khoảng 400 ms)
++        Order loadedOrder = timed("order", timings, () -> orders.getById(orderId));
++        List<ProductInfo> loadedProducts = timed("products", timings, () -> catalog.findByIds(
++                loadedOrder.getItems().stream().map(OrderItem::getProductId).distinct().toList()));
++        List<PaymentEvent> loadedPayments = timed("paymentHistory", timings,
+                 () -> paymentCache.get(orderId, () -> paymentHistory.findByOrderId(orderId)));
 -        CompletableFuture<List<Recommendation>> suggestions = call("recommendations", timings, optionalTimeout, true,
 -                () -> recommendations.forOrder(orderId));
 -
@@ -27,12 +33,6 @@ diff --git a/src/main/java/com/shoplab/order/internal/OrderDetailService.java b/
 -        }
 -
 -        // Hai nhánh phụ: mỗi lời gọi tự hết hạn (orTimeout), ở đây chỉ chờ kết quả hoặc lỗi
-+        // BẢN LỖI: gọi lần lượt từng nguồn trên luồng của request, nguồn sau chờ nguồn trước xong: cả trang mất tổng
-+        // thời gian các nguồn (khoảng 720 ms) thay vì nguồn chậm nhất (khoảng 400 ms)
-+        Order loadedOrder = timed("order", timings, () -> orders.getById(orderId));
-+        List<ProductInfo> loadedProducts = timed("products", timings, () -> catalog.findByIds(
-+                loadedOrder.getItems().stream().map(OrderItem::getProductId).distinct().toList()));
-+        List<PaymentEvent> loadedPayments = timed("paymentHistory", timings, () -> paymentHistory.findByOrderId(orderId));
 +        List<Recommendation> loadedSuggestions = timed("recommendations", timings, () -> recommendations.forOrder(orderId));
          List<String> unavailable = new ArrayList<>();
 -        List<PaymentEvent> loadedPayments = optional("paymentHistory", payments, unavailable);

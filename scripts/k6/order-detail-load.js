@@ -3,7 +3,9 @@
 // kết nối DB đang chờ (hikaricp.connections.pending), đang dùng (active), luồng Tomcat đang bận, CPU của app.
 //
 // Chạy:  k6 run -e BASE_URL=http://localhost:8080 scripts/k6/order-detail-load.js
-// Biến:  BASE_URL, VUS, DURATION, ORDERS (số đơn mới nhất để gọi ngẫu nhiên, mặc định 1000)
+// Biến:  BASE_URL, VUS, DURATION, ORDERS (số đơn mới nhất để gọi ngẫu nhiên, mặc định 1000),
+//        ORDER_PICK: newest (mặc định: một trong ORDERS đơn mới nhất) hoặc all (id ngẫu nhiên từ 1 tới id lớn nhất, mỗi
+//        lần gần như một đơn khác: dùng cho bài leak, scripts/memory-leak.ps1; id bị trống trả 404, đếm riêng)
 // Thường không chạy tay mà qua scripts/load-test.ps1 (khởi động app với từng cấu hình, chạy kịch bản này, in bảng).
 //
 // Kết quả: thay cho bảng tóm tắt mặc định, in đúng một dòng "K6_SUMMARY {json}" cho script đọc.
@@ -16,11 +18,13 @@ const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 const VUS = parseInt(__ENV.VUS || '200', 10);
 const DURATION = __ENV.DURATION || '2m';
 const ORDERS = parseInt(__ENV.ORDERS || '1000', 10);
+const ORDER_PICK = __ENV.ORDER_PICK || 'newest';
 
 // Chỉ tính các lời gọi trang chi tiết (http_reqs có cả lời gọi lấy danh sách đơn, đọc Actuator)
 const detailDuration = new Trend('detail_duration', true);
 const detailRequests = new Counter('detail_requests');
 const detailNot200 = new Counter('detail_not_200');
+const detailNotFound = new Counter('detail_not_found');   // ORDER_PICK=all: id không có đơn (404), không tính là lỗi
 const errNetwork = new Counter('detail_err_network');     // không có response: hết giờ chờ, mất kết nối (status 0)
 const err503 = new Counter('detail_err_503');             // vd order-detail-timeout: đơn / sản phẩm quá hạn
 const errOther = new Counter('detail_err_other');
@@ -51,8 +55,15 @@ export const options = {
     discardResponseBodies: false,
 };
 
-// Lấy id của ORDERS đơn mới nhất qua GET /api/orders (cursor), mỗi trang 100 đơn
+// Lấy id của ORDERS đơn mới nhất qua GET /api/orders (cursor), mỗi trang 100 đơn; ORDER_PICK=all: chỉ cần id lớn nhất
 export function setup() {
+    if (ORDER_PICK === 'all') {
+        const res = http.get(`${BASE_URL}/api/orders?size=1`, { tags: { name: 'setup' } });
+        if (res.status !== 200 || res.json().content.length === 0) {
+            exec.test.abort(`GET /api/orders?size=1 -> ${res.status}: cần ít nhất một đơn`);
+        }
+        return { maxId: res.json().content[0].id };
+    }
     const ids = [];
     let cursor = null;
     while (ids.length < ORDERS) {
@@ -75,14 +86,18 @@ export function setup() {
 }
 
 export function detail(data) {
-    const id = data.ids[Math.floor(Math.random() * data.ids.length)];
+    const id = data.maxId
+        ? 1 + Math.floor(Math.random() * data.maxId)
+        : data.ids[Math.floor(Math.random() * data.ids.length)];
     const started = Date.now();
     const res = http.get(`${BASE_URL}/api/orders/${id}/detail`, { tags: { name: 'detail' }, timeout: '30s' });
     const elapsed = Date.now() - started;   // res.timings.duration là 0 khi không có response, nên tự đo
     detailRequests.add(1);
     // Không có response (hết giờ, không kết nối được): tính đúng thời gian đã chờ, không phải 0
     detailDuration.add(res.status === 0 ? elapsed : res.timings.duration);
-    if (res.status !== 200) {
+    if (res.status === 404 && data.maxId) {
+        detailNotFound.add(1);
+    } else if (res.status !== 200) {
         detailNot200.add(1);
         if (res.status === 0) {
             errNetwork.add(1);
@@ -152,6 +167,7 @@ export function handleSummary(data) {
         p99: v('detail_duration', 'p(99)'),
         max: v('detail_duration', 'max'),
         not200: v('detail_not_200', 'count') || 0,
+        notFound: v('detail_not_found', 'count') || 0,
         errNetwork: v('detail_err_network', 'count') || 0,
         err503: v('detail_err_503', 'count') || 0,
         errOther: v('detail_err_other', 'count') || 0,

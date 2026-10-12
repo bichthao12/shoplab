@@ -1,5 +1,6 @@
 package com.shoplab.order.internal;
 
+import com.shoplab.common.MdcPropagation;
 import com.shoplab.product.ProductCatalog;
 import com.shoplab.product.ProductInfo;
 import org.slf4j.Logger;
@@ -28,7 +29,7 @@ import java.util.function.Supplier;
  * lượt).
  *
  *   nhánh 1: đơn hàng (DB) rồi sản phẩm (module product): sản phẩm cần productId của các dòng hàng, nên chạy sau đơn
- *   nhánh 2: lịch sử thanh toán (giả lập chậm 300 ms), chỉ cần id đơn
+ *   nhánh 2: lịch sử thanh toán (giả lập chậm 300 ms), chỉ cần id đơn; qua cache theo orderId (PaymentHistoryCache)
  *   nhánh 3: gợi ý (giả lập chậm 400 ms), chỉ cần id đơn
  *
  * Mỗi lời gọi có orTimeout riêng, tính từ lúc lời gọi đó bắt đầu:
@@ -49,17 +50,20 @@ public class OrderDetailService {
     private final OrderService orders;
     private final ProductCatalog catalog;
     private final PaymentHistorySource paymentHistory;
+    private final PaymentHistoryCache paymentCache;
     private final RecommendationSource recommendations;
     private final ExecutorService executor;
     private final Duration requiredTimeout;
     private final Duration optionalTimeout;
 
     OrderDetailService(OrderService orders, ProductCatalog catalog, PaymentHistorySource paymentHistory,
+                       PaymentHistoryCache paymentCache,
                        RecommendationSource recommendations,
                        @Qualifier("orderDetailExecutor") ExecutorService executor, OrderDetailProperties properties) {
         this.orders = orders;
         this.catalog = catalog;
         this.paymentHistory = paymentHistory;
+        this.paymentCache = paymentCache;
         this.recommendations = recommendations;
         this.executor = executor;
         this.requiredTimeout = properties.requiredTimeout();
@@ -75,7 +79,7 @@ public class OrderDetailService {
         CompletableFuture<List<ProductInfo>> products = order.thenCompose(o -> call("products", timings, requiredTimeout,
                 false, () -> catalog.findByIds(o.getItems().stream().map(OrderItem::getProductId).distinct().toList())));
         CompletableFuture<List<PaymentEvent>> payments = call("paymentHistory", timings, optionalTimeout, true,
-                () -> paymentHistory.findByOrderId(orderId));
+                () -> paymentCache.get(orderId, () -> paymentHistory.findByOrderId(orderId)));
         CompletableFuture<List<Recommendation>> suggestions = call("recommendations", timings, optionalTimeout, true,
                 () -> recommendations.forOrder(orderId));
 
@@ -109,19 +113,23 @@ public class OrderDetailService {
 
     /**
      * Một lời gọi trên executor, hết hạn sau timeout (orTimeout: CompletableFuture kết thúc bằng TimeoutException).
+     * Lời gọi chạy với MDC (traceId) của luồng gọi.
      * interrupt: quá hạn hay bị huỷ (cancel) thì ngắt luôn luồng đang chạy lời gọi. Tự CompletableFuture không làm việc
      * đó, nó chỉ đánh dấu kết thúc, còn việc vẫn chạy tiếp tới hết. Không dùng cho lời gọi DB (xem ghi chú của lớp).
      */
     private <T> CompletableFuture<T> call(String source, Map<String, Duration> timings, Duration timeout, boolean interrupt,
                                           Supplier<T> task) {
         CompletableFuture<T> result = new CompletableFuture<>();
-        Future<?> running = executor.submit(() -> {
+        // MDC (traceId) là ThreadLocal của luồng request: chép sang luồng chạy lời gọi, không thì log của nó (SQL,
+        // BEGIN / COMMIT, "bị huỷ") mất traceId. complete() cũng phải nằm trong phạm vi MDC: nó chạy ngay trên luồng
+        // này các bước nối sau (thenCompose giao lời gọi sản phẩm), bước đó chụp MDC lúc giao việc.
+        Future<?> running = executor.submit(MdcPropagation.withCurrentMdc(() -> {
             try {
                 result.complete(timed(source, timings, task));
             } catch (Throwable ex) {
                 result.completeExceptionally(ex);
             }
-        });
+        }));
         result.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS).whenComplete((value, ex) -> {
             if (interrupt && (ex instanceof TimeoutException || result.isCancelled())) {
                 running.cancel(true);

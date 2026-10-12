@@ -13,11 +13,15 @@ import java.time.Duration;
  * @param requiredTimeout      hạn (orTimeout) của mỗi lời gọi bắt buộc: đơn, sản phẩm. Quá hạn → trang trả 503
  * @param optionalTimeout      hạn (orTimeout) của mỗi lời gọi không bắt buộc: lịch sử thanh toán, gợi ý. Quá hạn thì
  *                             trang trả về không có phần đó (ghi vào unavailable) thay vì chờ tiếp
+ * @param paymentCacheMaximumSize số đơn tối đa trong cache lịch sử thanh toán (PaymentHistoryCache)
+ * @param paymentCacheTtl      một mục của cache đó sống bao lâu kể từ lúc ghi
  */
 @ConfigurationProperties("shoplab.order-detail")
 record OrderDetailProperties(
         @DefaultValue("300ms") Duration paymentHistoryDelay,
         @DefaultValue("400ms") Duration recommendationsDelay,
         @DefaultValue("2s") Duration requiredTimeout,
-        @DefaultValue("1s") Duration optionalTimeout
+        @DefaultValue("1s") Duration optionalTimeout,
+        @DefaultValue("10000") long paymentCacheMaximumSize,
+        @DefaultValue("1m") Duration paymentCacheTtl
 ) {}

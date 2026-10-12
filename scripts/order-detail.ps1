@@ -5,9 +5,11 @@
 
 .DESCRIPTION
   Gọi API thật (không chạy test, không đọc DB). Cần app đang chạy.
-    1. Tạo qua API một sản phẩm, một người dùng và một đơn 2 cái (bỏ qua nếu có -OrderId).
+    1. Tạo qua API một sản phẩm, một người dùng và -Runs + 1 đơn (bỏ qua nếu có -OrderId). Mỗi lần gọi một đơn KHÁC:
+       lịch sử thanh toán được cache 1 phút theo orderId, gọi lại cùng đơn thì nguồn đó mất khoảng 0 ms.
     2. Gọi trang chi tiết một lần cho nóng máy, rồi -Runs lần (mặc định 5). Mỗi lần in thời gian từng nguồn (order,
        products, paymentHistory, recommendations), "total" (cả trang, phía server) và thời gian client chờ.
+       Với -OrderId, mọi lần gọi cùng một đơn: từ lần thứ hai paymentHistory lấy từ cache, tổng 4 nguồn nhỏ đi.
     3. So trung vị: total (song song) với tổng 4 nguồn (thời gian trang sẽ mất nếu gọi lần lượt).
     4. Gọi một đơn không tồn tại: phải 404 ngay, không chờ hai nguồn chậm.
   Hai nguồn chậm là giả lập (shoplab.order-detail.payment-history-delay = 300ms, recommendations-delay = 400ms).
@@ -101,6 +103,7 @@ try {
     Stop-Script "Không gọi được app ở $BaseUrl ($($_.Exception.Message)). Chạy app trước: .\mvnw spring-boot:run"
 }
 
+$orderIds = @()
 if ($OrderId -le 0) {
     $product = Invoke-Api 'POST' '/api/products' (@{
         sku = "DETAIL-$run"; name = 'Áo thun chi tiết'; category = 'DETAIL'; price = 150000; stock = 1000
@@ -109,14 +112,21 @@ if ($OrderId -le 0) {
         email = "detail.$run@example.com"; fullName = 'Khách xem chi tiết'; username = "detail$run"; password = 'Secret123!'
     } | ConvertTo-Json -Compress) 201
     $orderJson = '{{"userId":{0},"items":[{{"productId":{1},"quantity":2}}]}}' -f $user.id, $product.id
-    $OrderId = (Invoke-Api 'POST' '/api/orders' $orderJson 201 ([guid]::NewGuid().ToString('N'))).id
-    Write-Host "Tạo qua API: sản phẩm $($product.id), người dùng $($user.id), đơn $OrderId (2 cái)"
+    for ($i = 0; $i -le $Runs; $i++) {
+        $orderIds += (Invoke-Api 'POST' '/api/orders' $orderJson 201 ([guid]::NewGuid().ToString('N'))).id
+    }
+    $OrderId = $orderIds[0]
+    Write-Host ("Tạo qua API: sản phẩm {0}, người dùng {1}, {2} đơn (mỗi đơn 2 cái): {3}" -f $product.id, $user.id, $orderIds.Count,
+                ($orderIds -join ', '))
+} else {
+    for ($i = 0; $i -le $Runs; $i++) { $orderIds += $OrderId }
+    Write-Host "Mọi lần gọi đơn ${OrderId}: từ lần thứ hai, lịch sử thanh toán lấy từ cache (khoảng 0 ms)" -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------------------------------------------------
 # 2. Gọi trang chi tiết
 
-$path = "/api/orders/$OrderId/detail"
+$path = "/api/orders/$($orderIds[0])/detail"
 $warm = Send-Request 'GET' $path $null $null   # lần đầu: nạp class, JIT
 if ($warm.Code -ne 200) {
     Stop-Script "GET $path -> $($warm.Code): $($warm.Body)"
@@ -128,11 +138,13 @@ Write-Host ("GET {0} -> 200: đơn {1} dòng hàng, {2} sản phẩm, {3} sự k
 Write-Host ''
 
 $rows = for ($i = 1; $i -le $Runs; $i++) {
+    $path = "/api/orders/$($orderIds[$i])/detail"
     $r = Send-Request 'GET' $path $null $null
     if ($r.Code -ne 200) { Stop-Script "GET $path -> $($r.Code): $($r.Body)" }
     $sum = ($sources | ForEach-Object { $r.Timing[$_] } | Measure-Object -Sum).Sum
     [pscustomobject]@{
         'Lần'                       = $i
+        'Đơn'                       = $orderIds[$i]
         'order'                     = Format-Ms $r.Timing['order']
         'products'                  = Format-Ms $r.Timing['products']
         'paymentHistory'            = Format-Ms $r.Timing['paymentHistory']
@@ -146,7 +158,7 @@ $rows = for ($i = 1; $i -le $Runs; $i++) {
     }
 }
 Write-Host 'Thời gian (ms) theo header Server-Timing; "Client chờ" tính cả HTTP:'
-$rows | Select-Object 'Lần', 'order', 'products', 'paymentHistory', 'recommendations', 'Tổng 4 nguồn (lần lượt)',
+$rows | Select-Object 'Lần', 'Đơn', 'order', 'products', 'paymentHistory', 'recommendations', 'Tổng 4 nguồn (lần lượt)',
         'total (song song)', 'Client chờ' | Format-Table -AutoSize | Out-String -Width 160 | Write-Host
 
 $medianSum = Get-Median ($rows | ForEach-Object { $_.Sum })

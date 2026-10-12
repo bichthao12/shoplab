@@ -1,9 +1,9 @@
 diff --git a/src/main/java/com/shoplab/order/internal/OrderDetailService.java b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
 --- a/src/main/java/com/shoplab/order/internal/OrderDetailService.java
 +++ b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
-@@ -123,7 +123,8 @@
+@@ -131,7 +131,8 @@
              }
-         });
+         }));
          result.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS).whenComplete((value, ex) -> {
 -            if (interrupt && (ex instanceof TimeoutException || result.isCancelled())) {
 +            // BẢN LỖI: ngắt cả lời gọi DB quá hạn: luồng ảo đang đọc socket bị ngắt thì JDK đóng socket, kết nối DB hỏng

@@ -1,0 +1,20 @@
+diff --git a/src/main/java/com/shoplab/order/internal/OrderDetailService.java b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
+--- a/src/main/java/com/shoplab/order/internal/OrderDetailService.java
++++ b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
+@@ -123,13 +123,14 @@
+         // MDC (traceId) là ThreadLocal của luồng request: chép sang luồng chạy lời gọi, không thì log của nó (SQL,
+         // BEGIN / COMMIT, "bị huỷ") mất traceId. complete() cũng phải nằm trong phạm vi MDC: nó chạy ngay trên luồng
+         // này các bước nối sau (thenCompose giao lời gọi sản phẩm), bước đó chụp MDC lúc giao việc.
+-        Future<?> running = executor.submit(MdcPropagation.withCurrentMdc(() -> {
++        // BẢN LỖI: giao việc thẳng cho executor, không chép MDC: log trên luồng order-detail-N không có traceId
++        Future<?> running = executor.submit(() -> {
+             try {
+                 result.complete(timed(source, timings, task));
+             } catch (Throwable ex) {
+                 result.completeExceptionally(ex);
+             }
+-        }));
++        });
+         result.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS).whenComplete((value, ex) -> {
+             if (interrupt && (ex instanceof TimeoutException || result.isCancelled())) {
+                 running.cancel(true);

@@ -36,7 +36,9 @@ class OrderDetailApiTests extends IntegrationTestBase {
         assertThat(send("PATCH", "/api/products/" + productId, """
                 {"price":120000,"version":0}
                 """, null).statusCode()).isEqualTo(200);
-        send("GET", "/api/orders/" + orderId + "/detail", null, null);   // chạy trước một lần (nạp class, JIT)
+        // Chạy trước một lần (nạp class, JIT) với một đơn KHÁC: lịch sử thanh toán được cache theo orderId
+        long warmUpOrderId = idOf(json(postOrder(newKey(), orderJson(productId, 1))));
+        send("GET", "/api/orders/" + warmUpOrderId + "/detail", null, null);
 
         HttpResponse<String> r = send("GET", "/api/orders/" + orderId + "/detail", null, null);
 
@@ -46,7 +48,7 @@ class OrderDetailApiTests extends IntegrationTestBase {
         Map<String, Object> product = firstOf(body.get("products"));
         assertThat(((Number) product.get("id")).longValue()).isEqualTo(productId);
         assertThat(new BigDecimal(product.get("price").toString())).isEqualByComparingTo("120000");
-        assertThat(((Number) product.get("stock")).intValue()).isEqualTo(8);
+        assertThat(((Number) product.get("stock")).intValue()).isEqualTo(7);   // 10 - 2 - 1 (đơn chạy trước)
         assertThat((List<?>) body.get("paymentHistory")).hasSize(2);
         assertThat((List<?>) body.get("recommendations")).hasSize(3);
         assertThat((List<?>) body.get("unavailable")).isEmpty();

@@ -69,6 +69,11 @@
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
 		<dependency>
+			<!-- Cache trong bộ nhớ có giới hạn (maximumSize, expireAfterWrite): lịch sử thanh toán của trang chi tiết đơn -->
+			<groupId>com.github.ben-manes.caffeine</groupId>
+			<artifactId>caffeine</artifactId>
+		</dependency>
+		<dependency>
 			<!-- /actuator/health, /actuator/metrics: số đo của pool kết nối (hikaricp.connections.*), JVM, Tomcat -->
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-actuator</artifactId>

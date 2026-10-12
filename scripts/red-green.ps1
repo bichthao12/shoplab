@@ -15,7 +15,7 @@
   -Attempts lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt.
 
   Cần git và Docker (test dựng PostgreSQL bằng Testcontainers), như khi chạy test. Mỗi kịch bản một lượt Maven,
-  cả 16 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
+  cả 19 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu mọi kịch bản xanh với bản sửa và đỏ với bản lỗi; 1 nếu không; 2 nếu không chạy được.
 
 .EXAMPLE
@@ -106,6 +106,18 @@ $all = @(
        Title = 'Trang chi tiết đơn: lời gọi DB quá hạn'
        Bug = 'ngắt luồng đang chờ PostgreSQL: kết nối DB bị đóng'
        Tests = @('OrderDetailDegradedTests#productsQueryTooSlow_returns503WithoutBreakingConnection') }
+    @{ Id = 'view-counter'; Patch = '17-view-counter-hashmap.patch'
+       Title = 'Bộ đếm lượt xem sản phẩm'
+       Bug = 'HashMap trong bean singleton, get rồi put'
+       Tests = @('ProductViewCounterTests#productViewCounter_countsExactly') }
+    @{ Id = 'trace-id'; Patch = '18-trace-id-lost.patch'
+       Title = 'traceId trong log của tác vụ song song'
+       Bug = 'giao việc cho executor, không chép MDC sang luồng mới'
+       Tests = @('TraceIdLoggingTests#orderDetail_logsOfParallelTasksCarryTraceId') }
+    @{ Id = 'payment-cache'; Patch = '19-payment-cache-unbounded.patch'
+       Title = 'Cache lịch sử thanh toán có giới hạn'
+       Bug = 'Map theo orderId không giới hạn, không hết hạn (leak)'
+       Tests = @('PaymentHistoryCacheTests#manyOrders_staysWithinMaximumSize') }
 )
 
 # powershell -File truyền "-Scenario a,b" thành MỘT chuỗi "a,b": tự tách theo dấu phẩy

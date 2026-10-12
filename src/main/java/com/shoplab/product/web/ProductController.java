@@ -3,6 +3,7 @@ package com.shoplab.product.web;
 import com.shoplab.idempotency.IdempotencyService;
 import com.shoplab.product.internal.AdjustStockCommand;
 import com.shoplab.product.internal.ProductService;
+import com.shoplab.product.internal.ProductViewCounter;
 import jakarta.validation.Valid;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
@@ -31,10 +32,12 @@ import java.net.URI;
 public class ProductController {
 
     private final ProductService service;
+    private final ProductViewCounter viewCounter;
     private final IdempotencyService idempotency;
 
-    public ProductController(ProductService service, IdempotencyService idempotency) {
+    public ProductController(ProductService service, ProductViewCounter viewCounter, IdempotencyService idempotency) {
         this.service = service;
+        this.viewCounter = viewCounter;
         this.idempotency = idempotency;
     }
 
@@ -49,10 +52,19 @@ public class ProductController {
         return ResponseEntity.created(location).body(created);
     }
 
-    /** GET /api/products/{id} → 200 hoặc 404 */
+    /** GET /api/products/{id} → 200 hoặc 404. Mỗi lần 200 là một lượt xem (ProductViewCounter). */
     @GetMapping("/{id}")
     public ProductResponse get(@PathVariable Long id) {
-        return ProductResponse.from(service.getById(id));
+        ProductResponse product = ProductResponse.from(service.getById(id));
+        viewCounter.record(id);
+        return product;
+    }
+
+    /** GET /api/products/{id}/views → {"productId": 1, "views": 123}: số lượt xem từ lúc app khởi động; 404 nếu không có sản phẩm */
+    @GetMapping("/{id}/views")
+    public ProductViewsResponse views(@PathVariable Long id) {
+        service.getById(id);
+        return new ProductViewsResponse(id, viewCounter.views(id));
     }
 
     /** GET /api/products?category=ao&page=0&size=20&sort=price,asc */

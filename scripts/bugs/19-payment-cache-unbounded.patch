@@ -1,0 +1,54 @@
+diff --git a/src/main/java/com/shoplab/order/internal/PaymentHistoryCache.java b/src/main/java/com/shoplab/order/internal/PaymentHistoryCache.java
+--- a/src/main/java/com/shoplab/order/internal/PaymentHistoryCache.java
++++ b/src/main/java/com/shoplab/order/internal/PaymentHistoryCache.java
+@@ -1,13 +1,12 @@
+ package com.shoplab.order.internal;
+ 
+-import com.github.benmanes.caffeine.cache.Cache;
+-import com.github.benmanes.caffeine.cache.Caffeine;
+ import io.micrometer.core.instrument.Gauge;
+ import io.micrometer.core.instrument.MeterRegistry;
+-import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
+ import org.springframework.stereotype.Component;
+ 
+ import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.function.Supplier;
+ 
+ /**
+@@ -31,22 +30,17 @@
+ @Component
+ class PaymentHistoryCache {
+ 
+-    private final Cache<Long, List<PaymentEvent>> cache;
++    // BẢN LỖI: Map theo orderId không giới hạn, không hết hạn: mỗi đơn từng được xem nằm lại trong heap mãi mãi (leak)
++    private final Map<Long, List<PaymentEvent>> cache = new ConcurrentHashMap<>();
+ 
+     PaymentHistoryCache(OrderDetailProperties properties, MeterRegistry registry) {
+-        this.cache = Caffeine.newBuilder()
+-                .maximumSize(properties.paymentCacheMaximumSize())
+-                .expireAfterWrite(properties.paymentCacheTtl())
+-                .recordStats()
+-                .build();
+-        CaffeineCacheMetrics.monitor(registry, cache, "orderPaymentHistory");
+         Gauge.builder("order.payment-history.cache.size", this, PaymentHistoryCache::size)
+                 .description("Số đơn đang nằm trong cache lịch sử thanh toán")
+                 .register(registry);
+     }
+ 
+     List<PaymentEvent> get(long orderId, Supplier<List<PaymentEvent>> load) {
+-        List<PaymentEvent> cached = cache.getIfPresent(orderId);
++        List<PaymentEvent> cached = cache.get(orderId);
+         if (cached != null) {
+             return cached;
+         }
+@@ -56,7 +50,6 @@
+     }
+ 
+     long size() {
+-        cache.cleanUp();   // chạy ngay các việc dọn đang chờ (bỏ mục thừa, mục hết hạn) để số đếm đúng
+-        return cache.estimatedSize();
++        return cache.size();
+     }
+ }

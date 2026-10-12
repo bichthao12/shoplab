@@ -612,7 +612,7 @@ Mỗi Spring context của test giữ một pool 10 connection. Testcontainers d
 Mỗi kịch bản có test bảo vệ, và một bản lỗi viết dưới dạng patch trong `scripts/bugs/` (bản lỗi không nằm trong code chính hay code test). Script copy `pom.xml`, `mvnw`, `.mvn`, `src` ra thư mục tạm (không đụng thư mục làm việc), chạy test bảo vệ của mọi kịch bản trên code hiện tại (mong đợi **xanh**), rồi lần lượt áp từng patch, chạy test bảo vệ của kịch bản đó (mong đợi **đỏ**) và gỡ patch.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 16 kịch bản, ~5–10 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 19 kịch bản, ~5–10 phút
 powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadlock,self-invocation # chỉ vài kịch bản
 ```
 
@@ -634,6 +634,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `cursor-ties` | `14`: cursor chỉ so `created_at < ?`, không so `id` | `OrderCursorPaginationTests#ordersWithSameCreatedAt_acrossPageBoundary` | 10 đơn, 6 đơn cùng `created_at`, trang 4 đơn: đi hết các trang chỉ được **8 đơn**, sót 2 đơn trùng `created_at` với đơn cuối trang 2 |
 | `order-detail-serial` | `15`: trang chi tiết đơn gọi lần lượt 4 nguồn trên luồng của request | `OrderDetailApiTests#detail_loadsFourSourcesInParallel` | `total` **725,6 ms** (tổng các nguồn) thay vì khoảng 400 ms |
 | `order-detail-interrupt` | `16`: lời gọi DB bắt buộc quá hạn thì ngắt luồng (như nguồn phụ) | `OrderDetailDegradedTests#productsQueryTooSlow_returns503WithoutBreakingConnection` | câu `SELECT 1 FROM pg_sleep(1)` hỏng giữa chừng: `An I/O error occurred while sending to the backend`, kết nối DB bị đóng |
+| `view-counter` | `17`: bộ đếm lượt xem là `HashMap` trong bean singleton, `put(id, getOrDefault(id, 0) + 1)` | `ProductViewCounterTests#productViewCounter_countsExactly` | 16 luồng × 100.000 lượt = 1.600.000, chỉ đếm được vài trăm nghìn (vd **286.621**, mỗi lần chạy một khác) |
+| `trace-id` | `18`: giao việc cho executor mà không chép MDC | `TraceIdLoggingTests#orderDetail_logsOfParallelTasksCarryTraceId` | log của luồng `order-detail-N` in `[]` thay vì traceId |
+| `payment-cache` | `19`: cache lịch sử thanh toán là `ConcurrentHashMap` theo orderId, không giới hạn, không hết hạn | `PaymentHistoryCacheTests#manyOrders_staysWithinMaximumSize` | xem 10.000 đơn: cache giữ **10.000** mục thay vì tối đa 100 |
 
 ```
 == Ma trận
@@ -646,8 +649,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
    cursor-ties              XANH         ĐỎ
    order-detail-serial      XANH         ĐỎ
    order-detail-interrupt   XANH         ĐỎ
+   view-counter             XANH         ĐỎ
+   trace-id                 XANH         ĐỎ
+   payment-cache            XANH         ĐỎ
 
-ĐÚNG (16/16): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
+ĐÚNG (19/19): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
 ```
 
 - **Kịch bản race** (`oversell`, `stock-adjustment`): không ép thứ tự thì lỗi không phải lần nào cũng lộ (bản ngây thơ bán vượt: 5 lần chạy cho 6, 10, 9, **1**, 10 đơn). Bản lỗi được chạy tối đa `-Attempts` lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt; script in ra lần thứ mấy thì đỏ.
@@ -667,6 +673,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 - **Nhập / trừ tồn kho cùng lúc với đơn hàng, gửi lại cùng key:** `scripts\stock-adjustment.ps1` (xem mục *Điều chỉnh tồn kho*).
 - **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).
 - **Đếm số câu SQL của danh sách 100 đơn kèm dòng hàng (N+1):** `scripts\n-plus-one.ps1` (xem mục *N+1*).
+- **Bắn song song vào bộ đếm lượt xem sản phẩm:** `scripts\view-counter.ps1` (`-Bug`: chạy bản `HashMap` để thấy đếm sai).
+- **traceId trong log của tác vụ song song:** `scripts\trace-id.ps1` (tự chạy app; `-Bug`: bản không chép MDC).
+- **Memory leak, heap sau 20 phút chạy tải:** `scripts\memory-leak.ps1` (tự chạy app, cần JDK; xem mục *Race condition, MDC và memory leak*).
 - **Tải k6 lên trang chi tiết đơn, luồng thường / luồng ảo, pool kết nối nhỏ:** `scripts\load-test.ps1` (tự chạy app, cần Docker; xem mục *Virtual thread và connection pool*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
@@ -693,6 +702,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `spring.datasource.hikari.maximum-pool-size` | `10` | Số kết nối DB tối đa (bằng mặc định của HikariCP, ghi ra cho rõ). Hết kết nối thì request xếp hàng chờ (`hikaricp.connections.pending`), quá 30 giây thì lỗi |
 | `management.endpoints.web.exposure.include` | `health,metrics` | Mở `/actuator/health`, `/actuator/metrics/{tên}` (vd `hikaricp.connections.pending`). App chưa có xác thực: lên môi trường thật thì phải chặn hoặc tách sang cổng riêng (`management.server.port`) |
 | `server.tomcat.mbeanregistry.enabled` | `true` | Có số đo luồng Tomcat (`tomcat.threads.busy`, `tomcat.threads.config.max`) trong `/actuator/metrics`. Khi chạy trên luồng ảo, `tomcat.threads.busy` là `-1` (không có pool luồng) |
+| `logging.pattern.correlation` | `[%X{traceId:-}]\u0020` | In traceId của request (MDC, `common.web.TraceIdFilter`, header `X-Trace-Id`) trên mọi dòng log, ngay trước tên logger; dòng không thuộc request nào in `[]` |
+| `shoplab.order-detail.payment-cache-maximum-size`, `payment-cache-ttl` | `10000`, `1m` | Cache lịch sử thanh toán theo orderId (`PaymentHistoryCache`, Caffeine): tối đa 10.000 đơn, mỗi mục sống 1 phút. Bỏ giới hạn là leak |
 | `shoplab.order-detail.payment-history-delay`, `recommendations-delay` | `300ms`, `400ms` | Độ trễ của hai nguồn giả lập (đứng thay cho cổng thanh toán, dịch vụ gợi ý) trên trang chi tiết đơn |
 | `shoplab.order-detail.required-timeout` | `2s` | Hạn (`orTimeout`) của mỗi lời gọi bắt buộc của trang chi tiết đơn (đơn, sản phẩm), tính từ lúc lời gọi bắt đầu: quá hạn thì trang trả 503 `order-detail-timeout`; lời gọi DB không bị ngắt, chạy xong rồi trả kết nối về pool |
 | `shoplab.order-detail.optional-timeout` | `1s` | Hạn của mỗi lời gọi phụ (lịch sử thanh toán, gợi ý): quá hạn thì lời gọi bị ngắt, trang trả về không có phần đó (`unavailable`) |
@@ -712,6 +723,7 @@ Mỗi dòng có thời điểm (ms) và tên luồng, nên lọc theo luồng l�
 04:12:01.558 [handler-7] TransactionLogging : COMMIT   DefaultIdempotencyService.execute
 ```
 
+- **traceId:** mỗi dòng có thêm `[traceId]` sau tên luồng, vd `[omcat-handler-7] [3f9c0a1b2c3d4e5f] ...TransactionLogging : BEGIN ...` (ví dụ trên lược đi cho gọn). Lọc theo traceId ra trọn một request, kể cả các dòng của luồng khác mà request giao việc cho (xem mục *Race condition, MDC và memory leak*).
 - **Tên luồng:** mỗi request chạy trên một luồng ảo mới tên `tomcat-handler-N` (log cắt còn 15 ký tự cuối: `omcat-handler-7`, ví dụ trên viết gọn `handler-7`). N tăng theo từng request, không dùng lại, nên lọc theo tên luồng ra đúng một request. Các nguồn của trang chi tiết đơn chạy trên luồng riêng `order-detail-N`. Chạy app với `--spring.threads.virtual.enabled=false` thì là luồng thường `nio-8080-exec-N`, dùng lại cho nhiều request (xem mục *Virtual thread và connection pool*).
 - `COMMIT` / `ROLLBACK` được ghi **sau** khi connection đã commit / rollback xong, nên mọi câu đứng trước nó trên cùng luồng đã nằm trong DB (khoá cũng được nhả lúc này).
 - Chỉ transaction **mới** có dòng `BEGIN` / `COMMIT`. Service hay repository gọi bên trong (vd `UserDirectory`, `ProductInventory` khi đặt hàng) chạy chung transaction ngoài nên không có dòng riêng.
@@ -733,7 +745,8 @@ Mọi request có body dùng `Content-Type: application/json`. Mọi response l�
 | Method | Đường dẫn | Thành công | Lỗi có thể gặp |
 |---|---|---|---|
 | `POST` | `/api/products` | **201** + header `Location` | 400 dữ liệu không hợp lệ · 409 trùng SKU |
-| `GET` | `/api/products/{id}` | **200** | 400 `id` sai kiểu · 404 không tồn tại |
+| `GET` | `/api/products/{id}` | **200**, tính một lượt xem | 400 `id` sai kiểu · 404 không tồn tại |
+| `GET` | `/api/products/{id}/views` | **200** `{"productId": 1, "views": 123}`: số lượt xem từ lúc app khởi động (đếm trong bộ nhớ, xem mục *Race condition, MDC và memory leak*) | 404 |
 | `GET` | `/api/products?category=AO&page=0&size=20&sort=price,desc` | **200** (có phân trang) | 400 `sort` theo trường không tồn tại |
 | `PATCH` | `/api/products/{id}` | **200** (chỉ sửa trường được gửi, trừ `stock`; bắt buộc gửi `version` đã đọc) | 400 dữ liệu không hợp lệ / thiếu `version` / có `stock` · 404 · 409 trùng SKU / sản phẩm đã bị sửa sau lần đọc |
 | `POST` | `/api/products/{id}/stock-adjustments` (bắt buộc header `Idempotency-Key`) | **200** với sản phẩm sau khi cộng / trừ tồn kho | 400 · 404 · 409 trừ quá tồn kho · 422 key đã dùng với `delta` khác |
@@ -985,7 +998,7 @@ Trang chi tiết gom 4 nguồn:
 |---|---|---|
 | `order` | đơn kèm dòng hàng (DB, `OrderService.getById`) | id đơn |
 | `products` | thông tin **hiện tại** của các sản phẩm trong đơn: giá, tồn kho, đang bán (module product, API mới `ProductCatalog`) | `productId` của các dòng hàng, tức phải có đơn trước |
-| `paymentHistory` | lịch sử thanh toán, **giả lập** cổng thanh toán: chờ 300 ms | id đơn |
+| `paymentHistory` | lịch sử thanh toán, **giả lập** cổng thanh toán: chờ 300 ms. Cache theo orderId 1 phút (`PaymentHistoryCache`): gọi lại cùng đơn thì khoảng 0 ms | id đơn |
 | `recommendations` | gợi ý, **giả lập** dịch vụ gợi ý: chờ 400 ms | id đơn |
 
 Gọi lần lượt thì trang mất tổng các nguồn, khoảng 720 ms. `OrderDetailService` chạy song song ba nhánh: (đơn rồi sản phẩm) ‖ lịch sử thanh toán ‖ gợi ý. Trang mất khoảng thời gian nhánh chậm nhất, khoảng 400 ms. Sản phẩm phải chờ đơn, vì module product không đọc bảng của module order (`DatabaseModularityTests`), nên chỉ tìm được sản phẩm theo id lấy từ dòng hàng.
@@ -1008,18 +1021,18 @@ Server-Timing: order;dur=6.9, products;dur=7.4, paymentHistory;dur=300.7, recomm
  "unavailable": []}
 ```
 
-**Gọi API** (`scripts/order-detail.ps1`, cần app đang chạy): script tạo một đơn qua API, gọi trang chi tiết 5 lần, rồi so trung vị `total` (song song) với tổng 4 nguồn (thời gian nếu gọi lần lượt). Script cũng gọi một đơn không tồn tại.
+**Gọi API** (`scripts/order-detail.ps1`, cần app đang chạy): script tạo 6 đơn qua API, gọi trang chi tiết mỗi đơn một lần (một lần cho nóng máy, 5 lần đo; mỗi lần một đơn khác vì lịch sử thanh toán được cache theo orderId), rồi so trung vị `total` (song song) với tổng 4 nguồn (thời gian nếu gọi lần lượt). Script cũng gọi một đơn không tồn tại.
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\order-detail.ps1          # -OrderId 123 để xem đơn có sẵn, -Runs 10
 ```
 ```
-Lần order products paymentHistory recommendations Tổng 4 nguồn (lần lượt) total (song song) Client chờ
-  1 12,8  8,4      300,9          400,7           722,8                   401,2             406,6
-  2 6,9   7,4      300,7          400,6           715,6                   401,1             406,5
+Lần     Đơn order products paymentHistory recommendations Tổng 4 nguồn (lần lượt) total (song song) Client chờ
+  1 2000102 7,4   10,5     300,9          400,7           719,5                   401,7             409,1
+  2 2000103 6,1   7,7      300,9          400,7           715,4                   401,3             409,4
   ...
-Trung vị: gọi lần lượt sẽ mất 718,6 ms (tổng 4 nguồn); song song mất 401,2 ms (client chờ 406,6 ms), nhanh hơn 317,4 ms
-GET /api/orders/999999999/detail -> 404 sau 34,0 ms (không chờ hai nguồn chậm 300 / 400 ms)
-ĐÚNG: trang mất 401,2 ms, bằng nguồn chậm nhất chứ không phải tổng các nguồn (718,6 ms); đơn không tồn tại trả 404 ngay
+Trung vị: gọi lần lượt sẽ mất 719,5 ms (tổng 4 nguồn); song song mất 401,6 ms (client chờ 409,4 ms), nhanh hơn 317,9 ms
+GET /api/orders/999999999/detail -> 404 sau 33,4 ms (không chờ hai nguồn chậm 300 / 400 ms)
+ĐÚNG: trang mất 401,6 ms, bằng nguồn chậm nhất chứ không phải tổng các nguồn (719,5 ms); đơn không tồn tại trả 404 ngay
 ```
 
 **Thử tay hạn chờ:** chạy app với hạn ngắn hơn nguồn giả lập, rồi gọi trang chi tiết của một đơn có sẵn.
@@ -1119,6 +1132,107 @@ curl.exe -s http://localhost:8080/actuator/metrics/hikaricp.connections.acquire 
 **Test:** `VirtualThreadAndPoolTests`:
 - request chạy trên luồng ảo: log `BEGIN` có tên luồng `...handler-N`, không phải `...-exec-N`. Chạy test với `-Dspring.threads.virtual.enabled=false` thì đỏ;
 - `/actuator/health` UP, đọc được `hikaricp.connections.pending` và `hikaricp.connections.max` = 10.
+
+#### Race condition, MDC và memory leak
+
+##### Bộ đếm lượt xem sản phẩm (`ProductViewCounter`)
+
+Mỗi `GET /api/products/{id}` thành công là một lượt xem, đếm trong bộ nhớ, đọc ở `GET /api/products/{id}/views`. Bộ đếm là bean singleton: mọi request, trên mọi luồng, cùng ghi vào một map.
+
+| Cách đếm | 16 luồng × 100.000 lượt cùng một sản phẩm (`ProductViewCounterTests`) |
+|---|---|
+| `HashMap`: `put(id, getOrDefault(id, 0) + 1)` (bản ngây thơ, chỉ có trong test và patch 17) | đếm được **286.621 / 1.600.000** (mất 82 %; lần khác 363.164), 680 ms |
+| `ConcurrentHashMap.merge(id, 1L, Long::sum)` | đúng 1.600.000, 1.016 ms |
+| `ConcurrentHashMap` + `LongAdder` (app dùng) | đúng 1.600.000, 407 ms |
+
+- **`HashMap` sai vì đọc rồi ghi là hai bước.** Hai luồng cùng đọc số 7 thì cả hai ghi 8, mất một lượt.
+- **`merge` đúng:** đọc, cộng, ghi nguyên tử theo từng khoá. Nhưng mọi luồng xem cùng một sản phẩm phải tranh nhau khoá của đúng một ô.
+- **`LongAdder` đúng và nhanh nhất khi nhiều luồng cùng tăng một khoá.** `increment()` không khoá: mỗi luồng cộng vào ô riêng, `sum()` cộng các ô lúc đọc.
+- **Map theo sản phẩm không lớn mãi:** số sản phẩm có hạn. Khác với map theo orderId ở phần leak bên dưới.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\view-counter.ps1        # cần app đang chạy: 2.000 GET cùng lúc → đếm đủ 2.000
+powershell -ExecutionPolicy Bypass -File .\scripts\view-counter.ps1 -Bug   # tự build bản HashMap, chạy ở cổng 8081: mất vài chục lượt
+```
+
+Qua HTTP, mỗi request phải đọc DB vài ms, nên ít khi hai request rơi đúng vào khoảng giữa `get` và `put`. Đã chạy ở đây với bản `HashMap`: mất 27 / 2.000 và 34 / 10.000 lượt. Bản app: đủ 10.000 / 10.000.
+
+##### traceId và MDC (`TraceIdFilter`, `MdcPropagation`)
+
+Mỗi request một traceId, để lọc ra mọi dòng log của đúng request đó:
+- **Lấy từ header `X-Trace-Id`** nếu client gửi và hợp lệ (chữ, số, `-`, `_`, tối đa 64 ký tự). Không thì app tự tạo 16 ký tự hex.
+- **Đặt vào MDC** (khoá `traceId`). Log pattern in nó trên mọi dòng (`logging.pattern.correlation`).
+- **Trả lại ở header `X-Trace-Id`.**
+
+MDC là `ThreadLocal`. Trang chi tiết đơn giao các nguồn cho luồng `order-detail-N`, nên log của các luồng đó (SQL, `BEGIN` / `COMMIT`, "bị huỷ") **mất traceId** nếu không chép MDC sang. `MdcPropagation.withCurrentMdc` làm việc này:
+- chụp MDC lúc giao việc;
+- đặt vào luồng chạy việc trước khi chạy;
+- trả MDC cũ của luồng đó lại sau khi xong, để luồng của pool không mang traceId của request trước sang request sau.
+
+Một chỗ dễ sai: `complete()` của `CompletableFuture` cũng phải nằm trong phạm vi MDC. Nó chạy **ngay trên luồng đó** các bước nối sau: ở đây `thenCompose` giao lời gọi sản phẩm, và bước đó chụp MDC lúc giao việc. Bản đầu tôi viết trả MDC trước khi `complete()`, nên log của lời gọi sản phẩm vẫn mất traceId.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\trace-id.ps1        # tự chạy app ở cổng 8082, gọi trang chi tiết với X-Trace-Id, in log theo luồng
+powershell -ExecutionPolicy Bypass -File .\scripts\trace-id.ps1 -Bug   # bản không chép MDC (patch 18)
+```
+```
+Giờ          Luồng          traceId         Nội dung
+10:28:05.322 order-detail-0 demo-1791800871 BEGIN    OrderService.getById (read-only)
+10:28:05.356 order-detail-0 demo-1791800871 select distinct o1_0.id,o1_0.created_at,...
+10:28:05.382 order-detail-3 demo-1791800871 BEGIN    DefaultProductCatalog.findByIds (read-only)
+...
+Dòng của luồng order-detail-N: 8, thiếu traceId: 0         (bản lỗi: 8, thiếu traceId: 8, cột traceId là "(trống)")
+```
+
+##### Memory leak: cache lịch sử thanh toán theo orderId (`PaymentHistoryCache`)
+
+Cổng thanh toán (giả lập) chậm 300 ms, nên lịch sử thanh toán được cache theo orderId.
+- **Bản lỗi (patch 19):** `ConcurrentHashMap` không giới hạn, không hết hạn. Mỗi đơn từng được xem nằm lại trong heap mãi mãi.
+- **Bản sửa:** Caffeine, `maximumSize` 10.000 (đầy thì bỏ bớt mục ít dùng) và `expireAfterWrite` 1 phút (lịch sử thanh toán thay đổi, không giữ bản cũ mãi).
+- **Không dùng `cache.get(orderId, loader)` hay `computeIfAbsent`:** hàm nạp 300 ms sẽ chạy bên trong khoá `synchronized` của `ConcurrentHashMap`. Java 21 ghim luồng ảo đang chờ trong `synchronized` vào luồng hệ điều hành, nên vài chục request cùng nạp là chiếm hết. Code đọc trước, nạp ở ngoài khoá, rồi mới ghi.
+
+`scripts/memory-leak.ps1` chạy từng bản (TRƯỚC rồi SAU) trên một app riêng:
+- k6 1 phút, lặp `-Minutes` lần (mặc định 20). 200 người dùng ảo gọi trang chi tiết của đơn **ngẫu nhiên trong mọi đơn** (`ORDER_PICK=all`), nên gần như mỗi request là một đơn mới.
+- Sau mỗi phút: ép full GC (`jcmd <pid> GC.run`), rồi đọc heap đang dùng (`jvm.memory.used`, `area=heap`) và số đơn trong cache (`order.payment-history.cache.size`).
+- Cuối mỗi bản: 8 lớp chiếm nhiều heap nhất (`jcmd GC.class_histogram`). Bản TRƯỚC thêm heap dump `target/memory-leak/before.hprof` (`jcmd <pid> GC.heap_dump ...`).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\memory-leak.ps1               # 2 bản × 20 phút, khoảng 45 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\memory-leak.ps1 -Minutes 3    # chạy thử nhanh
+```
+
+Kết quả (máy 4 CPU, 2 triệu đơn, 200 người dùng ảo, khoảng 494 req/s; heap sau full GC, MB; cache: số đơn trong cache):
+
+| Phút | TRƯỚC heap | TRƯỚC cache | SAU heap | SAU cache |
+|---|---|---|---|---|
+| 0 (vừa khởi động) | 34,9 | 0 | 34,9 | 0 |
+| 1 | 64,3 | 28.508 | 59,6 | 10.000 |
+| 5 | 98,6 | 142.770 | 60,2 | 9.998 |
+| 10 | 138,1 | 276.213 | 60,1 | 9.626 |
+| 15 | 174,6 | 400.099 | 60,3 | 9.740 |
+| 20 | **206,8** | 515.229 | **60,1** | 9.968 |
+
+- **Thẻ "Heap sau 20 phút chạy tải": TRƯỚC 206,8 MB, SAU 60,1 MB.**
+  - TRƯỚC tăng đều 7,5 MB mỗi phút, khoảng 290 byte cho mỗi đơn được xem (một `Long`, một `ConcurrentHashMap$Node`, một `List12`, hai `PaymentEvent`, mỗi `PaymentEvent` một `String` và một `Instant`). Cứ chạy là cứ tăng, tới lúc hết heap (`OutOfMemoryError`).
+  - SAU đi ngang từ phút 1: cache đầy 10.000 đơn thì Caffeine bỏ bớt mục ít dùng.
+- **`GC.class_histogram` của bản TRƯỚC sau 20 phút:** 1.030.458 `PaymentEvent`, 1.030.480 `Instant`, 589.300 `ConcurrentHashMap$Node`, 515.561 `List12`, 515.499 `Long`. Đúng bằng 2 sự kiện thanh toán cho mỗi đơn trong cache (515.229 đơn). Bản SAU không có lớp nào của app trong 8 lớp đầu.
+- **Heap dump của bản TRƯỚC:** 322 MB (dump ghi cả đối tượng chưa dọn, nên lớn hơn heap sau GC).
+- **Cả lượt chạy (build, 2 bản × 20 phút) hết khoảng 42 phút.**
+
+**Tìm leak trong heap dump bằng Eclipse MAT** (File → Open Heap Dump → `target/memory-leak/before.hprof`):
+- **Leak Suspects Report:** nghi phạm số 1 là `com.shoplab.order.internal.PaymentHistoryCache`, giữ một `java.util.concurrent.ConcurrentHashMap` chiếm phần lớn heap đang dùng.
+- **Dominator Tree:** `PaymentHistoryCache` → `ConcurrentHashMap` → `Node[]` → hàng trăm nghìn `ImmutableCollections$List12` → `PaymentEvent`.
+- **Không có MAT:** `GC.class_histogram` cũng chỉ thẳng ra thủ phạm, với `PaymentEvent`, `ConcurrentHashMap$Node`, `Instant` mỗi loại hàng trăm nghìn đối tượng, tăng theo số đơn đã xem.
+
+**Test:**
+- `ProductViewCounterTests`: HashMap đếm thiếu; `merge` và `ProductViewCounter` đếm đúng.
+- `ProductViewsApiTests`: 300 GET cùng lúc → `views = 300`; 404 cho sản phẩm không tồn tại.
+- `TraceIdLoggingTests`:
+  - mọi dòng log của luồng `order-detail-N` có traceId của request, kể cả lời gọi sản phẩm;
+  - không gửi header thì app tự tạo traceId;
+  - header không hợp lệ thì bị thay.
+- `PaymentHistoryCacheTests`: lần hai lấy từ cache; xem 10.000 đơn mà cache giữ tối đa 100 (maximumSize của test).
+- Bản lỗi: patch 17, 18, 19 (kịch bản `view-counter`, `trace-id`, `payment-cache` của `red-green.ps1`).
 
 ### Người dùng – `/api/users`
 
@@ -1984,6 +2098,7 @@ src/test/java/com/shoplab/
 ├── Concurrently.java                         chạy N tác vụ cùng lúc (virtual thread + CountDownLatch)
 ├── SqlLoggingTests.java                      log SQL và BEGIN / COMMIT / ROLLBACK in đúng thứ tự
 ├── VirtualThreadAndPoolTests.java            request chạy trên luồng ảo; Actuator mở số đo pool kết nối
+├── common/web/         TraceIdLoggingTests (traceId trên log của mọi luồng)
 ├── ModularityTests.java                      kiểm tra cấu trúc module, sinh tài liệu module
 ├── DatabaseModularityTests.java              bảng thuộc module nào, không có khoá ngoại chéo module
 ├── common/web/         GlobalExceptionHandlerTests
