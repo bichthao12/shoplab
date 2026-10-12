@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
   Tải k6 lên trang chi tiết đơn (GET /api/orders/{id}/detail): luồng thường so với luồng ảo (virtual thread), rồi pool
-  kết nối DB còn 5. In sẵn số cho sổ đo (dòng 2: thông lượng req/s; dòng 3: pool 5 kết nối).
+  kết nối DB còn 5. In sẵn số cho sổ đo (dòng 2: thông lượng req/s; dòng 3: p95 ms, cùng hai lượt).
 
 .DESCRIPTION
   Gọi API qua k6 (không chạy test, không chạy SQL). Script tự build app (Maven) rồi chạy app bằng java -jar, mỗi cấu
@@ -539,13 +539,13 @@ $platformRef = $results | Where-Object { $_.Label -eq "platform-$ReferenceVus" }
 $virtualRef = $results | Where-Object { $_.Label -eq "virtual-$ReferenceVus" }
 
 if ($platform -and $virtualRun) {
-    Write-Host ("Dòng 2, thông lượng dưới tải k6 (req/s, {0} VU):  TRƯỚC {1}   SAU {2}" -f $Vus,
+    Write-Host ("Dòng 2, thông lượng dưới tải k6 (req/s, {0} VU):   TRƯỚC {1}   SAU {2}" -f $Vus,
                 (Format-Num $platform.Rps '0.0'), (Format-Num $virtualRun.Rps '0.0')) -ForegroundColor Cyan
-    Write-Host ("        p95 cùng lượt (ms):                     TRƯỚC {0}   SAU {1}" -f
+    Write-Host ("Dòng 3, p95 dưới tải k6 (ms, cùng hai lượt trên):  TRƯỚC {0}   SAU {1}" -f
                 (Format-Num $platform.P95 '0.0'), (Format-Num $virtualRun.P95 '0.0')) -ForegroundColor Cyan
 }
 if ($pool5) {
-    Write-Host ("Dòng 3, pool {0} kết nối (luồng ảo, {1} VU): {2} req/s, p95 {3} ms; pending lớn nhất {4}, TB {5}; chờ lấy kết nối TB {6} ms" -f
+    Write-Host ("Pool {0} kết nối (luồng ảo, {1} VU; không có dòng riêng trong sổ): {2} req/s, p95 {3} ms; pending lớn nhất {4}, TB {5}; chờ lấy kết nối TB {6} ms" -f
                 $pool5.Pool, $Vus, (Format-Num $pool5.Rps '0.0'), (Format-Num $pool5.P95 '0.0'), (Format-Num $pool5.PendingMax '0'),
                 (Format-Num $pool5.PendingAvg '0.0'), (Format-Num $pool5.WaitMs '0.0')) -ForegroundColor Cyan
 }
@@ -577,6 +577,19 @@ if ($platform -and $virtualRun) {
         if ($null -ne $virtualRun.WaitMs -and $virtualRun.WaitMs -ge 50) {
             Write-Host ("  - Chờ lấy kết nối trung bình {0} ms: nút thắt pool kết nối." -f (Format-Num $virtualRun.WaitMs '0.0'))
         }
+    }
+    # Thẻ p95: giảm khi luồng thường bị dùng hết và request phải xếp hàng chờ luồng
+    $exhausted = ($platform.BusyMax -ge 200) -and ($Vus -gt 200)
+    if ($virtualRun.P95 -le 0.9 * $platform.P95) {
+        Write-Host ("p95 giảm {0} → {1} ms: luồng thường bị dùng hết (Tomcat bận {2} / 200), request phải xếp hàng chờ luồng, đúng như thẻ." -f
+                    (Format-Num $platform.P95 '0.0'), (Format-Num $virtualRun.P95 '0.0'), (Format-Num $platform.BusyMax '0')) -ForegroundColor Green
+    } elseif (-not $exhausted) {
+        Write-Host ("p95 không giảm ({0} → {1} ms), đúng như thẻ: thẻ chỉ mong giảm khi luồng thường bị dùng hết. Tomcat bận lớn nhất {2} / 200," -f
+                    (Format-Num $platform.P95 '0.0'), (Format-Num $virtualRun.P95 '0.0'), (Format-Num $platform.BusyMax '0')) -ForegroundColor Yellow
+        Write-Host ("  nhưng {0} người dùng ảo không vượt 200 luồng nên không request nào xếp hàng chờ luồng (xem phần tham khảo)." -f $Vus) -ForegroundColor Yellow
+    } else {
+        Write-Host ("p95 không giảm ({0} → {1} ms) dù luồng thường đã bị dùng hết: xem CPU, chờ kết nối ở bảng tài nguyên." -f
+                    (Format-Num $platform.P95 '0.0'), (Format-Num $virtualRun.P95 '0.0')) -ForegroundColor Yellow
     }
     if ($platformRef -and $virtualRef) {
         Write-Host ("Tham khảo, {0} người dùng ảo: luồng thường {1} req/s, p95 {2} ms; luồng ảo {3} req/s, p95 {4} ms (×{5})." -f

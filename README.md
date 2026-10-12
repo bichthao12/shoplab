@@ -1094,10 +1094,13 @@ Kết quả (máy 4 CPU, 2 triệu đơn; ms là thời gian k6 chờ):
 | `platform-400` (tham khảo) | 400 | 489,6 | 809,1 | 837,6 | 1020,1 | 0 | 200 / 200 | 226 | 21 % | 3,1 / 47 | 1,4 ms |
 | `virtual-400` (tham khảo) | 400 | **971,8** | 402,4 | 414,0 | 438,6 | 0 | – | 25 | 30 % | 3,5 / 21 | 1,8 ms |
 
+**Số cho sổ đo** (cùng hai lượt `platform`, `virtual`, 200 VU): dòng 2 *Thông lượng dưới tải k6* là cột req/s, dòng 3 *p95 dưới tải k6* là cột p95. Script in sẵn hai dòng `Dòng 2, ...`, `Dòng 3, ...`. Lượt `pool5` không có dòng riêng trong sổ.
+
 - **200 VU: luồng ảo không tăng thông lượng** (493,8 → 494,2 req/s). Thẻ ghi "không tăng thì nút thắt nằm ở connection pool hoặc CPU", nhưng ở đây cả hai đều không phải: CPU của app khoảng 25 %, chờ kết nối dưới 1 ms. Nút thắt là chính lượng tải:
   - k6 chạy kiểu đóng: mỗi VU chờ xong mới gọi tiếp, nên tối đa 200 / 0,402 s ≈ 498 req/s. Cả hai cách đều chạm trần này.
   - 200 VU vừa bằng 200 luồng của Tomcat. Luồng Tomcat bận 199 / 200, nhưng không request nào phải chờ luồng.
   - Luồng Tomcat chỉ ngồi chờ `join()`. Việc chờ thật (300 / 400 ms) đã chạy trên luồng ảo của `orderDetailExecutor` từ trước (mục *Trang chi tiết đơn*).
+- **200 VU: p95 cũng không giảm** (408,7 → 407,6 ms). Thẻ chỉ mong p95 giảm khi luồng thường bị dùng hết và request phải xếp hàng chờ luồng. Ở 200 VU, Tomcat bận lớn nhất 200 / 200 nhưng không request nào phải chờ luồng.
 - **400 VU: luồng ảo gấp đôi.** Luồng thường chỉ chạy được 200 request cùng lúc (bận 200 / 200), nửa còn lại xếp hàng chờ luồng. Thông lượng vì vậy đứng ở khoảng 490 req/s, p95 lên 837,6 ms (400 ms xử lý cộng khoảng 400 ms chờ luồng). Với luồng ảo, mỗi request một luồng: 971,8 req/s, p95 vẫn 414 ms. Đây là trường hợp thẻ nói tới: request chủ yếu chờ I/O, và số request đồng thời vượt số luồng.
 - **Luồng hệ điều hành:** chạy luồng thường, JVM có tới 226 luồng; chạy luồng ảo chỉ 25. Luồng ảo không tính vào `jvm.threads.*`; khi đang chờ I/O, nó không giữ luồng hệ điều hành nào.
 - **Pool 5 kết nối: request có xếp hàng chờ kết nối, nhưng trang không chậm hơn.**
