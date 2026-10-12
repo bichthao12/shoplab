@@ -1,0 +1,44 @@
+diff --git a/src/main/java/com/shoplab/order/internal/OrderDetailService.java b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
+index d67432a..b6143ef 100644
+--- a/src/main/java/com/shoplab/order/internal/OrderDetailService.java
++++ b/src/main/java/com/shoplab/order/internal/OrderDetailService.java
+@@ -62,32 +62,14 @@ public class OrderDetailService {
+         long started = System.nanoTime();
+         Map<String, Duration> timings = new ConcurrentHashMap<>();
+ 
+-        // Bắt đầu cả ba nhánh ngay, không chờ nhau
+-        CompletableFuture<Order> order = submit("order", timings, () -> orders.getById(orderId));
+-        CompletableFuture<List<ProductInfo>> products = order.thenApply(o -> timed("products", timings,
+-                () -> catalog.findByIds(o.getItems().stream().map(OrderItem::getProductId).distinct().toList())));
+-        CompletableFuture<List<PaymentEvent>> payments = submit("paymentHistory", timings,
+-                () -> paymentHistory.findByOrderId(orderId));
+-        CompletableFuture<List<Recommendation>> suggestions = submit("recommendations", timings,
+-                () -> recommendations.forOrder(orderId));
+-
+-        // Nhánh bắt buộc
+-        Order loadedOrder;
+-        List<ProductInfo> loadedProducts;
+-        try {
+-            loadedOrder = order.join();
+-            loadedProducts = products.join();
+-        } catch (CompletionException ex) {
+-            payments.cancel(true);
+-            suggestions.cancel(true);
+-            throw unwrap(ex);
+-        }
+-
+-        // Hai nhánh phụ: chờ tới hết hạn tính từ đầu request
+-        long deadline = started + optionalTimeout.toNanos();
++        // BẢN LỖI: gọi lần lượt từng nguồn trên luồng của request, nguồn sau chờ nguồn trước xong: cả trang mất tổng
++        // thời gian các nguồn (khoảng 710 ms) thay vì nguồn chậm nhất (khoảng 400 ms)
++        Order loadedOrder = timed("order", timings, () -> orders.getById(orderId));
++        List<ProductInfo> loadedProducts = timed("products", timings, () -> catalog.findByIds(
++                loadedOrder.getItems().stream().map(OrderItem::getProductId).distinct().toList()));
++        List<PaymentEvent> loadedPayments = timed("paymentHistory", timings, () -> paymentHistory.findByOrderId(orderId));
++        List<Recommendation> loadedSuggestions = timed("recommendations", timings, () -> recommendations.forOrder(orderId));
+         List<String> unavailable = new ArrayList<>();
+-        List<PaymentEvent> loadedPayments = awaitOptional("paymentHistory", payments, deadline, unavailable);
+-        List<Recommendation> loadedSuggestions = awaitOptional("recommendations", suggestions, deadline, unavailable);
+ 
+         Map<String, Duration> ordered = new LinkedHashMap<>();
+         for (String source : List.of("order", "products", "paymentHistory", "recommendations")) {

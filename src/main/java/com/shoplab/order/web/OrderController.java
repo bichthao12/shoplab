@@ -2,6 +2,8 @@ package com.shoplab.order.web;
 
 import com.shoplab.idempotency.IdempotencyService;
 import com.shoplab.order.internal.CreateOrderCommand;
+import com.shoplab.order.internal.OrderDetail;
+import com.shoplab.order.internal.OrderDetailService;
 import com.shoplab.order.internal.OrderPosition;
 import com.shoplab.order.internal.OrderService;
 import jakarta.validation.Valid;
@@ -24,6 +26,8 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import java.net.URI;
+import java.util.Locale;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/orders")
@@ -32,10 +36,13 @@ public class OrderController {
     static final int MAX_PAGE_SIZE = 100;
 
     private final OrderService orderService;
+    private final OrderDetailService orderDetailService;
     private final IdempotencyService idempotency;
 
-    public OrderController(OrderService orderService, IdempotencyService idempotency) {
+    public OrderController(OrderService orderService, OrderDetailService orderDetailService,
+                           IdempotencyService idempotency) {
         this.orderService = orderService;
+        this.orderDetailService = orderDetailService;
         this.idempotency = idempotency;
     }
 
@@ -68,6 +75,22 @@ public class OrderController {
     @GetMapping("/{id}")
     public OrderResponse get(@PathVariable Long id) {
         return OrderResponse.from(orderService.getById(id));
+    }
+
+    /**
+     * GET /api/orders/{id}/detail → trang chi tiết đơn, gom 4 nguồn chạy song song (OrderDetailService): đơn kèm dòng
+     * hàng, thông tin hiện tại của các sản phẩm, lịch sử thanh toán (giả lập chậm 300 ms), gợi ý (giả lập chậm 400 ms).
+     * Không có đơn → 404. Nguồn phụ không trả kịp hoặc lỗi → vẫn 200, phần đó null và có tên trong unavailable.
+     * Header Server-Timing: thời gian từng nguồn và cả trang (ms), vd
+     * "order;dur=5.1, products;dur=1.2, paymentHistory;dur=301.4, recommendations;dur=401.8, total;dur=403.0".
+     */
+    @GetMapping("/{id}/detail")
+    public ResponseEntity<OrderDetailResponse> detail(@PathVariable long id) {
+        OrderDetail detail = orderDetailService.load(id);
+        String serverTiming = detail.timings().entrySet().stream()
+                .map(t -> String.format(Locale.ROOT, "%s;dur=%.1f", t.getKey(), t.getValue().toNanos() / 1_000_000.0))
+                .collect(Collectors.joining(", "));
+        return ResponseEntity.ok().header("Server-Timing", serverTiming).body(OrderDetailResponse.from(detail));
     }
 
     /**

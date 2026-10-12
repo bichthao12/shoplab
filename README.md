@@ -609,7 +609,7 @@ Mỗi Spring context của test giữ một pool 10 connection. Testcontainers d
 Mỗi kịch bản có test bảo vệ, và một bản lỗi viết dưới dạng patch trong `scripts/bugs/` (bản lỗi không nằm trong code chính hay code test). Script copy `pom.xml`, `mvnw`, `.mvn`, `src` ra thư mục tạm (không đụng thư mục làm việc), chạy test bảo vệ của mọi kịch bản trên code hiện tại (mong đợi **xanh**), rồi lần lượt áp từng patch, chạy test bảo vệ của kịch bản đó (mong đợi **đỏ**) và gỡ patch.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 14 kịch bản, ~5–10 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 15 kịch bản, ~5–10 phút
 powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadlock,self-invocation # chỉ vài kịch bản
 ```
 
@@ -629,6 +629,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `hash-in-transaction` | `12`: `register` là một transaction, băm mật khẩu bên trong | `PasswordHashingOutsideTransactionTests#register_hashesPasswordOutsideTransaction` | lúc băm `transactionActive=true, activeConnections=1` |
 | `n-plus-one` | `13`: mỗi đơn tự nạp dòng hàng (`order.getItems().size()` trong vòng lặp) | `OrderListWithItemsTests` | **102 câu SQL** cho trang 100 đơn (22 câu cho trang 20 đơn) thay vì 2 |
 | `cursor-ties` | `14`: cursor chỉ so `created_at < ?`, không so `id` | `OrderCursorPaginationTests#ordersWithSameCreatedAt_acrossPageBoundary` | 10 đơn, 6 đơn cùng `created_at`, trang 4 đơn: đi hết các trang chỉ được **8 đơn**, sót 2 đơn trùng `created_at` với đơn cuối trang 2 |
+| `order-detail-serial` | `15`: trang chi tiết đơn gọi lần lượt 4 nguồn trên luồng của request | `OrderDetailApiTests#detail_loadsFourSourcesInParallel` | `total` **725,6 ms** (tổng các nguồn) thay vì khoảng 400 ms |
 
 ```
 == Ma trận
@@ -639,8 +640,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
    hash-in-transaction  XANH         ĐỎ
    n-plus-one           XANH         ĐỎ
    cursor-ties          XANH         ĐỎ
+   order-detail-serial  XANH         ĐỎ
 
-ĐÚNG (14/14): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
+ĐÚNG (15/15): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
 ```
 
 - **Kịch bản race** (`oversell`, `stock-adjustment`): không ép thứ tự thì lỗi không phải lần nào cũng lộ (bản ngây thơ bán vượt: 5 lần chạy cho 6, 10, 9, **1**, 10 đơn). Bản lỗi được chạy tối đa `-Attempts` lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt; script in ra lần thứ mấy thì đỏ.
@@ -681,6 +683,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `spring.jpa.properties.hibernate.generate_statistics` | `true` | Thống kê của Hibernate: hết mỗi request log số câu JDBC đã chạy (`Logging session metrics`), thấy ngay N+1. Logger `org.hibernate.session.metrics` nằm trong nhóm `sql` (khai báo lại nhóm có sẵn của Spring Boot để thêm logger này) |
 | `logging.level.sql` | `DEBUG` | Log từng câu SQL, của cả Hibernate (`org.hibernate.SQL`) lẫn `JdbcClient` (`org.springframework.jdbc.core`) |
 | `logging.level.tx` | `DEBUG` | Log `BEGIN` / `COMMIT` / `ROLLBACK` của mỗi transaction mới (`common.config.TransactionLogging`) |
+| `shoplab.order-detail.payment-history-delay`, `recommendations-delay` | `300ms`, `400ms` | Độ trễ của hai nguồn giả lập (đứng thay cho cổng thanh toán, dịch vụ gợi ý) trên trang chi tiết đơn |
+| `shoplab.order-detail.optional-timeout` | `1s` | Nguồn phụ của trang chi tiết đơn chưa xong sau chừng này, tính từ đầu request: trang trả về không có phần đó (`unavailable`), nguồn đó bị huỷ |
 
 #### Đọc log SQL
 
@@ -871,6 +875,7 @@ Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nế
 |---|---|---|---|
 | `POST` | `/api/orders` (bắt buộc header `Idempotency-Key`) | **201** + `Location` | xem bảng bên dưới |
 | `GET` | `/api/orders/{id}` | **200** | 404 |
+| `GET` | `/api/orders/{id}/detail` | **200**: trang chi tiết đơn, gom 4 nguồn chạy song song (đơn, sản phẩm, lịch sử thanh toán, gợi ý), header `Server-Timing` (xem mục *Trang chi tiết đơn*) | 404 (trả ngay, không chờ nguồn chậm) · nguồn phụ chậm / lỗi: vẫn 200, phần đó `null`, tên nguồn trong `unavailable` |
 | `GET` | `/api/orders?userId=1&size=20&cursor=…` | **200** `{"content": [...], "nextCursor": "..."}`: đơn mới nhất trước, **phân trang cursor**, không kèm dòng hàng. Bỏ `userId`: mọi đơn. `size` 1–100, mặc định 20. Trang sau: gửi lại `nextCursor` ở tham số `cursor`; `nextCursor` là `null` thì hết (xem mục *Phân trang cursor*) | 400 `invalid-cursor`: cursor hỏng, hoặc gửi `page` / `sort` · 400 `validation`: `size` ngoài 1–100 |
 | `GET` | `/api/orders/with-items?userId=1&page=0&size=100` | **200**: đơn của một người dùng, mới nhất trước, mỗi đơn kèm dòng hàng (cùng dạng `GET /api/orders/{id}`); trang bao nhiêu đơn cũng chỉ 2 câu SQL (xem mục *N+1*). Vẫn phân trang offset (`page`, có tổng số đơn) | 400 thiếu `userId` · 400 `sort` theo trường không tồn tại |
 
@@ -959,6 +964,55 @@ Không cách sửa nào có cảnh báo `HHH90003004` (test kiểm tra điều �
 | Bản hiện tại (`@EntityGraph`) | **2 câu**: trang đơn kèm dòng hàng, đếm | **2 câu** |
 
 Đã thử: test đếm được 2 câu với bản hiện tại. Áp patch N+1 (`scripts\red-green.ps1 -Scenario n-plus-one`) thì test đỏ với 102 và 22 câu. Script trên app thật in đúng 2 câu đọc dữ liệu (không tính `BEGIN READ ONLY`), khớp con số trong khối `Logging session metrics` của log.
+
+#### Trang chi tiết đơn: gọi 4 nguồn song song (`GET /api/orders/{id}/detail`)
+
+Trang chi tiết gom 4 nguồn:
+
+| Nguồn | Lấy từ | Cần gì |
+|---|---|---|
+| `order` | đơn kèm dòng hàng (DB, `OrderService.getById`) | id đơn |
+| `products` | thông tin **hiện tại** của các sản phẩm trong đơn: giá, tồn kho, đang bán (module product, API mới `ProductCatalog`) | `productId` của các dòng hàng, tức phải có đơn trước |
+| `paymentHistory` | lịch sử thanh toán, **giả lập** cổng thanh toán: chờ 300 ms | id đơn |
+| `recommendations` | gợi ý, **giả lập** dịch vụ gợi ý: chờ 400 ms | id đơn |
+
+Gọi lần lượt thì trang mất tổng các nguồn, khoảng 720 ms. `OrderDetailService` chạy song song ba nhánh: (đơn rồi sản phẩm) ‖ lịch sử thanh toán ‖ gợi ý. Trang mất khoảng thời gian nhánh chậm nhất, khoảng 400 ms. Sản phẩm phải chờ đơn, vì module product không đọc bảng của module order (`DatabaseModularityTests`), nên chỉ tìm được sản phẩm theo id lấy từ dòng hàng.
+- **Luồng.** Mỗi nguồn chạy trên một luồng ảo của executor `orderDetailExecutor` (Java 21, tên luồng `order-detail-N` trong log), mỗi nguồn trong transaction riêng nếu có. Không dùng `ForkJoinPool` chung, mặc định của `CompletableFuture.supplyAsync`: pool đó chỉ có số luồng bằng số CPU, vài request đang chờ dịch vụ ngoài là chiếm hết.
+- **Đơn và sản phẩm là bắt buộc.** Lỗi thì cả trang lỗi: đơn không tồn tại → 404 ngay, và hai nguồn chậm đang chạy **bị huỷ** (ngắt luồng). `CompletableFuture.cancel` tự nó chỉ đánh dấu huỷ, nên mỗi việc giữ `Future` của executor để ngắt thật.
+- **Hai nguồn phụ không bắt buộc.** Chưa xong sau `shoplab.order-detail.optional-timeout` (1 giây, tính từ đầu request) hay bị lỗi, trang vẫn trả 200: phần đó `null`, tên nguồn nằm trong `unavailable`, và nguồn đó bị huỷ.
+- **Header `Server-Timing`** ghi thời gian từng nguồn và cả trang (ms). DevTools của trình duyệt hiện nó trong tab Network → Timing.
+
+```
+GET /api/orders/2000051/detail → 200
+Server-Timing: order;dur=6.9, products;dur=7.4, paymentHistory;dur=300.7, recommendations;dur=400.6, total;dur=401.1
+{"order": {... như GET /api/orders/{id} ...},
+ "products": [{"id": 52, "sku": "DETAIL-...", "name": "...", "price": 150000.0, "stock": 998, "active": true}],
+ "paymentHistory": [{"reference": "PAY-2000051-1", "status": "CREATED", "at": "..."}, ...],
+ "recommendations": [{"sku": "GOI-Y-1", "name": "Sản phẩm gợi ý 1", "reason": "..."}, ...],
+ "unavailable": []}
+```
+
+**Gọi API** (`scripts/order-detail.ps1`, cần app đang chạy): script tạo một đơn qua API, gọi trang chi tiết 5 lần, rồi so trung vị `total` (song song) với tổng 4 nguồn (thời gian nếu gọi lần lượt). Script cũng gọi một đơn không tồn tại.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\order-detail.ps1          # -OrderId 123 để xem đơn có sẵn, -Runs 10
+```
+```
+Lần order products paymentHistory recommendations Tổng 4 nguồn (lần lượt) total (song song) Client chờ
+  1 12,8  8,4      300,9          400,7           722,8                   401,2             406,6
+  2 6,9   7,4      300,7          400,6           715,6                   401,1             406,5
+  ...
+Trung vị: gọi lần lượt sẽ mất 718,6 ms (tổng 4 nguồn); song song mất 401,2 ms (client chờ 406,6 ms), nhanh hơn 317,4 ms
+GET /api/orders/999999999/detail -> 404 sau 34,0 ms (không chờ hai nguồn chậm 300 / 400 ms)
+ĐÚNG: trang mất 401,2 ms, bằng nguồn chậm nhất chứ không phải tổng các nguồn (718,6 ms); đơn không tồn tại trả 404 ngay
+```
+
+**Test:**
+- `OrderDetailApiTests`:
+  - đủ 4 nguồn, `products` là giá hiện tại (đổi sau khi đặt), còn dòng hàng giữ giá lúc đặt;
+  - theo `Server-Timing`: `total` ≥ nguồn chậm nhất và nhỏ hơn tổng các nguồn trừ 200 ms;
+  - đơn không tồn tại trả 404 trong dưới 250 ms, và log có "bị huỷ" của cả hai nguồn chậm.
+- `OrderDetailTimeoutTests`: gợi ý chậm 3 giây, hạn chờ 600 ms. Trang trả 200 sau khoảng 600 ms, `recommendations` là `null`, `unavailable = ["recommendations"]`, và nguồn gợi ý bị huỷ.
+- **Bản lỗi gọi lần lượt** (`scripts/bugs/15-order-detail-sequential.patch`, kịch bản `order-detail-serial` của `red-green.ps1`): test đỏ với `total` 725,6 ms.
 
 ### Người dùng – `/api/users`
 

@@ -7,6 +7,7 @@ import com.shoplab.order.internal.CreateOrderCommand;
 import com.shoplab.order.internal.CreateOrderCommand.Line;
 import com.shoplab.order.internal.Order;
 import com.shoplab.order.internal.OrderService;
+import com.shoplab.product.ProductCatalog;
 import com.shoplab.product.ProductInventory;
 import com.shoplab.product.ProductReferences;
 import com.shoplab.product.ProductUnavailableException;
@@ -47,6 +48,7 @@ class OrderModuleTests {
     static final long USER_ID = 800_001L;   // không cần người dùng thật trong DB: không có khoá ngoại sang users
 
     @MockitoBean ProductInventory inventory;
+    @MockitoBean ProductCatalog catalog;           // trang chi tiết đơn (OrderDetailService)
     @MockitoBean UserDirectory users;
     @MockitoBean IdempotencyService idempotency;   // OrderController cần bean này; test không đi qua HTTP
 
