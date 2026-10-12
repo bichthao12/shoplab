@@ -1013,6 +1013,16 @@ GET /api/orders/999999999/detail -> 404 sau 34,0 ms (không chờ hai nguồn ch
 ĐÚNG: trang mất 401,2 ms, bằng nguồn chậm nhất chứ không phải tổng các nguồn (718,6 ms); đơn không tồn tại trả 404 ngay
 ```
 
+**Thử tay hạn chờ:** chạy app với hạn ngắn hơn nguồn giả lập, rồi gọi trang chi tiết của một đơn có sẵn.
+```powershell
+.\mvnw spring-boot:run "-Dspring-boot.run.arguments=--shoplab.order-detail.optional-timeout=350ms"
+# gợi ý (400 ms) quá hạn, lịch sử thanh toán (300 ms) kịp:
+#   200, total khoảng 360 ms, recommendations = null, unavailable = [recommendations]
+#   log: "Trang chi tiết đơn: recommendations quá 350 ms, bỏ qua phần này" và "Gợi ý (giả lập): bị huỷ, ..."
+.\mvnw spring-boot:run "-Dspring-boot.run.arguments=--shoplab.order-detail.required-timeout=1ms"
+# đơn quá hạn: 503 order-detail-timeout, header Retry-After: 1
+```
+
 **Test:**
 - `OrderDetailApiTests`:
   - đủ 4 nguồn, `products` là giá hiện tại (đổi sau khi đặt), còn dòng hàng giữ giá lúc đặt;

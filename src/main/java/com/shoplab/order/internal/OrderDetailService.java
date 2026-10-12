@@ -141,7 +141,7 @@ public class OrderDetailService {
             return future.join();
         } catch (CompletionException | CancellationException ex) {
             if (ex.getCause() instanceof TimeoutException) {
-                log.warn("Trang chi tiết đơn: {} quá {}, bỏ qua phần này", source, optionalTimeout);
+                log.warn("Trang chi tiết đơn: {} quá {} ms, bỏ qua phần này", source, optionalTimeout.toMillis());
             } else {
                 log.warn("Trang chi tiết đơn: {} lỗi, bỏ qua phần này: {}", source, String.valueOf(ex.getCause()));
             }
