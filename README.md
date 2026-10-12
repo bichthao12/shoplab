@@ -612,7 +612,7 @@ Mỗi Spring context của test giữ một pool 10 connection. Testcontainers d
 Mỗi kịch bản có test bảo vệ, và một bản lỗi viết dưới dạng patch trong `scripts/bugs/` (bản lỗi không nằm trong code chính hay code test). Script copy `pom.xml`, `mvnw`, `.mvn`, `src` ra thư mục tạm (không đụng thư mục làm việc), chạy test bảo vệ của mọi kịch bản trên code hiện tại (mong đợi **xanh**), rồi lần lượt áp từng patch, chạy test bảo vệ của kịch bản đó (mong đợi **đỏ**) và gỡ patch.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 15 kịch bản, ~5–10 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 16 kịch bản, ~5–10 phút
 powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadlock,self-invocation # chỉ vài kịch bản
 ```
 
@@ -633,19 +633,21 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `n-plus-one` | `13`: mỗi đơn tự nạp dòng hàng (`order.getItems().size()` trong vòng lặp) | `OrderListWithItemsTests` | **102 câu SQL** cho trang 100 đơn (22 câu cho trang 20 đơn) thay vì 2 |
 | `cursor-ties` | `14`: cursor chỉ so `created_at < ?`, không so `id` | `OrderCursorPaginationTests#ordersWithSameCreatedAt_acrossPageBoundary` | 10 đơn, 6 đơn cùng `created_at`, trang 4 đơn: đi hết các trang chỉ được **8 đơn**, sót 2 đơn trùng `created_at` với đơn cuối trang 2 |
 | `order-detail-serial` | `15`: trang chi tiết đơn gọi lần lượt 4 nguồn trên luồng của request | `OrderDetailApiTests#detail_loadsFourSourcesInParallel` | `total` **725,6 ms** (tổng các nguồn) thay vì khoảng 400 ms |
+| `order-detail-interrupt` | `16`: lời gọi DB bắt buộc quá hạn thì ngắt luồng (như nguồn phụ) | `OrderDetailDegradedTests#productsQueryTooSlow_returns503WithoutBreakingConnection` | câu `SELECT 1 FROM pg_sleep(1)` hỏng giữa chừng: `An I/O error occurred while sending to the backend`, kết nối DB bị đóng |
 
 ```
 == Ma trận
-   Kịch bản             Bản sửa      Bản lỗi
-   oversell             XANH         ĐỎ
-   deadlock             XANH         ĐỎ
+   Kịch bản                 Bản sửa      Bản lỗi
+   oversell                 XANH         ĐỎ
+   deadlock                 XANH         ĐỎ
    ...
-   hash-in-transaction  XANH         ĐỎ
-   n-plus-one           XANH         ĐỎ
-   cursor-ties          XANH         ĐỎ
-   order-detail-serial  XANH         ĐỎ
+   hash-in-transaction      XANH         ĐỎ
+   n-plus-one               XANH         ĐỎ
+   cursor-ties              XANH         ĐỎ
+   order-detail-serial      XANH         ĐỎ
+   order-detail-interrupt   XANH         ĐỎ
 
-ĐÚNG (15/15): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
+ĐÚNG (16/16): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
 ```
 
 - **Kịch bản race** (`oversell`, `stock-adjustment`): không ép thứ tự thì lỗi không phải lần nào cũng lộ (bản ngây thơ bán vượt: 5 lần chạy cho 6, 10, 9, **1**, 10 đơn). Bản lỗi được chạy tối đa `-Attempts` lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt; script in ra lần thứ mấy thì đỏ.
@@ -692,7 +694,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `management.endpoints.web.exposure.include` | `health,metrics` | Mở `/actuator/health`, `/actuator/metrics/{tên}` (vd `hikaricp.connections.pending`). App chưa có xác thực: lên môi trường thật thì phải chặn hoặc tách sang cổng riêng (`management.server.port`) |
 | `server.tomcat.mbeanregistry.enabled` | `true` | Có số đo luồng Tomcat (`tomcat.threads.busy`, `tomcat.threads.config.max`) trong `/actuator/metrics`. Khi chạy trên luồng ảo, `tomcat.threads.busy` là `-1` (không có pool luồng) |
 | `shoplab.order-detail.payment-history-delay`, `recommendations-delay` | `300ms`, `400ms` | Độ trễ của hai nguồn giả lập (đứng thay cho cổng thanh toán, dịch vụ gợi ý) trên trang chi tiết đơn |
-| `shoplab.order-detail.required-timeout` | `2s` | Hạn (`orTimeout`) của mỗi lời gọi bắt buộc của trang chi tiết đơn (đơn, sản phẩm), tính từ lúc lời gọi bắt đầu: quá hạn thì lời gọi bị ngắt, trang trả 503 `order-detail-timeout` |
+| `shoplab.order-detail.required-timeout` | `2s` | Hạn (`orTimeout`) của mỗi lời gọi bắt buộc của trang chi tiết đơn (đơn, sản phẩm), tính từ lúc lời gọi bắt đầu: quá hạn thì trang trả 503 `order-detail-timeout`; lời gọi DB không bị ngắt, chạy xong rồi trả kết nối về pool |
 | `shoplab.order-detail.optional-timeout` | `1s` | Hạn của mỗi lời gọi phụ (lịch sử thanh toán, gợi ý): quá hạn thì lời gọi bị ngắt, trang trả về không có phần đó (`unavailable`) |
 
 #### Đọc log SQL
@@ -988,11 +990,12 @@ Trang chi tiết gom 4 nguồn:
 
 Gọi lần lượt thì trang mất tổng các nguồn, khoảng 720 ms. `OrderDetailService` chạy song song ba nhánh: (đơn rồi sản phẩm) ‖ lịch sử thanh toán ‖ gợi ý. Trang mất khoảng thời gian nhánh chậm nhất, khoảng 400 ms. Sản phẩm phải chờ đơn, vì module product không đọc bảng của module order (`DatabaseModularityTests`), nên chỉ tìm được sản phẩm theo id lấy từ dòng hàng.
 - **Luồng.** Mỗi lời gọi là một `CompletableFuture` chạy trên một luồng ảo của executor `orderDetailExecutor` (Java 21, tên luồng `order-detail-N` trong log), mỗi nguồn trong transaction riêng nếu có. Không dùng `ForkJoinPool` chung, mặc định của `CompletableFuture.supplyAsync`: pool đó chỉ có số luồng bằng số CPU, vài request đang chờ dịch vụ ngoài là chiếm hết.
-- **Mỗi lời gọi có `orTimeout` riêng**, tính từ lúc lời gọi đó bắt đầu (sản phẩm bắt đầu khi đã có đơn, nên hạn của nó cũng tính từ đó). Quá hạn thì `CompletableFuture` kết thúc bằng `TimeoutException`, và luồng đang chạy lời gọi **bị ngắt**: tự `orTimeout` hay `cancel` chỉ đánh dấu kết thúc, việc vẫn chạy tiếp tới hết, nên mỗi lời gọi giữ `Future` của executor để ngắt thật.
+- **Mỗi lời gọi có `orTimeout` riêng**, tính từ lúc lời gọi đó bắt đầu (sản phẩm bắt đầu khi đã có đơn, nên hạn của nó cũng tính từ đó). Quá hạn thì `CompletableFuture` kết thúc bằng `TimeoutException` và trang không chờ lời gọi đó nữa. Tự `orTimeout` hay `cancel` chỉ đánh dấu kết thúc, việc vẫn chạy tiếp tới hết; muốn dừng thật thì phải ngắt luồng, nên mỗi lời gọi giữ `Future` của executor.
 - **Đơn và sản phẩm là bắt buộc**, hạn `shoplab.order-detail.required-timeout` (2 giây). Lỗi thì cả trang lỗi, và hai nguồn phụ đang chạy bị huỷ ngay, không bắt request chờ thêm:
   - đơn không tồn tại → 404 ngay;
   - đơn hay sản phẩm quá hạn → **503** `order-detail-timeout` kèm `Retry-After: 1`.
-- **Hai nguồn phụ không bắt buộc**, hạn `shoplab.order-detail.optional-timeout` (1 giây). Quá hạn hay lỗi thì trang vẫn trả 200: phần đó `null`, tên nguồn nằm trong `unavailable`, log có `WARN` ghi lý do.
+  - Lời gọi DB quá hạn **không bị ngắt**, chỉ bị bỏ kết quả: câu SQL chạy tiếp tới xong (lâu nhất tới `lock_timeout` 5 giây) rồi trả kết nối về pool. Ngắt một luồng ảo đang chờ PostgreSQL trả lời thì JDK đóng luôn socket: driver báo `An I/O error occurred while sending to the backend`, kết nối hỏng bị bỏ khỏi pool và Hikari phải mở kết nối mới. Dưới tải, nhiều lần quá hạn cùng lúc là nhiều kết nối phải mở lại đúng lúc pool đang thiếu. Phát hiện khi chạy `load-test.ps1` với hạn 8 ms: 252 kết nối hỏng trong 20 giây (bản lỗi: `scripts/bugs/16-order-detail-interrupt-db.patch`).
+- **Hai nguồn phụ không bắt buộc**, hạn `shoplab.order-detail.optional-timeout` (1 giây). Quá hạn hay lỗi thì trang vẫn trả 200: phần đó `null`, tên nguồn nằm trong `unavailable`, log có `WARN` ghi lý do. Quá hạn thì luồng đang chạy lời gọi **bị ngắt** (hai nguồn này không dùng DB).
 - **Header `Server-Timing`** ghi thời gian từng nguồn và cả trang (ms). DevTools của trình duyệt hiện nó trong tab Network → Timing.
 
 ```
@@ -1037,9 +1040,11 @@ GET /api/orders/999999999/detail -> 404 sau 34,0 ms (không chờ hai nguồn ch
 - `OrderDetailDegradedTests` (hạn của mọi lời gọi 600 ms, nguồn gợi ý và sản phẩm là mock):
   - gợi ý ném lỗi → 200 ngay (dưới 550 ms), `recommendations` là `null`, `unavailable = ["recommendations"]`, lịch sử thanh toán vẫn đủ;
   - gợi ý treo 10 giây → 200 sau khoảng 600 ms (quá hạn), như trên, và luồng gợi ý bị ngắt;
-  - sản phẩm treo 10 giây → 503 `order-detail-timeout`, `Retry-After: 1`, luồng sản phẩm bị ngắt.
+  - sản phẩm chậm 1,5 giây → 503 `order-detail-timeout`, `Retry-After: 1` ngay khi hết hạn; lời gọi sản phẩm không bị ngắt, chạy hết;
+  - sản phẩm chạy câu SQL thật chậm 1 giây (`pg_sleep`) → 503, câu SQL vẫn chạy xong, kết nối không bị đóng.
 - `OrderDetailTimingTests`: so gọi lần lượt (`SequentialOrderDetail`, chỉ có trong test) với `OrderDetailService`, mỗi cách 3 lần, ghi dòng `[so-do] order-detail ...` cho thẻ sổ đo (xem *Sổ đo trước / sau*).
 - **Bản lỗi gọi lần lượt** (`scripts/bugs/15-order-detail-sequential.patch`, kịch bản `order-detail-serial` của `red-green.ps1`): test đỏ với `total` 725,6 ms.
+- **Bản lỗi ngắt cả lời gọi DB** (`scripts/bugs/16-order-detail-interrupt-db.patch`, kịch bản `order-detail-interrupt`): test câu SQL chậm đỏ với `An I/O error occurred while sending to the backend`.
 
 #### Virtual thread và connection pool: tải k6 (`scripts/load-test.ps1`)
 
@@ -1063,7 +1068,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\load-test.ps1                
 powershell -ExecutionPolicy Bypass -File .\scripts\load-test.ps1 -Case pool5 -PoolSize 3 -SkipBuild  # một lượt, pool 3 kết nối
 powershell -ExecutionPolicy Bypass -File .\scripts\load-test.ps1 -Duration 30s -ReferenceVus 0       # chạy thử nhanh
 ```
-Máy chưa cài k6 thì script chạy k6 bằng Docker (image `grafana/k6:1.3.0`, gọi app qua `host.docker.internal`). Cài k6 trên Windows: `winget install k6 --source winget`. Log của app ở `target/load-test/<lượt>.log`.
+Máy chưa cài k6 thì script chạy k6 bằng Docker (image `grafana/k6:1.3.0`, gọi app qua `host.docker.internal`). Cài k6 trên Windows: `winget install k6 --source winget`. Log của app ở `target/load-test/<lượt>.log`. `-AppArgs '--a=1 --b=2'` truyền thêm cấu hình cho app, vd `-AppArgs '--shoplab.order-detail.optional-timeout=350ms'` để xem trang thiếu nguồn phụ dưới tải.
+
+**Chẩn đoán khi có lỗi.** Mỗi lượt script in thêm:
+- **Lỗi theo loại:** 503 (vd `order-detail-timeout`), không có response (hết giờ, mất kết nối), loại khác; trang thiếu nguồn phụ nào. Kèm vài mẫu có thời điểm theo giờ máy, để so với log của app. Mỗi người dùng ảo in tối đa một mẫu.
+- **Các dòng WARN / ERROR trong log của app,** gom theo nội dung và tách theo lúc xảy ra: trong lúc đo, hay lúc khởi động / chạy cho nóng máy. Ngay sau khi khởi động, JVM còn "lạnh" (chưa biên dịch JIT), nên vài request đầu của lượt chạy cho nóng máy có thể quá hạn 1 giây của nguồn phụ. Đó là lý do có lượt chạy cho nóng máy không tính.
+- **JFR:** app chạy kèm Java Flight Recorder (`-XX:StartFlightRecording`), cuối lượt script ghi ra `target/load-test/<lượt>.jfr` (`jcmd JFR.dump`) và đọc:
+  - GC dừng lâu nhất (`jdk.GCPhasePause`);
+  - số lần luồng ảo bị ghim vào luồng hệ điều hành từ 20 ms (`jdk.VirtualThreadPinned`), kèm đỉnh stack. Java 21 ghim luồng ảo khi nó chờ bên trong `synchronized`. Bị ghim nhiều thì vài luồng hệ điều hành bên dưới bị chiếm hết và mọi luồng ảo khác phải chờ.
+  - Đã thử ở đây với luồng ảo, 400 VU: GC dừng lâu nhất khoảng 50 ms, 0 lần bị ghim. Mở file `.jfr` bằng JDK Mission Control để xem kỹ hơn.
 
 Kết quả (máy 4 CPU, 2 triệu đơn; ms là thời gian k6 chờ):
 

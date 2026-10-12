@@ -15,7 +15,7 @@
   -Attempts lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt.
 
   Cần git và Docker (test dựng PostgreSQL bằng Testcontainers), như khi chạy test. Mỗi kịch bản một lượt Maven,
-  cả 15 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
+  cả 16 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu mọi kịch bản xanh với bản sửa và đỏ với bản lỗi; 1 nếu không; 2 nếu không chạy được.
 
 .EXAMPLE
@@ -102,6 +102,10 @@ $all = @(
        Title = 'Trang chi tiết đơn: gọi song song'
        Bug = 'gọi lần lượt 4 nguồn trên luồng của request'
        Tests = @('OrderDetailApiTests#detail_loadsFourSourcesInParallel') }
+    @{ Id = 'order-detail-interrupt'; Patch = '16-order-detail-interrupt-db.patch'
+       Title = 'Trang chi tiết đơn: lời gọi DB quá hạn'
+       Bug = 'ngắt luồng đang chờ PostgreSQL: kết nối DB bị đóng'
+       Tests = @('OrderDetailDegradedTests#productsQueryTooSlow_returns503WithoutBreakingConnection') }
 )
 
 # powershell -File truyền "-Scenario a,b" thành MỘT chuỗi "a,b": tự tách theo dấu phẩy
@@ -226,7 +230,7 @@ Write-Host "   xong sau $($fixedRun.Seconds) giây"
 foreach ($s in $scenarios) {
     $v = Get-Verdict $fixedRun.Results $s.Tests
     $s.Fixed = $v.Verdict
-    Write-Host ('   {0,-20} {1}' -f $s.Id, $v.Verdict) -ForegroundColor (Get-Color $v.Verdict 'XANH')
+    Write-Host ('   {0,-24} {1}' -f $s.Id, $v.Verdict) -ForegroundColor (Get-Color $v.Verdict 'XANH')
     foreach ($f in $v.Failed) { Write-Host "        $(Format-Failure $f)" }
 }
 if (@($scenarios | Where-Object { $_.Fixed -eq 'KHÔNG CHẠY' }).Count -gt 0) { Write-Tail $fixedRun }
@@ -272,12 +276,12 @@ if (-not $KeepTemp) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyCon
 
 Write-Host ''
 Write-Host '== Ma trận'
-Write-Host ('   {0,-20} {1,-12} {2}' -f 'Kịch bản', 'Bản sửa', 'Bản lỗi')
+Write-Host ('   {0,-24} {1,-12} {2}' -f 'Kịch bản', 'Bản sửa', 'Bản lỗi')
 $ok = 0
 foreach ($s in $scenarios) {
     $good = $s.Fixed -eq 'XANH' -and $s.Bugged -eq 'ĐỎ'
     if ($good) { $ok++ }
-    Write-Host ('   {0,-20} {1,-12} {2}' -f $s.Id, $s.Fixed, $s.Bugged) -ForegroundColor $(if ($good) { 'Green' } else { 'Red' })
+    Write-Host ('   {0,-24} {1,-12} {2}' -f $s.Id, $s.Fixed, $s.Bugged) -ForegroundColor $(if ($good) { 'Green' } else { 'Red' })
 }
 Write-Host ''
 if ($ok -eq $scenarios.Count) {

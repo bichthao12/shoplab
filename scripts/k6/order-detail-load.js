@@ -21,7 +21,18 @@ const ORDERS = parseInt(__ENV.ORDERS || '1000', 10);
 const detailDuration = new Trend('detail_duration', true);
 const detailRequests = new Counter('detail_requests');
 const detailNot200 = new Counter('detail_not_200');
+const errNetwork = new Counter('detail_err_network');     // không có response: hết giờ chờ, mất kết nối (status 0)
+const err503 = new Counter('detail_err_503');             // vd order-detail-timeout: đơn / sản phẩm quá hạn
+const errOther = new Counter('detail_err_other');
 const detailDegraded = new Counter('detail_degraded');   // 200 nhưng thiếu nguồn phụ (unavailable khác rỗng)
+const missingPayments = new Counter('detail_missing_payment_history');
+const missingRecommendations = new Counter('detail_missing_recommendations');
+
+// Mỗi người dùng ảo in tối đa một lỗi và một trang thiếu nguồn phụ (dòng DETAIL_ERROR / DETAIL_DEGRADED dạng
+// khoá=giá trị, chỉ ký tự ASCII, có thời điểm UTC để so với log của app), đủ để biết chuyện gì xảy ra mà không làm
+// ngập output
+let errorLogged = false;
+let degradedLogged = false;
 
 const poolPending = new Trend('pool_pending');   // request (luồng) đang xếp hàng chờ kết nối
 const poolActive = new Trend('pool_active');     // kết nối đang được dùng
@@ -69,9 +80,38 @@ export function detail(data) {
     detailRequests.add(1);
     detailDuration.add(res.timings.duration);
     if (res.status !== 200) {
-        detailNot200.add(1, { status: String(res.status) });
+        detailNot200.add(1);
+        if (res.status === 0) {
+            errNetwork.add(1);
+        } else if (res.status === 503) {
+            err503.add(1);
+        } else {
+            errOther.add(1);
+        }
+        if (!errorLogged) {
+            errorLogged = true;
+            console.warn(`DETAIL_ERROR t=${new Date().toISOString()} id=${id} status=${res.status}`
+                + ` ms=${Math.round(res.timings.duration)} type=${problemType(res)} error=${res.error || ''}`);
+        }
     } else if (res.body.indexOf('"unavailable":[]') < 0) {
         detailDegraded.add(1);
+        const missing = res.json('unavailable') || [];
+        if (missing.indexOf('paymentHistory') >= 0) missingPayments.add(1);
+        if (missing.indexOf('recommendations') >= 0) missingRecommendations.add(1);
+        if (!degradedLogged) {
+            degradedLogged = true;
+            console.warn(`DETAIL_DEGRADED t=${new Date().toISOString()} id=${id} status=200`
+                + ` ms=${Math.round(res.timings.duration)} missing=${missing.join(',')}`);
+        }
+    }
+}
+
+// type của ProblemDetail (vd .../order-detail-timeout), hoặc rỗng nếu body không phải JSON
+function problemType(res) {
+    try {
+        return String(res.json('type') || '').replace(/^.*\//, '');
+    } catch (e) {
+        return '';
     }
 }
 
@@ -109,7 +149,12 @@ export function handleSummary(data) {
         p99: v('detail_duration', 'p(99)'),
         max: v('detail_duration', 'max'),
         not200: v('detail_not_200', 'count') || 0,
+        errNetwork: v('detail_err_network', 'count') || 0,
+        err503: v('detail_err_503', 'count') || 0,
+        errOther: v('detail_err_other', 'count') || 0,
         degraded: v('detail_degraded', 'count') || 0,
+        missingPaymentHistory: v('detail_missing_payment_history', 'count') || 0,
+        missingRecommendations: v('detail_missing_recommendations', 'count') || 0,
         pendingAvg: v('pool_pending', 'avg'),
         pendingMax: v('pool_pending', 'max'),
         activeAvg: v('pool_active', 'avg'),

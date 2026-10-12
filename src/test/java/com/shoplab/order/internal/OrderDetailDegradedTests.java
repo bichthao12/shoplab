@@ -10,6 +10,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import java.net.http.HttpResponse;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -73,11 +74,19 @@ class OrderDetailDegradedTests extends IntegrationTestBase {
     }
 
     @Test
-    @DisplayName("Nguồn sản phẩm (bắt buộc) quá hạn → 503 order-detail-timeout + Retry-After; lời gọi sản phẩm bị ngắt")
-    void productsTooSlow_returns503() throws InterruptedException {
+    @DisplayName("Nguồn sản phẩm (bắt buộc) quá hạn → 503 order-detail-timeout + Retry-After ngay khi hết hạn; lời gọi không bị ngắt")
+    void productsTooSlow_returns503() throws Exception {
         long orderId = newOrder("DEGRADED-3");
-        CountDownLatch interrupted = new CountDownLatch(1);
-        when(catalog.findByIds(any())).thenAnswer(call -> sleepUntilInterrupted(interrupted));
+        CompletableFuture<String> call = new CompletableFuture<>();
+        when(catalog.findByIds(any())).thenAnswer(invocation -> {
+            try {
+                Thread.sleep(1_500);
+                call.complete("chạy hết");
+            } catch (InterruptedException ex) {
+                call.complete("bị ngắt");
+            }
+            return List.of();
+        });
         long started = System.nanoTime();
 
         HttpResponse<String> r = send("GET", "/api/orders/" + orderId + "/detail", null, null);
@@ -85,8 +94,32 @@ class OrderDetailDegradedTests extends IntegrationTestBase {
         long elapsedMs = (System.nanoTime() - started) / 1_000_000;
         assertProblem(r, 503, "order-detail-timeout");
         assertThat(r.headers().firstValue("Retry-After")).hasValue("1");
-        assertThat(elapsedMs).as("hạn của lời gọi sản phẩm 600 ms, mock chờ 10 giây").isBetween(550L, 1500L);
-        assertThat(interrupted.await(2, TimeUnit.SECONDS)).as("luồng đang chạy lời gọi sản phẩm bị ngắt").isTrue();
+        assertThat(elapsedMs).as("hạn của lời gọi sản phẩm 600 ms, mock chờ 1,5 giây").isBetween(550L, 1400L);
+        assertThat(call.get(5, TimeUnit.SECONDS)).as("lời gọi bắt buộc quá hạn chỉ bị bỏ kết quả").isEqualTo("chạy hết");
+    }
+
+    @Test
+    @DisplayName("Sản phẩm quá hạn giữa câu SQL → 503, nhưng câu SQL không bị ngắt: chạy xong, kết nối DB không bị đóng")
+    void productsQueryTooSlow_returns503WithoutBreakingConnection() throws Exception {
+        long orderId = newOrder("DEGRADED-4");
+        CompletableFuture<String> query = new CompletableFuture<>();
+        when(catalog.findByIds(any())).thenAnswer(call -> {
+            try {
+                // câu SQL thật, chậm 1 giây: quá hạn 600 ms khi đang chờ PostgreSQL trả lời
+                jdbc.sql("SELECT 1 FROM pg_sleep(1)").query(Integer.class).single();
+                query.complete("xong");
+            } catch (RuntimeException ex) {
+                query.complete("lỗi: " + ex.getMessage());
+            }
+            return List.of();
+        });
+
+        HttpResponse<String> r = send("GET", "/api/orders/" + orderId + "/detail", null, null);
+
+        assertProblem(r, 503, "order-detail-timeout");
+        // Ngắt luồng ảo đang đọc socket thì JDK đóng luôn socket: driver báo "An I/O error occurred while sending to
+        // the backend", kết nối bị bỏ khỏi pool. Lời gọi DB quá hạn vì vậy không bị ngắt, chỉ bị bỏ kết quả.
+        assertThat(query.get(5, TimeUnit.SECONDS)).isEqualTo("xong");
     }
 
     private long newOrder(String sku) {

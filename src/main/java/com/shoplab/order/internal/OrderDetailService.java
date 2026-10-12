@@ -31,11 +31,14 @@ import java.util.function.Supplier;
  *   nhánh 2: lịch sử thanh toán (giả lập chậm 300 ms), chỉ cần id đơn
  *   nhánh 3: gợi ý (giả lập chậm 400 ms), chỉ cần id đơn
  *
- * Mỗi lời gọi có orTimeout riêng, tính từ lúc lời gọi đó bắt đầu; quá hạn thì luồng đang chạy lời gọi bị ngắt:
+ * Mỗi lời gọi có orTimeout riêng, tính từ lúc lời gọi đó bắt đầu:
  *   - đơn, sản phẩm: bắt buộc, hạn shoplab.order-detail.required-timeout. Lỗi thì cả trang lỗi (đơn không tồn tại →
  *     404, quá hạn → 503 order-detail-timeout), hai nguồn phụ đang chạy bị huỷ ngay, không bắt request chờ thêm.
+ *     Quá hạn thì chỉ bỏ kết quả, KHÔNG ngắt luồng: luồng ảo bị ngắt khi đang đọc socket thì JDK đóng luôn socket, tức
+ *     đóng kết nối DB ("An I/O error occurred while sending to the backend"), pool phải mở kết nối mới. Câu SQL chạy
+ *     tiếp tới xong (lâu nhất tới lock_timeout 5 giây) rồi trả kết nối về pool như bình thường.
  *   - lịch sử thanh toán, gợi ý: không bắt buộc, hạn shoplab.order-detail.optional-timeout. Quá hạn hay lỗi thì trang
- *     vẫn trả về, phần đó để trống và ghi tên vào unavailable.
+ *     vẫn trả về, phần đó để trống và ghi tên vào unavailable. Quá hạn thì luồng đang chạy lời gọi bị ngắt.
  * Mỗi nguồn chạy trong transaction riêng của nó (nếu có), trên luồng riêng: không có transaction chung cho cả trang.
  */
 @Service
@@ -68,12 +71,12 @@ public class OrderDetailService {
         Map<String, Duration> timings = new ConcurrentHashMap<>();
 
         // Bắt đầu cả ba nhánh ngay, không chờ nhau. Sản phẩm bắt đầu (và tính hạn) khi đã có đơn.
-        CompletableFuture<Order> order = call("order", timings, requiredTimeout, () -> orders.getById(orderId));
+        CompletableFuture<Order> order = call("order", timings, requiredTimeout, false, () -> orders.getById(orderId));
         CompletableFuture<List<ProductInfo>> products = order.thenCompose(o -> call("products", timings, requiredTimeout,
-                () -> catalog.findByIds(o.getItems().stream().map(OrderItem::getProductId).distinct().toList())));
-        CompletableFuture<List<PaymentEvent>> payments = call("paymentHistory", timings, optionalTimeout,
+                false, () -> catalog.findByIds(o.getItems().stream().map(OrderItem::getProductId).distinct().toList())));
+        CompletableFuture<List<PaymentEvent>> payments = call("paymentHistory", timings, optionalTimeout, true,
                 () -> paymentHistory.findByOrderId(orderId));
-        CompletableFuture<List<Recommendation>> suggestions = call("recommendations", timings, optionalTimeout,
+        CompletableFuture<List<Recommendation>> suggestions = call("recommendations", timings, optionalTimeout, true,
                 () -> recommendations.forOrder(orderId));
 
         // Nhánh bắt buộc
@@ -106,10 +109,11 @@ public class OrderDetailService {
 
     /**
      * Một lời gọi trên executor, hết hạn sau timeout (orTimeout: CompletableFuture kết thúc bằng TimeoutException).
-     * Quá hạn hay bị huỷ (cancel) thì ngắt luôn luồng đang chạy lời gọi: tự CompletableFuture không làm việc đó, nó chỉ
-     * đánh dấu kết thúc, còn việc vẫn chạy tiếp tới hết.
+     * interrupt: quá hạn hay bị huỷ (cancel) thì ngắt luôn luồng đang chạy lời gọi. Tự CompletableFuture không làm việc
+     * đó, nó chỉ đánh dấu kết thúc, còn việc vẫn chạy tiếp tới hết. Không dùng cho lời gọi DB (xem ghi chú của lớp).
      */
-    private <T> CompletableFuture<T> call(String source, Map<String, Duration> timings, Duration timeout, Supplier<T> task) {
+    private <T> CompletableFuture<T> call(String source, Map<String, Duration> timings, Duration timeout, boolean interrupt,
+                                          Supplier<T> task) {
         CompletableFuture<T> result = new CompletableFuture<>();
         Future<?> running = executor.submit(() -> {
             try {
@@ -119,7 +123,7 @@ public class OrderDetailService {
             }
         });
         result.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS).whenComplete((value, ex) -> {
-            if (ex instanceof TimeoutException || result.isCancelled()) {
+            if (interrupt && (ex instanceof TimeoutException || result.isCancelled())) {
                 running.cancel(true);
             }
         });
