@@ -345,7 +345,20 @@ Mọi đơn (10 triệu), 20 đơn mỗi trang, trung vị 5 lần, dữ liệu 
 - **Dữ liệu nhỏ hơn** (vd `seed-big-data.ps1 -Users 200000 -Orders 2000000`): bài đo cần ít nhất 2 triệu đơn. Phần B chỉ đo những trang user 1 có (user 1 còn khoảng 800 đơn). Trang 100.000 lúc đó là trang cuối, sau cursor chỉ còn 20 đơn: planner biết điều đó từ thống kê nên cách viết `OR` cũng nhanh (Bitmap Index Scan đọc đúng phần còn lại), không phải vì `OR` dùng được làm điểm bắt đầu quét.
 - **Danh sách của một người dùng** (user 1, nhiều đơn nhất: 1.381 đơn). Trang cuối (69): OFFSET đọc 1.380 dòng, 0,92 ms; cursor đọc 21 dòng, 0,07 ms. Một người dùng chỉ có vài trăm tới vài nghìn đơn nên OFFSET ở đây chưa thành vấn đề. Vấn đề nằm ở danh sách lớn.
 
-**Gọi API** trên app đang chạy (cần dữ liệu lớn):
+**Kiểm tra nhanh API** (`scripts/cursor-api-check.ps1`, chỉ gọi API, cần app đang chạy và có đơn):
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\cursor-api-check.ps1                  # -UserId 42, -Size 10 để đổi
+```
+Script gọi trang 1 (`?size=3`), trang 2 theo `nextCursor`, danh sách `?userId=1` (rồi đi hết danh sách đó theo `nextCursor`, 100 đơn mỗi trang), một người dùng không tồn tại, và 5 request sai tham số. Mỗi mục in `ĐÚNG` / `SAI`:
+- trang 1: đủ 3 đơn, mới nhất trước, có `nextCursor`;
+- trang 2: không trùng trang 1, và trang 1 + trang 2 đúng bằng 6 đơn đầu của `?size=6` (không sót đơn nào ở giữa);
+- danh sách của người dùng: chỉ đơn của người đó; đi hết không đơn nào lặp, đúng thứ tự, trang cuối `nextCursor` null;
+- người dùng không tồn tại: rỗng, `nextCursor` null;
+- `page=1`, `sort=id`, `cursor=abc` → 400 `invalid-cursor`; `size=0`, `size=101` → 400 `validation`.
+
+Mã thoát `0` nếu mọi mục đúng (`ĐÚNG (10/10)`), `1` nếu có mục sai, `2` nếu không gọi được app hoặc DB chưa có đơn.
+
+**So trang 1 và trang 10.000 qua API** trên app đang chạy (cần dữ liệu lớn):
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\cursor-pagination.ps1          # nhảy thẳng tới trang 10.000
 powershell -ExecutionPolicy Bypass -File .\scripts\cursor-pagination.ps1 -Walk    # đi thật 10.000 trang theo nextCursor (khoảng 1 phút)
