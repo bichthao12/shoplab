@@ -95,6 +95,9 @@ BEGIN
     ELSE
         EXECUTE format('SELECT created_at, id FROM orders WHERE %s%sOFFSET %s LIMIT 1', p_where, ord, (p_page - 1) * 20 - 1)
             INTO c_at, c_id;
+        IF c_id IS NULL THEN
+            RAISE EXCEPTION 'Trang % (%): danh sách không có đủ % đơn', p_page, p_list, (p_page - 1) * 20;
+        END IF;
         q_cursor := format('%s%s AND (created_at, id) < (%L, %s)%sLIMIT 21', cols, p_where, c_at, c_id, ord);
         q_or := format('%s%s AND (created_at < %L OR (created_at = %L AND id < %s))%sLIMIT 21',
                        cols, p_where, c_at, c_at, c_id, ord);
@@ -139,8 +142,10 @@ SELECT :total >= 2000000 AS big_enough \gset
 \echo '== A. Mọi đơn, trang 1, 10, 100, 1.000, 10.000, 100.000 (vài chục giây)'
 SELECT page_lab.run_page('A. mọi đơn', 'true', p) FROM unnest(ARRAY[1, 10, 100, 1000, 10000, 100000]) AS p \g /dev/null
 
-\echo '== B. Đơn của user 1, trang 1, 10, 50 và trang đủ 20 đơn cuối cùng'
-SELECT page_lab.run_page('B. user 1', 'user_id = 1', p) FROM unnest(ARRAY[1, 10, 50, :heavy_n / 20]) AS p \g /dev/null
+\echo '== B. Đơn của user 1, trang 1, 10, 50 và trang đủ 20 đơn cuối cùng (bỏ các trang user 1 không có)'
+SELECT page_lab.run_page('B. user 1', 'user_id = 1', p)
+FROM (SELECT DISTINCT p FROM unnest(ARRAY[1, 10, 50, :heavy_n / 20]) AS p WHERE p BETWEEN 1 AND :heavy_n / 20) AS pages
+ORDER BY p \g /dev/null
 
 \echo '== C. Câu đếm Page của Spring Data chạy kèm mỗi trang OFFSET (cursor không cần)'
 SELECT page_lab.measure('A. mọi đơn', NULL, 'count(*)', 'SELECT count(*) FROM orders') \g /dev/null
