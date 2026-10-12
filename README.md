@@ -2,7 +2,7 @@
 
 REST API bán hàng tối giản dùng để luyện thiết kế API: CRUD sản phẩm, đặt hàng có **Idempotency-Key**, đăng ký người dùng (mật khẩu băm BCrypt), trả mọi lỗi theo chuẩn **ProblemDetail (RFC 9457)**.
 
-**Công nghệ:** Java 21 · Spring Boot 4 (Web MVC, Data JPA, Validation) · Spring Modulith · Spring Security Crypto (chỉ BCrypt) · PostgreSQL 17 · Flyway · Testcontainers
+**Công nghệ:** Java 21 (virtual thread) · Spring Boot 4 (Web MVC, Data JPA, Validation, Actuator) · Spring Modulith · Spring Security Crypto (chỉ BCrypt) · PostgreSQL 17 · Flyway · Testcontainers
 
 **Ghi chú đồng thời:** [`docs/concurrency-notes.md`](docs/concurrency-notes.md): bảng mức cô lập × hiện tượng (lập bằng thí nghiệm `IsolationLevelTests`), 5 ý tóm tắt, postmortem cho 12 kịch bản đã "phá", trả lời 3 câu hỏi về transaction, `FOR UPDATE` và deadlock.
 
@@ -665,6 +665,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 - **Nhập / trừ tồn kho cùng lúc với đơn hàng, gửi lại cùng key:** `scripts\stock-adjustment.ps1` (xem mục *Điều chỉnh tồn kho*).
 - **Đăng ký trùng email / username cùng lúc:** `scripts\duplicate-email.ps1` (xem mục *Đăng ký trùng gửi cùng lúc*).
 - **Đếm số câu SQL của danh sách 100 đơn kèm dòng hàng (N+1):** `scripts\n-plus-one.ps1` (xem mục *N+1*).
+- **Tải k6 lên trang chi tiết đơn, luồng thường / luồng ảo, pool kết nối nhỏ:** `scripts\load-test.ps1` (tự chạy app, cần Docker; xem mục *Virtual thread và connection pool*).
 - **Bắn request đồng thời cùng key:**
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\test-concurrent-orders.ps1 -Count 3
@@ -686,6 +687,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `spring.jpa.properties.hibernate.generate_statistics` | `true` | Thống kê của Hibernate: hết mỗi request log số câu JDBC đã chạy (`Logging session metrics`), thấy ngay N+1. Logger `org.hibernate.session.metrics` nằm trong nhóm `sql` (khai báo lại nhóm có sẵn của Spring Boot để thêm logger này) |
 | `logging.level.sql` | `DEBUG` | Log từng câu SQL, của cả Hibernate (`org.hibernate.SQL`) lẫn `JdbcClient` (`org.springframework.jdbc.core`) |
 | `logging.level.tx` | `DEBUG` | Log `BEGIN` / `COMMIT` / `ROLLBACK` của mỗi transaction mới (`common.config.TransactionLogging`) |
+| `spring.threads.virtual.enabled` | `true` | Mỗi request một luồng ảo (Java 21) thay vì pool 200 luồng thường của Tomcat; cả `@Scheduled` và executor mặc định của Spring. Số đo trước / sau: mục *Virtual thread và connection pool* |
+| `spring.datasource.hikari.maximum-pool-size` | `10` | Số kết nối DB tối đa (bằng mặc định của HikariCP, ghi ra cho rõ). Hết kết nối thì request xếp hàng chờ (`hikaricp.connections.pending`), quá 30 giây thì lỗi |
+| `management.endpoints.web.exposure.include` | `health,metrics` | Mở `/actuator/health`, `/actuator/metrics/{tên}` (vd `hikaricp.connections.pending`). App chưa có xác thực: lên môi trường thật thì phải chặn hoặc tách sang cổng riêng (`management.server.port`) |
+| `server.tomcat.mbeanregistry.enabled` | `true` | Có số đo luồng Tomcat (`tomcat.threads.busy`, `tomcat.threads.config.max`) trong `/actuator/metrics`. Khi chạy trên luồng ảo, `tomcat.threads.busy` là `-1` (không có pool luồng) |
 | `shoplab.order-detail.payment-history-delay`, `recommendations-delay` | `300ms`, `400ms` | Độ trễ của hai nguồn giả lập (đứng thay cho cổng thanh toán, dịch vụ gợi ý) trên trang chi tiết đơn |
 | `shoplab.order-detail.required-timeout` | `2s` | Hạn (`orTimeout`) của mỗi lời gọi bắt buộc của trang chi tiết đơn (đơn, sản phẩm), tính từ lúc lời gọi bắt đầu: quá hạn thì lời gọi bị ngắt, trang trả 503 `order-detail-timeout` |
 | `shoplab.order-detail.optional-timeout` | `1s` | Hạn của mỗi lời gọi phụ (lịch sử thanh toán, gợi ý): quá hạn thì lời gọi bị ngắt, trang trả về không có phần đó (`unavailable`) |
@@ -695,16 +700,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 Mỗi dòng có thời điểm (ms) và tên luồng, nên lọc theo luồng là thấy trọn một request:
 
 ```
-04:12:01.293 [exec-1] TransactionLogging : BEGIN    DefaultIdempotencyService.execute
-04:12:01.303 [exec-1] JdbcTemplate       : Executing prepared SQL statement [INSERT INTO idempotency_keys ...]
-04:12:01.344 [exec-1] org.hibernate.SQL  : select ... from users u1_0 join accounts a1_0 ...
-04:12:01.452 [exec-1] JdbcTemplate       : Executing prepared SQL statement [UPDATE products SET stock = stock - ? ... WHERE id = ? AND active AND stock >= ? RETURNING ...]
-04:12:01.510 [exec-1] org.hibernate.SQL  : insert into orders ...
-04:12:01.516 [exec-1] org.hibernate.SQL  : insert into order_items ...
-04:12:01.550 [exec-1] JdbcTemplate       : Executing prepared SQL statement [UPDATE idempotency_keys SET status = ? ...]
-04:12:01.558 [exec-1] TransactionLogging : COMMIT   DefaultIdempotencyService.execute
+04:12:01.293 [handler-7] TransactionLogging : BEGIN    DefaultIdempotencyService.execute
+04:12:01.303 [handler-7] JdbcTemplate       : Executing prepared SQL statement [INSERT INTO idempotency_keys ...]
+04:12:01.344 [handler-7] org.hibernate.SQL  : select ... from users u1_0 join accounts a1_0 ...
+04:12:01.452 [handler-7] JdbcTemplate       : Executing prepared SQL statement [UPDATE products SET stock = stock - ? ... WHERE id = ? AND active AND stock >= ? RETURNING ...]
+04:12:01.510 [handler-7] org.hibernate.SQL  : insert into orders ...
+04:12:01.516 [handler-7] org.hibernate.SQL  : insert into order_items ...
+04:12:01.550 [handler-7] JdbcTemplate       : Executing prepared SQL statement [UPDATE idempotency_keys SET status = ? ...]
+04:12:01.558 [handler-7] TransactionLogging : COMMIT   DefaultIdempotencyService.execute
 ```
 
+- **Tên luồng:** mỗi request chạy trên một luồng ảo mới tên `tomcat-handler-N` (log cắt còn 15 ký tự cuối: `omcat-handler-7`, ví dụ trên viết gọn `handler-7`). N tăng theo từng request, không dùng lại, nên lọc theo tên luồng ra đúng một request. Các nguồn của trang chi tiết đơn chạy trên luồng riêng `order-detail-N`. Chạy app với `--spring.threads.virtual.enabled=false` thì là luồng thường `nio-8080-exec-N`, dùng lại cho nhiều request (xem mục *Virtual thread và connection pool*).
 - `COMMIT` / `ROLLBACK` được ghi **sau** khi connection đã commit / rollback xong, nên mọi câu đứng trước nó trên cùng luồng đã nằm trong DB (khoá cũng được nhả lúc này).
 - Chỉ transaction **mới** có dòng `BEGIN` / `COMMIT`. Service hay repository gọi bên trong (vd `UserDirectory`, `ProductInventory` khi đặt hàng) chạy chung transaction ngoài nên không có dòng riêng.
 - Giá trị các tham số `?` không được log (có cả email, hash mật khẩu). Cần thì bỏ comment 2 dòng cuối phần log trong `application.properties`, chỉ trên máy mình.
@@ -1034,6 +1040,63 @@ GET /api/orders/999999999/detail -> 404 sau 34,0 ms (không chờ hai nguồn ch
   - sản phẩm treo 10 giây → 503 `order-detail-timeout`, `Retry-After: 1`, luồng sản phẩm bị ngắt.
 - `OrderDetailTimingTests`: so gọi lần lượt (`SequentialOrderDetail`, chỉ có trong test) với `OrderDetailService`, mỗi cách 3 lần, ghi dòng `[so-do] order-detail ...` cho thẻ sổ đo (xem *Sổ đo trước / sau*).
 - **Bản lỗi gọi lần lượt** (`scripts/bugs/15-order-detail-sequential.patch`, kịch bản `order-detail-serial` của `red-green.ps1`): test đỏ với `total` 725,6 ms.
+
+#### Virtual thread và connection pool: tải k6 (`scripts/load-test.ps1`)
+
+Kịch bản k6 `scripts/k6/order-detail-load.js`: 200 người dùng ảo (VU) gọi trang chi tiết đơn liên tục trong 2 phút, không nghỉ giữa hai lần gọi, mỗi lần một đơn ngẫu nhiên trong 1.000 đơn mới nhất (lấy qua `GET /api/orders`). Song song đó, 2 lần mỗi giây, k6 đọc qua Actuator:
+- `hikaricp.connections.pending`: request đang xếp hàng chờ kết nối;
+- `hikaricp.connections.active`, `tomcat.threads.busy`, `process.cpu.usage`.
+
+`scripts/load-test.ps1` build app, rồi chạy app (`java -jar`, log SQL tắt) với từng cấu hình. Mỗi lượt chạy k6 15 giây cho nóng máy rồi mới đo:
+
+| Lượt | `spring.threads.virtual.enabled` | Pool kết nối |
+|---|---|---|
+| `platform` (TRƯỚC) | `false`: Tomcat có pool 200 luồng thường | 10 |
+| `virtual` (SAU, cấu hình hiện tại của app) | `true`: mỗi request một luồng ảo | 10 |
+| `pool5` | `true` | 5 |
+
+Thêm hai lượt tham khảo, 400 VU trong 30 giây, chạy ngay sau `platform` và `virtual`. Sau mỗi lượt, script đọc `hikaricp.connections.acquire` (tổng thời gian chờ lấy kết nối và số lần lấy, lấy số sau trừ số trước) và `jvm.threads.peak`.
+
+```powershell
+docker compose up -d   # DB đã có đơn; dừng app đang chạy trước, script tự chạy app
+powershell -ExecutionPolicy Bypass -File .\scripts\load-test.ps1                                     # 3 lượt + tham khảo, khoảng 9 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\load-test.ps1 -Case pool5 -PoolSize 3 -SkipBuild  # một lượt, pool 3 kết nối
+powershell -ExecutionPolicy Bypass -File .\scripts\load-test.ps1 -Duration 30s -ReferenceVus 0       # chạy thử nhanh
+```
+Máy chưa cài k6 thì script chạy k6 bằng Docker (image `grafana/k6:1.3.0`, gọi app qua `host.docker.internal`). Cài k6 trên Windows: `winget install k6 --source winget`. Log của app ở `target/load-test/<lượt>.log`.
+
+Kết quả (máy 4 CPU, 2 triệu đơn; ms là thời gian k6 chờ):
+
+| Lượt | VU | req/s | p50 | p95 | p99 | Lỗi | Luồng Tomcat bận TB / max | Luồng JVM lớn nhất | CPU app | Pending TB / max | Chờ lấy kết nối TB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `platform` | 200 | **493,8** | 402,0 | **408,7** | 424,5 | 0 | 199 / 200 | 226 | 27 % | 0,1 / 14 | 0,2 ms |
+| `virtual` | 200 | **494,2** | 401,7 | **407,6** | 437,1 | 0 | – | 25 | 22 % | 0,1 / 11 | 0,3 ms |
+| `pool5` | 200 | 493,6 | 401,8 | 410,5 | 435,7 | 0 | – | 25 | 22 % | 1,9 / **47** | 2,1 ms |
+| `platform-400` (tham khảo) | 400 | 489,6 | 809,1 | 837,6 | 1020,1 | 0 | 200 / 200 | 226 | 21 % | 3,1 / 47 | 1,4 ms |
+| `virtual-400` (tham khảo) | 400 | **971,8** | 402,4 | 414,0 | 438,6 | 0 | – | 25 | 30 % | 3,5 / 21 | 1,8 ms |
+
+- **200 VU: luồng ảo không tăng thông lượng** (493,8 → 494,2 req/s). Thẻ ghi "không tăng thì nút thắt nằm ở connection pool hoặc CPU", nhưng ở đây cả hai đều không phải: CPU của app khoảng 25 %, chờ kết nối dưới 1 ms. Nút thắt là chính lượng tải:
+  - k6 chạy kiểu đóng: mỗi VU chờ xong mới gọi tiếp, nên tối đa 200 / 0,402 s ≈ 498 req/s. Cả hai cách đều chạm trần này.
+  - 200 VU vừa bằng 200 luồng của Tomcat. Luồng Tomcat bận 199 / 200, nhưng không request nào phải chờ luồng.
+  - Luồng Tomcat chỉ ngồi chờ `join()`. Việc chờ thật (300 / 400 ms) đã chạy trên luồng ảo của `orderDetailExecutor` từ trước (mục *Trang chi tiết đơn*).
+- **400 VU: luồng ảo gấp đôi.** Luồng thường chỉ chạy được 200 request cùng lúc (bận 200 / 200), nửa còn lại xếp hàng chờ luồng. Thông lượng vì vậy đứng ở khoảng 490 req/s, p95 lên 837,6 ms (400 ms xử lý cộng khoảng 400 ms chờ luồng). Với luồng ảo, mỗi request một luồng: 971,8 req/s, p95 vẫn 414 ms. Đây là trường hợp thẻ nói tới: request chủ yếu chờ I/O, và số request đồng thời vượt số luồng.
+- **Luồng hệ điều hành:** chạy luồng thường, JVM có tới 226 luồng; chạy luồng ảo chỉ 25. Luồng ảo không tính vào `jvm.threads.*`; khi đang chờ I/O, nó không giữ luồng hệ điều hành nào.
+- **Pool 5 kết nối: request có xếp hàng chờ kết nối, nhưng trang không chậm hơn.**
+  - Có tới 47 request cùng chờ một lúc, mỗi lần lấy kết nối chờ trung bình 2,1 ms (pool 10: 0,3 ms); req/s và p95 gần như không đổi.
+  - Lý do: nhánh DB (đơn rồi sản phẩm, mỗi lần giữ kết nối khoảng 1,5 ms) chạy song song với nguồn gợi ý 400 ms, nên chờ thêm để lấy kết nối mà vẫn xong trước nhánh chậm nhất.
+  - Pool thành nút thắt khi nhu cầu vượt số kết nối. Nhu cầu ở đây: 494 req/s × 2 lần lấy × 1,5 ms ≈ 1,5 kết nối bận trung bình.
+- **Với luồng ảo, giới hạn chuyển xuống pool kết nối.** Không còn trần 200 luồng: hàng nghìn luồng ảo có thể cùng chờ 5 kết nối. Chờ quá hạn của nguồn bắt buộc (`required-timeout`, 2 giây) thì trang trả 503 `order-detail-timeout`; quá `connection-timeout` của Hikari (30 giây) thì lỗi kết nối. Thử `-Case pool5 -PoolSize 2` để thấy hàng chờ dài hơn: lần chạy 30 giây ra pending trung bình 16,9, lớn nhất 95, chờ trung bình 14 ms, p95 420,9 ms (vẫn chưa chậm đáng kể). Pool 1 thì app không khởi động được: Flyway cần 2 kết nối cùng lúc, chờ 30 giây rồi lỗi.
+- **Pending là mẫu tức thời** (2 lần mỗi giây), chỉ cho thấy có xếp hàng. Thời gian chờ trung bình lấy từ `hikaricp.connections.acquire` thì chính xác hơn.
+
+Xem tay khi app đang chạy:
+```powershell
+curl.exe -s http://localhost:8080/actuator/metrics/hikaricp.connections.pending   # {...,"measurements":[{"statistic":"VALUE","value":0.0}],"name":"hikaricp.connections.pending"}
+curl.exe -s http://localhost:8080/actuator/metrics/hikaricp.connections.acquire   # COUNT, TOTAL_TIME (giây), MAX
+```
+
+**Test:** `VirtualThreadAndPoolTests`:
+- request chạy trên luồng ảo: log `BEGIN` có tên luồng `...handler-N`, không phải `...-exec-N`. Chạy test với `-Dspring.threads.virtual.enabled=false` thì đỏ;
+- `/actuator/health` UP, đọc được `hikaricp.connections.pending` và `hikaricp.connections.max` = 10.
 
 ### Người dùng – `/api/users`
 
@@ -1898,6 +1961,7 @@ src/test/java/com/shoplab/
 ├── IntegrationTestBase.java                  nền chung cho integration test qua HTTP
 ├── Concurrently.java                         chạy N tác vụ cùng lúc (virtual thread + CountDownLatch)
 ├── SqlLoggingTests.java                      log SQL và BEGIN / COMMIT / ROLLBACK in đúng thứ tự
+├── VirtualThreadAndPoolTests.java            request chạy trên luồng ảo; Actuator mở số đo pool kết nối
 ├── ModularityTests.java                      kiểm tra cấu trúc module, sinh tài liệu module
 ├── DatabaseModularityTests.java              bảng thuộc module nào, không có khoá ngoại chéo module
 ├── common/web/         GlobalExceptionHandlerTests
