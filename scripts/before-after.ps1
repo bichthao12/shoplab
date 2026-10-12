@@ -4,10 +4,10 @@
   để nhập vào sổ (dấu phẩy thập phân) và kiểm tra plan có đúng như thẻ ghi không.
 
 .DESCRIPTION
-  Chỉ chạy SQL qua docker exec psql (không gọi API, không chạy test). Không đổi DB. Thẻ cần trạng thái "chưa có index"
-  thì index đó bị bỏ TRONG một transaction rồi ROLLBACK: index trở lại nguyên vẹn, không phải dựng lại; lỗi hay Ctrl+C
-  giữa chừng thì kết nối đóng và PostgreSQL tự rollback. Trong mấy giây đo phần đó, bảng bị khoá (request của app phải
-  chờ); nếu một transaction khác đang dùng bảng, script chờ tối đa 5 giây rồi báo lỗi thay vì treo.
+  Chỉ chạy SQL qua docker exec psql (không gọi API, không chạy test). Không đổi DB. Trạng thái nào cần bỏ hay thêm
+  index thì làm việc đó TRONG một transaction rồi ROLLBACK: index trở lại đúng như cũ, không phải dựng lại; lỗi hay
+  Ctrl+C giữa chừng thì kết nối đóng và PostgreSQL tự rollback. Trong mấy giây đo phần đó, bảng bị khoá (request của
+  app phải chờ); nếu một transaction khác đang dùng bảng, script chờ tối đa 5 giây rồi báo lỗi thay vì treo.
 
   Các thẻ (-Case, mặc định all: đo mọi thẻ rồi in bảng tóm tắt):
     user-orders  Đơn mới nhất của một user
@@ -23,12 +23,20 @@
                  Kế hoạch: Seq Scan → Index Scan hoặc Bitmap Scan
                  :day mặc định 2026-10-01 (-Day để chọn). Script kiểm tra hai câu trả cùng số đơn. Ngày tính theo
                  TimeZone của phiên (UTC trong docker compose), cho cả DATE() lẫn khoảng ngày.
+    pending      Đơn đang chờ xử lý
+                 SELECT * FROM orders WHERE status = 'PENDING' ORDER BY created_at LIMIT 50
+                 Cách sửa: partial index ON orders (created_at) WHERE status = 'PENDING'. "Sau": tạo index đó.
+                 Kế hoạch: Seq Scan → Index Scan trên index nhỏ chỉ chứa đơn PENDING
+                 "Trước" như thẻ: không index nào dùng được cho câu này, tức bỏ idx_orders_created_at và
+                 idx_orders_status. Script đo thêm "DB hiện tại" (còn hai index đó, chưa có partial index) để tham khảo:
+                 dữ liệu sinh rải đơn PENDING đều trong 2 năm, nên đi theo idx_orders_created_at từ đơn cũ nhất sớm gặp
+                 đủ 50 đơn PENDING; đơn PENDING thật thường dồn về gần đây, cách đó sẽ phải đọc gần hết đơn cũ.
 
   Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu đo xong và mọi plan đúng như thẻ, 1 nếu có plan khác thẻ, 2 nếu không chạy được.
 
 .PARAMETER Case
-  Thẻ cần đo: all (mặc định), user-orders, day-orders.
+  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending.
 
 .PARAMETER UserId
   :uid cho thẻ user-orders. Bỏ trống: tự chọn một user có 8–12 đơn.
@@ -43,10 +51,10 @@
   powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case day-orders -Day 2026-09-15
+  powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 #>
 param(
-    [ValidateSet('all', 'user-orders', 'day-orders')][string]$Case = 'all',
+    [ValidateSet('all', 'user-orders', 'day-orders', 'pending')][string]$Case = 'all',
     [long]$UserId = 0,
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$Day = '2026-10-01',
     [ValidateRange(1, 20)][int]$Runs = 3
@@ -103,9 +111,18 @@ function Test-IndexExists([string]$name) {
     return @(Invoke-Sql "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname = '$name'")[0] -eq '1'
 }
 
+function Test-HasNode($nodes, [string]$pattern) {
+    return [bool]($nodes | Where-Object { $_.'Node Type' -like $pattern })
+}
+
+function Test-UsesIndex($nodes, [string]$index) {
+    return [bool]($nodes | Where-Object { $_.'Index Name' -eq $index })
+}
+
 # ---------------------------------------------------------------------------------------------------------------
-# 1. Các thẻ. Before / After: câu đo; DropIndex: index bỏ (trong transaction) cho phần "trước", trống nếu hai câu
-# chạy trên cùng DB; BeforeOk / AfterOk: plan mong đợi theo thẻ (nhận danh sách nút của plan).
+# 1. Các thẻ. Mỗi thẻ có các pha: before (số "trước" của sổ), after (số "sau"), và có thể thêm current (DB hiện tại,
+# để tham khảo). Pha có Setup thì chạy trong transaction: Setup, đo, ROLLBACK. Info: câu SQL in thêm thông tin, chạy
+# cuối pha (trước ROLLBACK). MustExist / MustNotExist: trạng thái index sau khi đo, kiểm tra DB không đổi.
 
 function New-UserOrdersCard {
     $uid = $UserId
@@ -121,18 +138,20 @@ function New-UserOrdersCard {
     $orderCount = @(Invoke-Sql "SELECT count(*) FROM orders WHERE user_id = $uid")[0]
     $query = "SELECT * FROM orders WHERE user_id = $uid ORDER BY created_at DESC LIMIT 20"
     return @{
-        Title     = 'Đơn mới nhất của một user'
-        Note      = "user $uid có $orderCount đơn"
-        Before    = $query
-        After     = $query
-        DropIndex = 'idx_orders_user_id_created_at'
-        Fix       = 'index ghép (user_id, created_at) = idx_orders_user_id_created_at; "trước" = bỏ index đó'
-        Expect    = 'Seq Scan và Sort → Index Scan, không còn bước Sort'
-        BeforeOk  = { param($nodes) [bool]($nodes | Where-Object { $_.'Node Type' -like '*Seq Scan' }) -and
-                                    [bool]($nodes | Where-Object { $_.'Node Type' -like '*Sort' }) }
-        AfterOk   = { param($nodes) [bool]($nodes | Where-Object { $_.'Index Name' -eq 'idx_orders_user_id_created_at' }) -and
-                                    -not ($nodes | Where-Object { $_.'Node Type' -like '*Sort' }) }
-        Hint      = 'user nhiều đơn gần đây? chạy lại không kèm -UserId, hoặc chọn user khác'
+        Title        = 'Đơn mới nhất của một user'
+        Note         = "user $uid có $orderCount đơn"
+        Fix          = 'index ghép (user_id, created_at) = idx_orders_user_id_created_at'
+        Expect       = 'Seq Scan và Sort → Index Scan, không còn bước Sort'
+        Phases       = @(
+            @{ Key = 'before'; Label = 'Trước'; Query = $query; Setup = @('DROP INDEX public.idx_orders_user_id_created_at')
+               Describe = 'bỏ idx_orders_user_id_created_at (trong transaction)' }
+            @{ Key = 'after'; Label = 'Sau'; Query = $query; Setup = @(); Describe = 'DB hiện tại, có index ghép' }
+        )
+        MustExist    = @('idx_orders_user_id_created_at')
+        MustNotExist = @()
+        BeforeOk     = { param($n) (Test-HasNode $n '*Seq Scan') -and (Test-HasNode $n '*Sort') }
+        AfterOk      = { param($n) (Test-UsesIndex $n 'idx_orders_user_id_created_at') -and -not (Test-HasNode $n '*Sort') }
+        Hint         = 'user nhiều đơn gần đây? chạy lại không kèm -UserId, hoặc chọn user khác'
     }
 }
 
@@ -149,72 +168,112 @@ function New-DayOrdersCard {
         Write-Host "  Ngày $Day không có đơn nào: chọn ngày khác bằng -Day (dữ liệu sinh rải trong 2 năm gần nhất)." -ForegroundColor Yellow
     }
     return @{
-        Title     = 'Đơn trong một ngày'
-        Note      = "ngày $Day có $($counts[0]) đơn, hai cách viết trả cùng số đơn"
-        Before    = $before
-        After     = $after
-        DropIndex = ''
-        Fix       = 'viết thành khoảng ngày, dùng index idx_orders_created_at có sẵn'
-        Expect    = 'Seq Scan → Index Scan hoặc Bitmap Scan'
-        BeforeOk  = { param($nodes) [bool]($nodes | Where-Object { $_.'Node Type' -like '*Seq Scan' }) }
-        AfterOk   = { param($nodes) [bool]($nodes | Where-Object { $_.'Index Name' -eq 'idx_orders_created_at' }) -and
-                                    -not ($nodes | Where-Object { $_.'Node Type' -like '*Seq Scan' }) }
-        Hint      = ''
+        Title        = 'Đơn trong một ngày'
+        Note         = "ngày $Day có $($counts[0]) đơn, hai cách viết trả cùng số đơn"
+        Fix          = 'viết thành khoảng ngày, dùng index idx_orders_created_at có sẵn'
+        Expect       = 'Seq Scan → Index Scan hoặc Bitmap Scan'
+        Phases       = @(
+            @{ Key = 'before'; Label = 'Trước'; Query = $before; Setup = @(); Describe = 'DATE(created_at) = ngày' }
+            @{ Key = 'after'; Label = 'Sau'; Query = $after; Setup = @(); Describe = 'khoảng ngày nửa mở' }
+        )
+        MustExist    = @()
+        MustNotExist = @()
+        BeforeOk     = { param($n) Test-HasNode $n '*Seq Scan' }
+        AfterOk      = { param($n) (Test-UsesIndex $n 'idx_orders_created_at') -and -not (Test-HasNode $n '*Seq Scan') }
+        Hint         = ''
+    }
+}
+
+function New-PendingCard {
+    $partial = 'idx_orders_pending_created_at'
+    if (Test-IndexExists $partial) {
+        Stop-Script "Index $partial đã có trong DB: bỏ nó trước (DROP INDEX $partial) để đo được trạng thái trước."
+    }
+    $counts = @(Invoke-Sql "SELECT count(*) FILTER (WHERE status = 'PENDING') || '|' || count(*) FROM orders")[0] -split '\|'
+    $query = "SELECT * FROM orders WHERE status = 'PENDING' ORDER BY created_at LIMIT 50"
+    return @{
+        Title        = 'Đơn đang chờ xử lý'
+        Note         = "$($counts[0]) đơn PENDING trên $($counts[1]) đơn"
+        Fix          = "partial index ON orders (created_at) WHERE status = 'PENDING' (tạm đặt tên $partial)"
+        Expect       = 'Seq Scan → Index Scan trên index nhỏ chỉ chứa đơn PENDING'
+        Phases       = @(
+            @{ Key = 'before'; Label = 'Trước'; Query = $query
+               Setup = @('DROP INDEX public.idx_orders_created_at', 'DROP INDEX public.idx_orders_status')
+               Describe = 'như thẻ: không index nào dùng được (bỏ idx_orders_created_at, idx_orders_status trong transaction)' }
+            @{ Key = 'after'; Label = 'Sau'; Query = $query
+               Setup = @("CREATE INDEX $partial ON orders (created_at) WHERE status = 'PENDING'")
+               Info = "SELECT 'info|Partial index: ' || pg_size_pretty(pg_relation_size('$partial')) || ', chỉ chứa đơn PENDING'"
+               Describe = 'tạo partial index (trong transaction)' }
+            @{ Key = 'current'; Label = 'DB hiện tại'; Query = $query; Setup = @()
+               Describe = 'để tham khảo: còn idx_orders_created_at, idx_orders_status, chưa có partial index' }
+        )
+        MustExist    = @('idx_orders_created_at', 'idx_orders_status')
+        MustNotExist = @($partial)
+        BeforeOk     = { param($n) (Test-HasNode $n '*Seq Scan') -and (Test-HasNode $n '*Sort') }
+        AfterOk      = { param($n) (Test-UsesIndex $n 'idx_orders_pending_created_at') -and -not (Test-HasNode $n '*Sort') -and
+                                   -not (Test-HasNode $n '*Seq Scan') }
+        Hint         = ''
     }
 }
 
 # ---------------------------------------------------------------------------------------------------------------
-# 2. Đo một thẻ trong MỘT phiên psql: phần "trước" (trong transaction có DROP INDEX rồi ROLLBACK nếu thẻ cần), rồi
-# phần "sau". Hàm tạm trả kết quả EXPLAIN dạng JSON trên một dòng để đọc lại.
+# 2. Đo một thẻ trong MỘT phiên psql. Hàm tạm trả kết quả EXPLAIN dạng JSON trên một dòng để đọc lại.
 
 function Measure-Card($card) {
     Write-Host "== $($card.Title) ($($card.Note))" -ForegroundColor Cyan
-    if ($card.Before -eq $card.After) {
-        Write-Host "  $($card.Before)"
-    } else {
-        Write-Host "  trước: $($card.Before)"
-        Write-Host "  sau:   $($card.After)"
+    foreach ($phase in $card.Phases) {
+        Write-Host ("  {0}: {1}" -f $phase.Label, $phase.Describe)
+        Write-Host "    $($phase.Query)"
     }
     Write-Host "  Cách sửa: $($card.Fix)"
     Write-Host "  Kế hoạch theo thẻ: $($card.Expect)"
 
-    if ($card.DropIndex -and -not (Test-IndexExists $card.DropIndex)) {
-        Stop-Script "Không thấy index $($card.DropIndex): chưa chạy app lần nào (Flyway tạo index), hoặc index đã bị xoá."
+    foreach ($name in $card.MustExist) {
+        if (-not (Test-IndexExists $name)) {
+            Stop-Script "Không thấy index ${name}: chưa chạy app lần nào (Flyway tạo index), hoặc index đã bị xoá."
+        }
     }
 
     $explain = 'CREATE FUNCTION pg_temp.explain_json(q text) RETURNS text LANGUAGE plpgsql AS $f$ ' +
                'DECLARE p json; BEGIN EXECUTE ''EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) '' || q INTO p; ' +
                'RETURN p::jsonb::text; END $f$'
-    $beforeCall = "SELECT 'before|' || pg_temp.explain_json('$($card.Before.Replace("'", "''"))')"
-    $afterCall = "SELECT 'after|' || pg_temp.explain_json('$($card.After.Replace("'", "''"))')"
-    $sessionArgs = @('-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', $explain)
-    if ($card.DropIndex) {
-        $sessionArgs += @('-c', "SET lock_timeout = '5s'", '-c', 'BEGIN', '-c', "DROP INDEX public.$($card.DropIndex)")
+    $sessionArgs = @('-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', $explain, '-c', "SET lock_timeout = '5s'")
+    foreach ($phase in $card.Phases) {
+        $call = "SELECT '$($phase.Key)|' || pg_temp.explain_json('$($phase.Query.Replace("'", "''"))')"
+        $inTransaction = @($phase.Setup).Count -gt 0
+        if ($inTransaction) {
+            $sessionArgs += @('-c', 'BEGIN')
+            foreach ($sql in $phase.Setup) { $sessionArgs += @('-c', $sql) }
+        }
+        for ($i = 0; $i -lt $Runs; $i++) { $sessionArgs += @('-c', $call) }
+        if ($phase.Info) { $sessionArgs += @('-c', $phase.Info) }
+        if ($inTransaction) { $sessionArgs += @('-c', 'ROLLBACK') }
     }
-    for ($i = 0; $i -lt $Runs; $i++) { $sessionArgs += @('-c', $beforeCall) }
-    if ($card.DropIndex) { $sessionArgs += @('-c', 'ROLLBACK') }
-    for ($i = 0; $i -lt $Runs; $i++) { $sessionArgs += @('-c', $afterCall) }
 
     $result = Invoke-Docker ($psql + $sessionArgs)
     if ($result.ExitCode -ne 0) {
         Stop-Script ("Đo không được (DB không đổi: lỗi thì PostgreSQL tự rollback):`n  $($result.Lines -join "`n  ")" +
                      "`n  Gặp 'lock timeout': đang có transaction khác dùng bảng, tắt app hoặc chạy lại sau.")
     }
-    if ($card.DropIndex -and -not (Test-IndexExists $card.DropIndex)) {
-        Stop-Script "SAI: sau khi đo không còn thấy index $($card.DropIndex)!"
+    foreach ($name in $card.MustExist) {
+        if (-not (Test-IndexExists $name)) { Stop-Script "SAI: sau khi đo không còn thấy index $name!" }
+    }
+    foreach ($name in $card.MustNotExist) {
+        if (Test-IndexExists $name) { Stop-Script "SAI: sau khi đo vẫn còn index $name!" }
     }
 
-    $measured = foreach ($line in ($result.Lines | Where-Object { $_ -match '^(before|after)\|' })) {
-        $phase, $json = $line -split '\|', 2
+    $measured = foreach ($line in ($result.Lines | Where-Object { $_ -match '^[a-z]+\|\[' })) {
+        $key, $json = $line -split '\|', 2
         $explainResult = @($json | ConvertFrom-Json)[0]
         $nodes = @(Get-PlanNodes $explainResult.Plan)
         $scans = @($nodes | Where-Object { $_.'Node Type' -like '*Scan' -and $_.'Node Type' -ne 'Bitmap Index Scan' })
         [pscustomobject]@{
-            Phase = $phase
+            Key   = $key
             Ms    = [double]$explainResult.'Execution Time'
             Plan  = (($nodes | ForEach-Object {
                         $n = $_.'Node Type'
                         if ($_.'Parallel Aware' -and $n -like '*Scan') { $n = "Parallel $n" }
+                        if ($_.'Scan Direction' -eq 'Backward') { $n += ' Backward' }
                         if ($_.'Index Name') { $n += " using $($_.'Index Name')" }
                         $n
                     }) -join ' → ')
@@ -227,31 +286,38 @@ function Measure-Card($card) {
             Nodes = $nodes
         }
     }
-    $before = @($measured | Where-Object { $_.Phase -eq 'before' })
-    $after = @($measured | Where-Object { $_.Phase -eq 'after' })
-    if ($before.Count -ne $Runs -or $after.Count -ne $Runs) {
-        Stop-Script "Không đọc được kết quả EXPLAIN:`n  $($result.Lines -join "`n  ")"
+    $byPhase = @{}
+    foreach ($phase in $card.Phases) {
+        $byPhase[$phase.Key] = @($measured | Where-Object { $_.Key -eq $phase.Key })
+        if ($byPhase[$phase.Key].Count -ne $Runs) {
+            Stop-Script "Không đọc được kết quả EXPLAIN:`n  $($result.Lines -join "`n  ")"
+        }
     }
 
     $table = for ($i = 0; $i -lt $Runs; $i++) {
-        [pscustomobject]@{
-            'Lần'          = $i + 1
-            'Trước (ms)'   = Format-Ms $before[$i].Ms
-            'Trước: trang' = $before[$i].Pages
-            'Sau (ms)'     = Format-Ms $after[$i].Ms
-            'Sau: trang'   = $after[$i].Pages
+        $row = [ordered]@{ 'Lần' = $i + 1 }
+        foreach ($phase in $card.Phases) {
+            $row["$($phase.Label) (ms)"] = Format-Ms $byPhase[$phase.Key][$i].Ms
+            $row["$($phase.Label): trang"] = $byPhase[$phase.Key][$i].Pages
         }
+        [pscustomobject]$row
     }
-    $table | Format-Table -AutoSize | Out-String -Width 120 | Write-Host
+    $table | Format-Table -AutoSize | Out-String -Width 160 | Write-Host
 
     $last = $Runs - 1
-    Write-Host "  Plan trước: $($before[$last].Plan)"
-    Write-Host ("              đọc {0} dòng (kể cả dòng lọc bỏ), {1} trang 8 KB" -f $before[$last].Rows, $before[$last].Pages)
-    Write-Host "  Plan sau:   $($after[$last].Plan)"
-    Write-Host ("              đọc {0} dòng, {1} trang 8 KB" -f $after[$last].Rows, $after[$last].Pages)
+    foreach ($phase in $card.Phases) {
+        $m = $byPhase[$phase.Key][$last]
+        Write-Host ("  Plan ({0}): {1}" -f $phase.Label, $m.Plan)
+        Write-Host ("      đọc {0} dòng (kể cả dòng lọc bỏ), {1} trang 8 KB" -f $m.Rows, $m.Pages)
+    }
+    foreach ($line in ($result.Lines | Where-Object { $_ -like 'info|*' })) {
+        Write-Host "  $($line.Substring(5))"
+    }
 
-    $beforeOk = & $card.BeforeOk $before[$last].Nodes
-    $afterOk = & $card.AfterOk $after[$last].Nodes
+    $before = $byPhase['before'][$last]
+    $after = $byPhase['after'][$last]
+    $beforeOk = & $card.BeforeOk $before.Nodes
+    $afterOk = & $card.AfterOk $after.Nodes
     $verdict = 'khớp thẻ'
     if (-not ($beforeOk -and $afterOk)) {
         $verdict = 'KHÁC THẺ'
@@ -260,14 +326,20 @@ function Measure-Card($card) {
         if (-not $beforeOk) { Write-Host ('  KHÁC THẺ: plan "trước" không như thẻ ghi{0}.' -f $hint) -ForegroundColor Yellow }
         if (-not $afterOk) { Write-Host '  KHÁC THẺ: plan "sau" không như thẻ ghi.' -ForegroundColor Yellow }
     }
-    Write-Host ("  Nhập vào sổ: TRƯỚC {0}   SAU {1}   ({2})" -f (Format-Ms $before[$last].Ms), (Format-Ms $after[$last].Ms), $verdict) -ForegroundColor Cyan
+    Write-Host ("  Nhập vào sổ: TRƯỚC {0}   SAU {1}   ({2})" -f (Format-Ms $before.Ms), (Format-Ms $after.Ms), $verdict) -ForegroundColor Cyan
+    $extra = ''
+    if ($byPhase.ContainsKey('current')) {
+        $extra = Format-Ms $byPhase['current'][$last].Ms
+        Write-Host "  (Tham khảo, không nhập vào sổ: DB hiện tại $extra)"
+    }
     Write-Host ''
     return [pscustomobject]@{
-        'Thẻ'   = $card.Title
-        'TRƯỚC' = Format-Ms $before[$last].Ms
-        'SAU'   = Format-Ms $after[$last].Ms
-        'Plan'  = $verdict
-        Ok      = ($beforeOk -and $afterOk)
+        'Thẻ'                  = $card.Title
+        'TRƯỚC'                = Format-Ms $before.Ms
+        'SAU'                  = Format-Ms $after.Ms
+        'Plan'                 = $verdict
+        'DB hiện tại (tham khảo)' = $extra
+        Ok                     = ($beforeOk -and $afterOk)
     }
 }
 
@@ -284,9 +356,11 @@ Write-Host ''
 $summary = @()
 if ($Case -in @('all', 'user-orders')) { $summary += Measure-Card (New-UserOrdersCard) }
 if ($Case -in @('all', 'day-orders')) { $summary += Measure-Card (New-DayOrdersCard) }
+if ($Case -in @('all', 'pending')) { $summary += Measure-Card (New-PendingCard) }
 
 Write-Host 'Nhập vào sổ đo (lần cuối, dấu phẩy thập phân):' -ForegroundColor Cyan
-$summary | Select-Object 'Thẻ', 'TRƯỚC', 'SAU', 'Plan' | Format-Table -AutoSize | Out-String -Width 120 | Write-Host
+$summary | Select-Object 'Thẻ', 'TRƯỚC', 'SAU', 'Plan', 'DB hiện tại (tham khảo)' | Format-Table -AutoSize |
+    Out-String -Width 160 | Write-Host
 
 if (@($summary | Where-Object { -not $_.Ok }).Count -eq 0) {
     Write-Host 'ĐÚNG: plan của mọi thẻ khớp thẻ' -ForegroundColor Green

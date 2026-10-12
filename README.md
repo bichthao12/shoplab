@@ -228,15 +228,20 @@ Kết quả đo (dữ liệu đã nằm sẵn trong bộ nhớ, thời gian là 
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1                          # mọi thẻ, kèm bảng tóm tắt
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case user-orders -UserId 1
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case day-orders -Day 2026-09-15
+powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 ```
 
 | Thẻ (`-Case`) | Trước | Sau | Kết quả với 2 triệu đơn (lần cuối) |
 |---|---|---|---|
 | `user-orders`: đơn mới nhất của một user | `SELECT * FROM orders WHERE user_id = :uid ORDER BY created_at DESC LIMIT 20`, **không có** `idx_orders_user_id_created_at` | cùng câu đó, có index ghép | trước: `Parallel Seq Scan` + `Sort`, đọc 2 triệu dòng, 97 ms. Sau: `Index Scan using idx_orders_user_id_created_at`, không còn `Sort`, đọc 8 dòng, 0,053 ms |
 | `day-orders`: đơn trong một ngày | `WHERE DATE(created_at) = '2026-10-01'` | `WHERE created_at >= '2026-10-01' AND created_at < '2026-10-02'` | trước: `Parallel Seq Scan`, đọc 2 triệu dòng, 195 ms. Sau: `Index Scan using idx_orders_created_at`, đọc 2.739 dòng (58 trang), 0,59 ms. Hai câu trả cùng 2.739 đơn |
+| `pending`: đơn đang chờ xử lý | `SELECT * FROM orders WHERE status = 'PENDING' ORDER BY created_at LIMIT 50`, **không có** `idx_orders_created_at`, `idx_orders_status` (như thẻ: không index nào dùng được) | cùng câu đó, **thêm** partial index `ON orders (created_at) WHERE status = 'PENDING'` | trước: `Parallel Seq Scan` + `Sort`, 126 ms. Sau: `Index Scan` trên partial index (928 kB), đọc 50 dòng, 0,073 ms. DB hiện tại (tham khảo): 0,43 ms |
 
 - **`user-orders`, trạng thái "trước":** script bỏ index ghép **trong một transaction** rồi `ROLLBACK`, nên index trở lại nguyên vẹn, không phải dựng lại. Trong mấy giây đo, bảng bị khoá. Nếu một transaction khác đang dùng `orders`, script báo lỗi sau 5 giây (`lock_timeout`) thay vì treo.
 - **`user-orders`, chọn `:uid`:** mặc định là một user có 8–12 đơn. Với user nhiều đơn (user 1: 832 đơn), plan "trước" không phải `Seq Scan`: PostgreSQL đi theo `idx_orders_created_at` từ đơn mới nhất và lọc `user_id`, bỏ 54.904 dòng, 11,8 ms. Script khi đó báo "KHÁC THẺ" (mã thoát 1).
+- **`pending`:** partial index chưa có trong DB, nên script tạo nó **trong transaction** để đo "sau", rồi `ROLLBACK`.
+  - Số "trước" theo đúng kế hoạch trên thẻ (`Seq Scan`), bằng cách bỏ hai index có thể dùng cho câu này.
+  - Script đo thêm "DB hiện tại" để tham khảo: `Index Scan Backward using idx_orders_created_at`, đọc 2.233 dòng, 0,43 ms. Câu này đã nhanh sẵn vì dữ liệu sinh rải đơn PENDING đều trong 2 năm (2%), nên đi theo `created_at` từ đơn cũ nhất sớm gặp đủ 50 đơn. Ở shop thật, đơn PENDING thường dồn về những ngày gần đây (đơn cũ đã thanh toán hay bị huỷ), khi đó cách này phải đọc gần hết đơn cũ. Partial index thì chỉ chứa đơn PENDING, nên lúc nào cũng chỉ đọc đúng 50 đơn.
 - **`day-orders`:** hai câu chạy trên cùng DB, vì index `created_at` vẫn ở đó, chỉ là câu bọc `DATE()` không dùng được nó. Script kiểm tra hai câu trả cùng số đơn. Ngày tính theo TimeZone của phiên (UTC trong docker compose) cho cả hai câu; muốn tính theo giờ Việt Nam, xem mục bên dưới.
 
 ### Viết lại `DATE(created_at) = …` thành khoảng thời gian (`scripts/date-range-lab.sql`)
