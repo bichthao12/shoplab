@@ -31,15 +31,26 @@
                  idx_orders_status. Script đo thêm "DB hiện tại" (còn hai index đó, chưa có partial index) để tham khảo:
                  dữ liệu sinh rải đơn PENDING đều trong 2 năm, nên đi theo idx_orders_created_at từ đơn cũ nhất sớm gặp
                  đủ 50 đơn PENDING; đơn PENDING thật thường dồn về gần đây, cách đó sẽ phải đọc gần hết đơn cũ.
+    user-total   Tổng tiền đã mua của một user
+                 SELECT sum(total_amount) FROM orders WHERE user_id = :uid   (thẻ ghi cột total, bảng của app tên
+                 total_amount)
+                 Cách sửa: thêm INCLUDE (total_amount) vào index của user_id. "Sau": dựng lại
+                 idx_orders_user_id_created_at với cùng các cột khoá, thêm INCLUDE (total_amount) (trong transaction).
+                 Kế hoạch: Index Scan → Index Only Scan, Heap Fetches gần 0
+                 :uid mặc định là user nhiều đơn nhất: lợi ích nằm ở đó, vì mỗi đơn của một user nằm ở một trang khác
+                 nhau của bảng. User vài đơn thì trước / sau gần như bằng nhau. "Trước" với user nhiều đơn thường là
+                 Bitmap Heap Scan thay vì Index Scan: cũng là đọc index rồi ghé bảng, script chấp nhận cả hai. Heap
+                 Fetches chỉ gần 0 khi VACUUM đã đánh dấu các trang all-visible; nhiều thì chạy VACUUM orders.
 
   Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu đo xong và mọi plan đúng như thẻ, 1 nếu có plan khác thẻ, 2 nếu không chạy được.
 
 .PARAMETER Case
-  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending.
+  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending, user-total.
 
 .PARAMETER UserId
-  :uid cho thẻ user-orders. Bỏ trống: tự chọn một user có 8–12 đơn.
+  :uid cho thẻ user-orders và user-total. Bỏ trống: mỗi thẻ tự chọn (user-orders: một user có 8–12 đơn; user-total:
+  user nhiều đơn nhất).
 
 .PARAMETER Day
   :day cho thẻ day-orders (yyyy-MM-dd, mặc định 2026-10-01).
@@ -54,7 +65,7 @@
   powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 #>
 param(
-    [ValidateSet('all', 'user-orders', 'day-orders', 'pending')][string]$Case = 'all',
+    [ValidateSet('all', 'user-orders', 'day-orders', 'pending', 'user-total')][string]$Case = 'all',
     [long]$UserId = 0,
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$Day = '2026-10-01',
     [ValidateRange(1, 20)][int]$Runs = 3
@@ -216,6 +227,55 @@ function New-PendingCard {
     }
 }
 
+function New-UserTotalCard {
+    $uid = $UserId
+    if ($uid -le 0) {
+        # Dữ liệu sinh dồn đơn về các user id nhỏ (user lâu năm): user nhiều đơn nhất nằm trong 100 user đầu
+        $picked = @(Invoke-Sql ('SELECT user_id FROM orders WHERE user_id <= 100 GROUP BY user_id ' +
+                                'ORDER BY count(*) DESC, user_id LIMIT 1'))
+        if ($picked.Count -eq 0) {
+            $picked = @(Invoke-Sql 'SELECT user_id FROM orders WHERE user_id IS NOT NULL GROUP BY user_id ORDER BY count(*) DESC LIMIT 1')
+        }
+        if ($picked.Count -eq 0) { Stop-Script 'Bảng orders chưa có đơn nào. Nạp dữ liệu: scripts/seed-big-data.ps1' }
+        $uid = [long]$picked[0]
+    }
+    $index = 'idx_orders_user_id_created_at'
+    if (-not (Test-IndexExists $index)) {
+        Stop-Script "Không thấy index ${index}: chưa chạy app lần nào (Flyway tạo index), hoặc index đã bị xoá."
+    }
+    $def = @(Invoke-Sql "SELECT pg_get_indexdef('public.$index'::regclass)")[0]
+    if ($def -match 'INCLUDE') {
+        Stop-Script "Index $index đã có INCLUDE ($def): trả nó về như migration V11 rồi đo lại."
+    }
+    $info = @(Invoke-Sql ("SELECT count(*) || '|' || pg_size_pretty(pg_relation_size('public.$index')) " +
+                          "FROM orders WHERE user_id = $uid"))[0] -split '\|'
+    return @{
+        Title        = 'Tổng tiền đã mua của một user'
+        Note         = "user $uid có $($info[0]) đơn; thẻ ghi cột total, bảng của app tên total_amount"
+        Fix          = "thêm INCLUDE (total_amount) vào $index (dựng lại cùng các cột khoá)"
+        Expect       = 'Index Scan → Index Only Scan, Heap Fetches gần 0'
+        Phases       = @(
+            @{ Key = 'before'; Label = 'Trước'; Query = "SELECT sum(total_amount) FROM orders WHERE user_id = $uid"; Setup = @()
+               Describe = "DB hiện tại: $index ($($info[1])), không có total_amount" }
+            @{ Key = 'after'; Label = 'Sau'; Query = "SELECT sum(total_amount) FROM orders WHERE user_id = $uid"
+               Setup = @("DROP INDEX public.$index", "$def INCLUDE (total_amount)")
+               Info = "SELECT 'info|Index $index với INCLUDE (total_amount): ' || pg_size_pretty(pg_relation_size('public.$index')) || ' (trước đó $($info[1]))'"
+               Describe = 'dựng lại index với INCLUDE (total_amount) (trong transaction, vài giây)' }
+        )
+        MustExist    = @($index)
+        MustNotExist = @()
+        SameDef      = @{ $index = $def }
+        # Trước: đọc index rồi ghé bảng (Index Scan hoặc Bitmap Heap Scan); sau: Index Only Scan, ghé bảng gần như 0 lần
+        BeforeOk     = { param($n) ((Test-UsesIndex $n 'idx_orders_user_id_created_at') -or (Test-HasNode $n 'Bitmap Heap Scan')) -and
+                                   -not (Test-HasNode $n 'Index Only Scan') }
+        AfterOk      = { param($n)
+                         $only = @($n | Where-Object { $_.'Node Type' -eq 'Index Only Scan' -and $_.'Index Name' -eq 'idx_orders_user_id_created_at' })
+                         $only.Count -gt 0 -and [long]$only[0].'Heap Fetches' -le [Math]::Max(10, [long]$only[0].'Actual Rows' / 20) }
+        Hint         = ''
+        AfterHint    = 'Heap Fetches nhiều: VACUUM chưa đánh dấu all-visible các trang có đơn mới, chạy VACUUM orders rồi đo lại'
+    }
+}
+
 # ---------------------------------------------------------------------------------------------------------------
 # 2. Đo một thẻ trong MỘT phiên psql. Hàm tạm trả kết quả EXPLAIN dạng JSON trên một dòng để đọc lại.
 
@@ -261,6 +321,12 @@ function Measure-Card($card) {
     foreach ($name in $card.MustNotExist) {
         if (Test-IndexExists $name) { Stop-Script "SAI: sau khi đo vẫn còn index $name!" }
     }
+    if ($card.SameDef) {
+        foreach ($name in $card.SameDef.Keys) {
+            $now = @(Invoke-Sql "SELECT pg_get_indexdef('public.$name'::regclass)")[0]
+            if ($now -ne $card.SameDef[$name]) { Stop-Script "SAI: index $name đổi định nghĩa sau khi đo: $now" }
+        }
+    }
 
     $measured = foreach ($line in ($result.Lines | Where-Object { $_ -match '^[a-z]+\|\[' })) {
         $key, $json = $line -split '\|', 2
@@ -283,6 +349,10 @@ function Measure-Card($card) {
                         ([long]$_.'Actual Rows' + [long]$_.'Rows Removed by Filter' + [long]$_.'Rows Removed by Index Recheck') * [long]$_.'Actual Loops'
                     } | Measure-Object -Sum).Sum
             Pages = [long]$explainResult.Plan.'Shared Hit Blocks' + [long]$explainResult.Plan.'Shared Read Blocks'
+            # Index Only Scan: số lần vẫn phải ghé bảng (trang chưa all-visible)
+            HeapFetches = ($nodes | Where-Object { $_.'Node Type' -eq 'Index Only Scan' } |
+                           ForEach-Object { [long]$_.'Heap Fetches' * [long]$_.'Actual Loops' } | Measure-Object -Sum).Sum
+            OnlyScan = [bool]($nodes | Where-Object { $_.'Node Type' -eq 'Index Only Scan' })
             Nodes = $nodes
         }
     }
@@ -308,7 +378,9 @@ function Measure-Card($card) {
     foreach ($phase in $card.Phases) {
         $m = $byPhase[$phase.Key][$last]
         Write-Host ("  Plan ({0}): {1}" -f $phase.Label, $m.Plan)
-        Write-Host ("      đọc {0} dòng (kể cả dòng lọc bỏ), {1} trang 8 KB" -f $m.Rows, $m.Pages)
+        $fetches = ''
+        if ($m.OnlyScan) { $fetches = ", Heap Fetches $($m.HeapFetches)" }
+        Write-Host ("      đọc {0} dòng (kể cả dòng lọc bỏ), {1} trang 8 KB{2}" -f $m.Rows, $m.Pages, $fetches)
     }
     foreach ($line in ($result.Lines | Where-Object { $_ -like 'info|*' })) {
         Write-Host "  $($line.Substring(5))"
@@ -324,7 +396,9 @@ function Measure-Card($card) {
         $hint = ''
         if ($card.Hint) { $hint = " ($($card.Hint))" }
         if (-not $beforeOk) { Write-Host ('  KHÁC THẺ: plan "trước" không như thẻ ghi{0}.' -f $hint) -ForegroundColor Yellow }
-        if (-not $afterOk) { Write-Host '  KHÁC THẺ: plan "sau" không như thẻ ghi.' -ForegroundColor Yellow }
+        $afterHint = ''
+        if ($card.AfterHint) { $afterHint = " ($($card.AfterHint))" }
+        if (-not $afterOk) { Write-Host ('  KHÁC THẺ: plan "sau" không như thẻ ghi{0}.' -f $afterHint) -ForegroundColor Yellow }
     }
     Write-Host ("  Nhập vào sổ: TRƯỚC {0}   SAU {1}   ({2})" -f (Format-Ms $before.Ms), (Format-Ms $after.Ms), $verdict) -ForegroundColor Cyan
     $extra = ''
@@ -357,6 +431,7 @@ $summary = @()
 if ($Case -in @('all', 'user-orders')) { $summary += Measure-Card (New-UserOrdersCard) }
 if ($Case -in @('all', 'day-orders')) { $summary += Measure-Card (New-DayOrdersCard) }
 if ($Case -in @('all', 'pending')) { $summary += Measure-Card (New-PendingCard) }
+if ($Case -in @('all', 'user-total')) { $summary += Measure-Card (New-UserTotalCard) }
 
 Write-Host 'Nhập vào sổ đo (lần cuối, dấu phẩy thập phân):' -ForegroundColor Cyan
 $summary | Select-Object 'Thẻ', 'TRƯỚC', 'SAU', 'Plan', 'DB hiện tại (tham khảo)' | Format-Table -AutoSize |
