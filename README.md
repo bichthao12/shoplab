@@ -410,6 +410,80 @@ mọi trang count(*) của Page (cách cũ) 10.000.119 8.619      358,764
 - 6 đơn cùng `created_at`, ranh giới trang rơi giữa chúng: không sót, không lặp, cả danh sách mọi đơn và danh sách theo người dùng.
 - Cursor hỏng, gửi `page` / `sort` → 400 `invalid-cursor`; `size` ngoài 1–100 → 400 `validation`.
 
+### Index thừa làm chậm việc ghi (`scripts/redundant-index-lab.sql`)
+
+Mỗi index của bảng là một cấu trúc nữa phải cập nhật mỗi khi chèn một dòng: tìm đúng trang lá, ghi khoá vào đó (trang đầy thì tách đôi), ghi WAL cho thay đổi đó. Index giúp đọc, nhưng câu ghi nào cũng phải trả giá cho **mọi** index của bảng, kể cả index không câu đọc nào dùng.
+
+Thí nghiệm chèn 100.000 đơn vào một bản chép của `orders` (schema `write_lab`, xoá khi xong; bảng thật chỉ được đọc một lần để chép). So ba phương án, mỗi phương án dựng index mới trên cùng dữ liệu:
+- **V0:** chỉ khoá chính.
+- **V1 (trước):** 4 index hiện có của `orders`, lấy đúng định nghĩa trong DB.
+- **V2 (sau):** thêm 5 index thừa, đúng các kiểu hay gặp:
+
+| Index thêm | Vì sao thừa |
+|---|---|
+| `(user_id)` | trùng phần đầu của `idx_orders_user_id_created_at (user_id, created_at DESC, id DESC)`: câu lọc `user_id` dùng index ghép được |
+| `(user_id, created_at DESC, id DESC)` | trùng hệt index có sẵn (vd một lần thêm bằng migration, một lần thêm tay) |
+| `(created_at)` | trùng `idx_orders_created_at (created_at DESC)`: B-tree đọc được cả hai chiều |
+| `(customer_email)`, `(total_amount)` | không câu nào của app lọc đơn theo hai cột này |
+
+Mỗi phương án chèn 100.000 đơn theo hai cách, mỗi cách 3 lần, lấy trung vị:
+- **Một câu `INSERT` 100.000 dòng** (nạp hàng loạt).
+- **100.000 transaction, mỗi transaction một đơn, 8 kết nối song song** (`pgbench`). Đây là cách app ghi: mỗi `POST /api/orders` là một transaction riêng.
+
+Trước mỗi lần đo chạy `CHECKPOINT`: lần đầu sửa một trang sau checkpoint, PostgreSQL ghi cả trang 8 KB vào WAL (full page write), nên các lần đo phải bắt đầu từ cùng một trạng thái.
+
+```powershell
+docker cp scripts/redundant-index-lab.sql shoplab-postgres:/tmp/
+docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/redundant-index-lab.sql
+```
+Không đi qua API, không cần app. App chạy cùng lúc cũng được, nhưng đừng gọi API trong lúc đo, vì WAL đo được tính cả câu ghi của app. Với 2 triệu đơn mất khoảng 4 phút và cần khoảng 1 GB đĩa trống.
+
+**Kết quả** (2 triệu đơn, `seed-big-data.ps1 -Users 200000 -Orders 2000000`):
+
+| Phương án | Index | Kích thước index | Một câu `INSERT` 100.000 đơn | WAL | 100.000 transaction (`pgbench`) | Đơn/giây | WAL |
+|---|---|---|---|---|---|---|---|
+| V0. chỉ khoá chính | 1 | 43 MB | 0,48 giây | 22 MB | 20,4 giây | 4.909 | 26 MB |
+| **V1. index hiện có (trước)** | 4 | 177 MB | **1,81 giây** | 120 MB | **19,7 giây** | 5.081 | 131 MB |
+| **V2. thêm 5 index thừa (sau)** | 9 | 378 MB | **5,10 giây (×2,8)** | 279 MB | **22,0 giây (×1,12)** | 4.535 | 301 MB |
+
+- **Nạp hàng loạt chậm 2,8 lần.** Gần như toàn bộ thời gian là cập nhật index: mỗi index thêm khoảng 0,4–0,7 giây cho 100.000 dòng. Trong 3 lần đo, lần chậm nhất của V1 (1,89 giây) vẫn nhanh hơn nhiều so với lần nhanh nhất của V2 (4,66 giây).
+- **Từng đơn một transaction chậm 12%** (5.081 → 4.535 đơn/giây), cả 3 lần đo của V2 đều chậm hơn cả 3 lần của V1.
+  - Độ chênh nhỏ hơn nạp hàng loạt vì phần lớn thời gian mỗi transaction là đi lại giữa client và server, và chờ commit ghi WAL xuống đĩa.
+  - Vì cùng lý do đó, V0 so với V1 không khác nhau quá mức nhiễu.
+- **WAL tăng 2,3 lần ở cả hai cách** (120 → 279 MB, 131 → 301 MB): mỗi đơn mới phải ghi thêm vào 5 index. WAL nhiều thì checkpoint dày hơn, và backup hay replica phải chép nhiều hơn.
+- **Dung lượng:** index từ 177 lên 378 MB, tức thêm 201 MB không phục vụ câu đọc nào. Chúng còn chiếm chỗ trong `shared_buffers`, đẩy dữ liệu có ích ra khỏi bộ nhớ.
+
+**Index phình khi chèn** (V2, sau khi chèn 600.000 đơn, bảng tăng 30%):
+
+| Index | Sau khi dựng | Sau khi chèn | Tăng |
+|---|---|---|---|
+| `(user_id, created_at DESC, id DESC)` (có sẵn, và bản trùng) | 77 MB | 142 MB | **+65 MB (+84%)** |
+| `(created_at DESC)` (có sẵn) | 43 MB | 66 MB | +23 MB |
+| `(customer_email)` | 22 MB | 42 MB | +20 MB |
+| `(total_amount)` | 43 MB | 61 MB | +18 MB |
+| `(user_id)` | 17 MB | 32 MB | +15 MB |
+| `(created_at)`, `(id)` | 43 MB | 56 MB | +13 MB |
+
+- **Khoá ngẫu nhiên** (`user_id`, email, tổng tiền): đơn mới chen vào giữa index. Trang đầy bị tách đôi, mỗi nửa chỉ đầy một nửa, nên index to nhanh hơn số dòng nhiều: +84% trong khi bảng chỉ tăng 30%.
+- **Khoá tăng dần** (`id`, `created_at`): đơn mới luôn nằm ở trang cuối. PostgreSQL tách trang cuối kiểu để lại trang cũ đầy 90%, nên index tăng đúng theo số dòng.
+- **`created_at DESC` tăng gần gấp đôi `created_at`** (+23 so với +13 MB), dù cùng dữ liệu. Ở index `DESC`, đơn mới nằm ở trang **đầu** bên trái, mà cách tách trang tiết kiệm chỉ áp dụng cho trang cuối bên phải. Với index một cột, `DESC` không giúp gì cho việc đọc (B-tree đọc được cả hai chiều), nên index một cột trên cột luôn tăng thì nên để chiều tăng.
+
+**Tìm index thừa.** Cuối thí nghiệm có hai truy vấn, đem dùng được trên DB thật:
+- **Index B-tree có các cột là phần đầu, hoặc trùng hệt, các cột của một index khác cùng bảng.** Trên bản chép ở V2, truy vấn bắt đúng 3 index trùng; `(user_id)` hiện hai lần, vì nó là phần đầu của cả index gốc lẫn bản trùng. Hai index không ai dùng (email, tổng tiền) thì truy vấn này không bắt được. Trên schema `public` thật: không có dòng nào, tức app không có index trùng.
+  - Truy vấn bỏ qua index `UNIQUE`, vì nó giữ ràng buộc dữ liệu chứ không chỉ để đọc nhanh.
+  - Index có biểu thức hay có `WHERE` thì phải xem tay.
+- **Index chưa được câu nào dùng** (`pg_stat_user_indexes.idx_scan = 0`, không tính `UNIQUE`). Chỉ là gợi ý để xem tiếp, chưa đủ để bỏ, vì:
+  - `idx_scan` chỉ đếm từ khi thống kê bắt đầu: reset bằng `pg_stat_reset()`, mất khi PostgreSQL tắt không sạch;
+  - index vừa dựng lại (như sau `seed-big-data.ps1`) đếm lại từ 0;
+  - câu hiếm khi chạy (báo cáo cuối tháng) vẫn cần index của nó.
+
+  Nên chạy app một thời gian rồi mới xem.
+
+**Kết luận:**
+- Thêm index cho một câu đọc cụ thể, và xem bằng `EXPLAIN` rằng câu đó dùng nó.
+- Index trùng hệt, hay trùng phần đầu của index khác, thì bỏ.
+- Index nghi không dùng thì theo dõi `idx_scan` một thời gian rồi mới bỏ bằng `DROP INDEX CONCURRENTLY`. Lệnh này không khoá ghi; bỏ nhầm thì dựng lại được bằng `CREATE INDEX CONCURRENTLY`.
+
 ### Chạy test
 
 ```bash
