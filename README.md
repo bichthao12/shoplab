@@ -223,6 +223,18 @@ Kết quả đo (dữ liệu đã nằm sẵn trong bộ nhớ, thời gian là 
 - **Kết luận: giữ index C (V11), không thêm index đơn.** Index ghép dùng được cho cả điều kiện chỉ có `user_id = ?` (cột đầu của index), nên có thêm A chỉ tốn chỗ và làm mỗi lần ghi đơn phải cập nhật thêm một index.
 - **Phần còn lại là trang của bảng.** Ngay với C, 10 dòng vẫn tốn 14 trang: khoảng 4 trang index, còn lại mỗi đơn một trang bảng, vì đơn của một user nằm rải khắp bảng. Index chỉ quyết định đọc ít hay nhiều **dòng**; muốn giảm trang của bảng thì cần cách khác, vd index chứa sẵn mọi cột câu cần (covering index), hay xếp lại bảng theo user.
 
+**Sổ đo trước / sau** (`scripts/before-after.ps1`): đo đúng cách của sổ đo, rồi in sẵn hai số để nhập, với dấu phẩy thập phân. Cách đo: `EXPLAIN (ANALYZE, BUFFERS)`, mỗi truy vấn 3 lần, ghi lần cuối. Thẻ hiện có `-Case user-orders`: `SELECT * FROM orders WHERE user_id = :uid ORDER BY created_at DESC LIMIT 20`, trước và sau index ghép.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1              # tự chọn một user có 8–12 đơn
+powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -UserId 1    # chọn user
+```
+- **Không đổi DB.** Trạng thái "trước" có được bằng cách bỏ `idx_orders_user_id_created_at` **trong một transaction** rồi `ROLLBACK`: index trở lại nguyên vẹn, không phải dựng lại.
+- **Bảng bị khoá trong mấy giây đo.** Nếu một transaction khác đang dùng `orders`, script báo lỗi sau 5 giây (`lock_timeout`) thay vì treo.
+- **Kết quả với 2 triệu đơn, user 99895 (8 đơn):**
+  - trước: `Parallel Seq Scan` + `Sort`, đọc 2 triệu dòng (32.792 trang 8 KB), 89–112 ms;
+  - sau: `Index Scan using idx_orders_user_id_created_at`, không còn `Sort`, đọc 8 dòng (11 trang), 0,06 ms.
+- **User nhiều đơn không khớp thẻ.** Với user 1 (832 đơn), plan "trước" không phải `Seq Scan`: PostgreSQL đi theo `idx_orders_created_at` từ đơn mới nhất và lọc `user_id`, bỏ 54.904 dòng, 11,8 ms. Script khi đó báo "KHÁC THẺ" (mã thoát 1).
+
 ### Viết lại `DATE(created_at) = …` thành khoảng thời gian (`scripts/date-range-lab.sql`)
 
 ```sql
