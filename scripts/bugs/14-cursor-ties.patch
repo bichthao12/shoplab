@@ -1,0 +1,49 @@
+diff --git a/src/main/java/com/shoplab/order/internal/OrderRepository.java b/src/main/java/com/shoplab/order/internal/OrderRepository.java
+index 1d57b9f..f8ad4f5 100644
+--- a/src/main/java/com/shoplab/order/internal/OrderRepository.java
++++ b/src/main/java/com/shoplab/order/internal/OrderRepository.java
+@@ -42,10 +42,11 @@ interface OrderRepository extends JpaRepository<Order, Long> {
+      */
+     @Query("""
+             select o from ShopOrder o
+-            where (o.createdAt, o.id) < (:createdAt, :id)
++            where o.createdAt < :createdAt
+             order by o.createdAt desc, o.id desc
+             """)
+-    List<Order> findNewestAfter(@Param("createdAt") Instant createdAt, @Param("id") long id, Limit limit);
++    // BẢN LỖI: chỉ so created_at. Đơn cùng created_at với đơn cuối trang trước mà chưa được trả về thì bị bỏ qua
++    List<Order> findNewestAfter(@Param("createdAt") Instant createdAt, Limit limit);
+ 
+     /** Trang đầu đơn của một người dùng (index idx_orders_user_id_created_at). */
+     @Query("select o from ShopOrder o where o.userId = :userId order by o.createdAt desc, o.id desc")
+@@ -54,11 +55,11 @@ interface OrderRepository extends JpaRepository<Order, Long> {
+     /** Các đơn của người dùng đứng sau đơn (createdAt, id). */
+     @Query("""
+             select o from ShopOrder o
+-            where o.userId = :userId and (o.createdAt, o.id) < (:createdAt, :id)
++            where o.userId = :userId and o.createdAt < :createdAt
+             order by o.createdAt desc, o.id desc
+             """)
+     List<Order> findNewestByUserIdAfter(@Param("userId") long userId, @Param("createdAt") Instant createdAt,
+-                                        @Param("id") long id, Limit limit);
++                                        Limit limit);
+ 
+     /** Đơn của một người dùng, phân trang offset (bản N+1 trong scripts/bugs và các test so sánh cách nạp dùng). */
+     Page<Order> findByUserId(Long userId, Pageable pageable);
+diff --git a/src/main/java/com/shoplab/order/internal/OrderService.java b/src/main/java/com/shoplab/order/internal/OrderService.java
+index 03ce457..ce49093 100644
+--- a/src/main/java/com/shoplab/order/internal/OrderService.java
++++ b/src/main/java/com/shoplab/order/internal/OrderService.java
+@@ -86,10 +86,10 @@ public class OrderService {
+         List<Order> rows;
+         if (userId == null) {
+             rows = after == null ? orderRepo.findNewest(limit)
+-                    : orderRepo.findNewestAfter(after.createdAt(), after.id(), limit);
++                    : orderRepo.findNewestAfter(after.createdAt(), limit);
+         } else {
+             rows = after == null ? orderRepo.findNewestByUserId(userId, limit)
+-                    : orderRepo.findNewestByUserIdAfter(userId, after.createdAt(), after.id(), limit);
++                    : orderRepo.findNewestByUserIdAfter(userId, after.createdAt(), limit);
+         }
+         if (rows.size() <= size) {
+             return new OrderSlice(rows, null);

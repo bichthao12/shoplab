@@ -304,6 +304,98 @@ docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/partial-covering
 - **Giá phải trả là dung lượng.** B1 tới 464 MB, lớn hơn cả index `(user_id)` thường (86 MB): index có `INCLUDE` không gộp được các khoá trùng (deduplication), nên mỗi đơn là một mục riêng. B2 dùng lại index đang có nên chỉ thêm 249 MB, và vẫn phục vụ câu "đơn của tôi" như cũ, vì các cột khoá không đổi. Nhưng index của câu đó to ra, trên máy ít RAM thì càng khó nằm hết trong bộ nhớ.
 - **Kết luận:** chỉ thêm covering index khi câu tổng tiền thật sự chạy nhiều; dùng `top-queries.ps1` (pg_stat_statements) để biết. Nếu thêm thì chọn B2 (sửa index hiện có) thay vì B1 (thêm một index nữa). Index Only Scan chỉ không phải ghé bảng ở những trang đã được VACUUM đánh dấu all-visible.
 
+### Phân trang cursor: trang 1 và trang 10.000 (`scripts/pagination-lab.sql`, `scripts/cursor-pagination.ps1`)
+
+`GET /api/orders` chuyển từ phân trang offset (`page`, `size`, trả kèm tổng số đơn) sang **phân trang cursor** (keyset):
+```
+GET /api/orders?size=20                            → {"content": [20 đơn mới nhất], "nextCursor": "MjAyNi0xMC0xMlQwMjozOTozMC4wNDc1OTBaLDk5OTk5OTg"}
+GET /api/orders?size=20&cursor=MjAyNi0xMC0xMlQw... → 20 đơn kế tiếp, kèm nextCursor của trang sau (null: hết danh sách)
+```
+- `nextCursor` là vị trí của đơn cuối trang: `created_at` và `id`, mã hoá base64url (bên trong là `2026-10-12T02:39:30.047590Z,9999998`). Client gửi lại nguyên văn, không cần hiểu nội dung.
+- Trang sau là các đơn đứng sau đơn đó theo thứ tự `(created_at DESC, id DESC)`. JPQL `where (o.createdAt, o.id) < (:createdAt, :id)` (`OrderRepository.findNewestAfter`), Hibernate sinh:
+  ```sql
+  select ... from orders o1_0 where (o1_0.created_at,o1_0.id)<(?,?)
+  order by o1_0.created_at desc,o1_0.id desc fetch first ? rows only     -- size + 1: có đơn thứ size + 1 thì còn trang sau
+  ```
+  Phải so cả `id`: nhiều đơn cùng `created_at` thì `created_at < ?` bỏ sót những đơn trùng với đơn cuối trang mà chưa được trả về (bản lỗi `scripts/bugs/14-cursor-ties.patch`).
+- Đổi lại: không có tổng số đơn, số trang, không nhảy thẳng tới "trang 37". Gửi `page` hay `sort` → 400 `invalid-cursor`: bỏ qua thì client tưởng đang xem trang N mà thật ra luôn nhận trang đầu.
+- `GET /api/orders/with-items` (bài N+1) vẫn phân trang offset: chỉ đơn của một người dùng, nhiều nhất vài nghìn đơn.
+
+**Đo trong DB.** Chỉ đọc bảng `orders` (kết quả ghi vào schema `page_lab` rồi xoá), khoảng 15 giây. Mỗi trang đo ba cách và kiểm tra ba cách trả cùng 20 đơn:
+```powershell
+docker cp scripts/pagination-lab.sql shoplab-postgres:/tmp/
+docker exec shoplab-postgres psql -U shoplab -d shoplab -f /tmp/pagination-lab.sql
+```
+Mọi đơn (10 triệu), 20 đơn mỗi trang, trung vị 5 lần, dữ liệu đã nằm trong bộ nhớ. Dòng đọc: số dòng index / bảng đã đọc, kể cả dòng đọc rồi bỏ.
+
+| Trang | OFFSET: dòng đọc | OFFSET | OFFSET + `count(*)` (như `Page`) | Cursor: dòng đọc | Cursor | Cursor viết `OR`: dòng đọc, thời gian |
+|---|---|---|---|---|---|---|
+| 1 | 21 | 0,063 ms | 317 ms | 22 | 0,062 ms | |
+| 10 | 201 | 0,11 ms | 317 ms | 23 | 0,054 ms | 202, 0,096 ms |
+| 100 | 2.001 | 0,80 ms | 318 ms | 23 | 0,061 ms | 2.002, 0,34 ms |
+| 1.000 | 20.001 | 7,6 ms | 325 ms | 23 | 0,064 ms | 20.002, 3,1 ms |
+| **10.000** | **200.001** | **86,7 ms** | **404 ms** | **23** | **0,064 ms** | 200.002, 32,5 ms |
+| 100.000 | 2.000.001 | 949 ms | 1.266 ms | 23 | 0,065 ms | 2.000.002, 357 ms |
+
+- **OFFSET đọc rồi bỏ mọi đơn của các trang trước.** Trang 10.000 đọc 200.001 dòng (3.877 trang 8 KB) để trả 20 đơn, chậm hơn trang 1 khoảng 1.400 lần. Thời gian tăng đều theo số trang: trang 100.000 gần 1 giây.
+- **Cursor trang nào cũng đọc 22–23 dòng, 4–5 trang 8 KB.** So sánh bộ `(created_at, id) < (?, ?)` là điều kiện trên các cột của index, nên PostgreSQL đi thẳng tới vị trí đó trong index như khi tìm một giá trị, rồi đọc 21 dòng.
+- **`Page` của Spring Data còn chạy `SELECT count(*)`** cho `totalElements`, `totalPages`. Đếm 10 triệu đơn tốn khoảng 317 ms ở **mọi trang, kể cả trang 1**. Danh sách cursor không đếm.
+- **Viết kiểu `OR` thì mất lợi thế:** `created_at < ? OR (created_at = ? AND id < ?)` cho cùng kết quả, nhưng PostgreSQL không dùng điều kiện `OR` làm điểm bắt đầu quét index. Nó đọc từ đầu index rồi lọc bỏ, số dòng đọc như OFFSET (nhanh hơn OFFSET một chút chỉ vì dòng bị bỏ được lọc ngay ở bước quét, không đi qua bước sắp xếp). Viết keyset bằng so sánh bộ.
+- **Index.** App dùng `idx_orders_created_at (created_at DESC)` có sẵn. Plan: `Index Scan` với `Index Cond: created_at <= ?`, `Filter` phần so sánh bộ (bỏ 1 dòng, chính là đơn cuối trang trước), rồi `Incremental Sort` xếp các đơn trùng `created_at` theo `id`. Đơn hầu như không trùng `created_at` (tới micro giây; bộ dữ liệu sinh không có cặp nào trùng), nên phần thêm này gần như bằng 0. Nếu hàng nghìn đơn có cùng một `created_at` (vd nhập hàng loạt trong một transaction với `now()`), mỗi trang phải đọc và sắp lại cả nhóm đó. Khi ấy cần index `(created_at DESC, id DESC)`, như `idx_orders_user_id_created_at (user_id, created_at DESC, id DESC)` của danh sách theo người dùng.
+- **Danh sách của một người dùng** (user 1, nhiều đơn nhất: 1.381 đơn). Trang cuối (69): OFFSET đọc 1.380 dòng, 0,92 ms; cursor đọc 21 dòng, 0,07 ms. Một người dùng chỉ có vài trăm tới vài nghìn đơn nên OFFSET ở đây chưa thành vấn đề. Vấn đề nằm ở danh sách lớn.
+
+**Gọi API** trên app đang chạy (cần dữ liệu lớn):
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\cursor-pagination.ps1          # nhảy thẳng tới trang 10.000
+powershell -ExecutionPolicy Bypass -File .\scripts\cursor-pagination.ps1 -Walk    # đi thật 10.000 trang theo nextCursor (khoảng 1 phút)
+```
+Trang 10.000 cần `nextCursor` của trang 9.999. Mặc định script lấy `(created_at, id)` của đơn thứ 199.980 trong DB rồi mã hoá như app, đúng chuỗi API trả ở trang 9.999. Sau đó script:
+1. gọi trang 1 và trang 10.000 xen kẽ, mỗi trang 20 lần, lấy trung vị;
+2. kiểm tra trang 10.000 đúng là các đơn của câu `... OFFSET 199980 LIMIT 20` trong DB;
+3. `EXPLAIN ANALYZE` trong DB câu của app ở hai trang, câu OFFSET của cách cũ, và câu `count(*)`.
+
+```
+Bảng orders: 10.000.120 đơn, 500.006 trang
+Trang 10.000: các đơn thứ 199.981 – 200.000. Cursor của nó = nextCursor của trang 9.999 = vị trí đơn thứ 199.980:
+  "2026-09-27T12:30:34.776590Z,9800141" → base64url: MjAyNi0wOS0yN1QxMjozMDozNC43NzY1OTBaLDk4MDAxNDE
+
+Trang  Request                            Trung vị (ms) Đơn đầu – cuối
+1      GET /api/orders?size=20            11,1          10000120 – 10000101
+10.000 GET /api/orders?size=20&cursor=... 12,2          9800140 – 9800121
+
+Trang 10.000 qua API = các đơn của câu ... ORDER BY created_at DESC, id DESC OFFSET 199980 LIMIT 20 trong DB: ĐÚNG
+
+Trang     Cách                        Dòng đọc   Trang 8 KB ms
+1         cursor (app)                22         25         0,065
+10.000    cursor (app)                23         4          0,071
+1         OFFSET (cách cũ)            21         24         0,121
+10.000    OFFSET (cách cũ)            200.001    3.980      82,205
+mọi trang count(*) của Page (cách cũ) 10.000.119 8.619      358,764
+
+ĐÚNG: trang 10.000 trả đúng 20 đơn và chỉ đọc 23 dòng như trang 1, không phụ thuộc số trang đứng trước
+```
+- Qua API, trang 1 và trang 10.000 luôn ngang nhau: 11–12 ms ở lần chạy trên, 4 ms khi app đã chạy nóng (sau `-Walk`). Gần hết thời gian đó là HTTP, Spring, Hibernate và log SQL; câu SQL chỉ 0,07 ms. Nếu vẫn phân trang offset như `Page`, trang 10.000 cộng thêm khoảng 80 ms cho OFFSET và 320–360 ms cho câu đếm.
+- Trang 1 chạm 25 trang 8 KB, trang 10.000 chỉ 4, dù cùng đọc 22–23 dòng. Lý do: 20 đơn mới nhất ở đây là đơn `flash-sale.ps1` vừa đặt cùng lúc, nằm xen kẽ trên 9 trang của bảng, nên gần như mỗi đơn phải đọc một trang bảng khác. Đơn của bộ dữ liệu sinh nằm theo thứ tự `created_at`, 20 đơn liền nhau chung một trang. Đó là chuyện dữ liệu nằm ở đâu trong bảng, không phải chuyện phân trang.
+- `-Walk` đi từ trang 1 theo `nextCursor`, kiểm tra không đơn nào lặp, `nextCursor` của trang 9.999 trùng cursor tính từ DB, và trang 10.000 trùng câu OFFSET. Đo được (10.000 request trong 53 giây):
+  ```
+  Đã đi 10.000 trang trong 53,1 giây: 200.000 đơn, không đơn nào lặp; nextCursor trang 9.999 trùng cursor tính từ DB; trang 10.000 trùng câu OFFSET: có
+
+  Các trang      Trung vị (ms) Chậm nhất (ms)
+  1              12,0          12,0
+  2 – 10         8,8           14,3
+  11 – 100       9,7           25,8
+  101 – 1.000    6,2           128,9
+  1.001 – 10.000 4,0           66,4
+  ```
+  Trang càng sau càng nhanh vì app nóng dần lên (JIT), không phải vì trang sau rẻ hơn. Với OFFSET thì ngược lại: trang 1.001 – 10.000 sẽ cộng thêm 8–90 ms cho mỗi trang.
+- Mã thoát `0` nếu trang 10.000 đúng đơn và câu của nó đọc không quá 50 dòng; `1` nếu không; `2` nếu không chạy được. Đừng đặt đơn trong lúc chạy: đơn mới đứng đầu danh sách, đẩy các đơn của câu OFFSET lùi lại.
+
+**Test** (`OrderCursorPaginationTests`):
+- Đi hết các trang: mỗi đơn đúng một lần, đúng thứ tự `ORDER BY created_at DESC, id DESC`; trang cuối `nextCursor` là `null`.
+- Đơn mới đặt giữa hai lần gọi: trang 2 theo cursor vẫn là đúng 10 đơn kế tiếp. Cùng lúc đó `OFFSET 10` mở đầu bằng đơn cuối của trang 1: OFFSET lặp đơn khi có đơn mới (và sót đơn khi có đơn bị xoá).
+- 6 đơn cùng `created_at`, ranh giới trang rơi giữa chúng: không sót, không lặp, cả danh sách mọi đơn và danh sách theo người dùng.
+- Cursor hỏng, gửi `page` / `sort` → 400 `invalid-cursor`; `size` ngoài 1–100 → 400 `validation`.
+
 ### Chạy test
 
 ```bash
@@ -334,7 +426,7 @@ Mỗi Spring context của test giữ một pool 10 connection. Testcontainers d
 Mỗi kịch bản có test bảo vệ, và một bản lỗi viết dưới dạng patch trong `scripts/bugs/` (bản lỗi không nằm trong code chính hay code test). Script copy `pom.xml`, `mvnw`, `.mvn`, `src` ra thư mục tạm (không đụng thư mục làm việc), chạy test bảo vệ của mọi kịch bản trên code hiện tại (mong đợi **xanh**), rồi lần lượt áp từng patch, chạy test bảo vệ của kịch bản đó (mong đợi **đỏ**) và gỡ patch.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 13 kịch bản, ~5–10 phút
+powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1                                   # 14 kịch bản, ~5–10 phút
 powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadlock,self-invocation # chỉ vài kịch bản
 ```
 
@@ -353,6 +445,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
 | `self-invocation` | `11`: cả ba cách sửa quay về `this.transfer(...)` | 3 test sửa của `SelfInvocationTrapTests` | A = **60.00** thay vì 90.00 (mất 30) |
 | `hash-in-transaction` | `12`: `register` là một transaction, băm mật khẩu bên trong | `PasswordHashingOutsideTransactionTests#register_hashesPasswordOutsideTransaction` | lúc băm `transactionActive=true, activeConnections=1` |
 | `n-plus-one` | `13`: mỗi đơn tự nạp dòng hàng (`order.getItems().size()` trong vòng lặp) | `OrderListWithItemsTests` | **102 câu SQL** cho trang 100 đơn (22 câu cho trang 20 đơn) thay vì 2 |
+| `cursor-ties` | `14`: cursor chỉ so `created_at < ?`, không so `id` | `OrderCursorPaginationTests#ordersWithSameCreatedAt_acrossPageBoundary` | 10 đơn, 6 đơn cùng `created_at`, trang 4 đơn: đi hết các trang chỉ được **8 đơn**, sót 2 đơn trùng `created_at` với đơn cuối trang 2 |
 
 ```
 == Ma trận
@@ -362,8 +455,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\red-green.ps1 -Scenario deadl
    ...
    hash-in-transaction  XANH         ĐỎ
    n-plus-one           XANH         ĐỎ
+   cursor-ties          XANH         ĐỎ
 
-ĐÚNG (13/13): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
+ĐÚNG (14/14): mọi kịch bản có test xanh với bản sửa và đỏ với bản lỗi
 ```
 
 - **Kịch bản race** (`oversell`, `stock-adjustment`): không ép thứ tự thì lỗi không phải lần nào cũng lộ (bản ngây thơ bán vượt: 5 lần chạy cho 6, 10, 9, **1**, 10 đơn). Bản lỗi được chạy tối đa `-Attempts` lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt; script in ra lần thứ mấy thì đỏ.
@@ -594,8 +688,8 @@ Mã thoát `0` nếu cả 3 case đều đúng; `1` nếu có case sai; `2` nế
 |---|---|---|---|
 | `POST` | `/api/orders` (bắt buộc header `Idempotency-Key`) | **201** + `Location` | xem bảng bên dưới |
 | `GET` | `/api/orders/{id}` | **200** | 404 |
-| `GET` | `/api/orders?userId=1&page=0&size=20` | **200**: đơn của người dùng, mới nhất trước, có phân trang, không kèm dòng hàng | 400 thiếu `userId` · 400 `sort` theo trường không tồn tại |
-| `GET` | `/api/orders/with-items?userId=1&page=0&size=100` | **200**: như trên nhưng mỗi đơn kèm dòng hàng (cùng dạng `GET /api/orders/{id}`); trang bao nhiêu đơn cũng chỉ 2 câu SQL (xem mục *N+1*) | như trên |
+| `GET` | `/api/orders?userId=1&size=20&cursor=…` | **200** `{"content": [...], "nextCursor": "..."}`: đơn mới nhất trước, **phân trang cursor**, không kèm dòng hàng. Bỏ `userId`: mọi đơn. `size` 1–100, mặc định 20. Trang sau: gửi lại `nextCursor` ở tham số `cursor`; `nextCursor` là `null` thì hết (xem mục *Phân trang cursor*) | 400 `invalid-cursor`: cursor hỏng, hoặc gửi `page` / `sort` · 400 `validation`: `size` ngoài 1–100 |
+| `GET` | `/api/orders/with-items?userId=1&page=0&size=100` | **200**: đơn của một người dùng, mới nhất trước, mỗi đơn kèm dòng hàng (cùng dạng `GET /api/orders/{id}`); trang bao nhiêu đơn cũng chỉ 2 câu SQL (xem mục *N+1*). Vẫn phân trang offset (`page`, có tổng số đơn) | 400 thiếu `userId` · 400 `sort` theo trường không tồn tại |
 
 Ví dụ:
 
@@ -1356,6 +1450,7 @@ Tiền tố: `https://shoplab.dev/errors/`
 |---|---|---|
 | `validation` | 400 | Dữ liệu gửi lên không hợp lệ |
 | `invalid-sort` | 400 | Sắp xếp theo trường không tồn tại |
+| `invalid-cursor` | 400 | Danh sách đơn: `cursor` không phải `nextCursor` do API trả, hoặc gửi `page` / `sort` (tham số của phân trang offset) |
 | `invalid-idempotency-key` | 400 | Key sai định dạng |
 | `product-not-found` | 404 | Không tìm thấy sản phẩm |
 | `order-not-found` | 404 | Không tìm thấy đơn hàng |

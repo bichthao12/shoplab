@@ -159,7 +159,7 @@ Write-Host "Tạo $($productIds.Count) sản phẩm, mỗi sản phẩm tồn kh
 
 $operations = @(
     @{ Name = 'GET  /api/orders?userId='; Weight = 35; Make = {
-        New-Request 'GET' "/api/orders?userId=$(Pick $userIds)&page=0&size=20" } }
+        New-Request 'GET' "/api/orders?userId=$(Pick $userIds)&size=20" } }
     @{ Name = 'GET  /api/orders/{id}'; Weight = 20; Make = {
         New-Request 'GET' "/api/orders/$(if ($orderIds.Count -gt 0) { Pick $orderIds } else { 1 })" } }
     @{ Name = 'GET  /api/users/{id}'; Weight = 15; Make = {

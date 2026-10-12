@@ -129,7 +129,14 @@ $results | Where-Object { $_.Type } | Group-Object Type | Sort-Object Name |
         ForEach-Object { Write-Host ('{0,12} {1}' -f $_.Count, $_.Name) }
 
 Write-Host '== Bước 5: đếm đơn và xem kho'
-$orders = (Get-Json "/api/orders?userId=$($user.id)&size=1").page.totalElements
+# Danh sách đơn phân trang cursor, không có tổng số: đi hết các trang theo nextCursor, 100 đơn mỗi trang
+$listPath = "/api/orders?userId=$($user.id)&size=100"
+$listPage = Get-Json $listPath
+$orders = @($listPage.content).Count
+while ($listPage.nextCursor) {
+    $listPage = Get-Json "$listPath&cursor=$($listPage.nextCursor)"
+    $orders += @($listPage.content).Count
+}
 $stockLeft = (Get-Json "/api/products/$($product.id)").stock
 $created = @($results | Where-Object { $_.Code -eq '201' }).Count
 $outOfStock = @($results | Where-Object { $_.Type -eq 'insufficient-stock' }).Count

@@ -19,7 +19,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.modulith.test.ApplicationModuleTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.transaction.annotation.Transactional;
@@ -121,7 +120,7 @@ class OrderModuleTests {
         Order second = orders.create(CreateOrderCommand.of(USER_ID, List.of(new Line(900_004L, 1))));
         orders.create(CreateOrderCommand.of(otherUser, List.of(new Line(900_004L, 1))));
 
-        assertThat(orders.listByUser(USER_ID, PageRequest.of(0, 10)).getContent())
+        assertThat(orders.listOrders(USER_ID, null, 10).orders())
                 .extracting(Order::getId)
                 .containsExactlyInAnyOrder(first.getId(), second.getId());
     }

@@ -61,7 +61,9 @@ class OrderListWithItemsTests extends IntegrationTestBase {
     @Test
     @DisplayName("GET /with-items trang 2 (20 đơn): đúng 20 đơn kế tiếp, mới nhất trước; 2 câu SQL, chỉ nạp 20 đơn")
     void secondPageWithItems_matchesSummaryListOrder() {
-        List<Object> summaryIds = content(send("GET", "/api/orders?userId=" + userId + "&page=1&size=20", null, null))
+        // Trang 2 của danh sách tóm tắt (phân trang cursor): theo nextCursor của trang 1
+        Object cursor = json(send("GET", "/api/orders?userId=" + userId + "&size=20", null, null)).get("nextCursor");
+        List<Object> summaryIds = content(send("GET", "/api/orders?userId=" + userId + "&size=20&cursor=" + cursor, null, null))
                 .stream().map(order -> order.get("id")).toList();
         Statistics stats = emf.unwrap(SessionFactory.class).getStatistics();
         stats.clear();

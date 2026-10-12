@@ -1,8 +1,8 @@
 diff --git a/src/main/java/com/shoplab/order/internal/OrderService.java b/src/main/java/com/shoplab/order/internal/OrderService.java
-index c10ebc2..9956361 100644
+index 03ce457..b67de47 100644
 --- a/src/main/java/com/shoplab/order/internal/OrderService.java
 +++ b/src/main/java/com/shoplab/order/internal/OrderService.java
-@@ -85,6 +85,10 @@ public class OrderService {
+@@ -107,6 +107,10 @@ public class OrderService {
       */
      @Transactional(readOnly = true)
      public Page<Order> listByUserWithItems(long userId, Pageable pageable) {

@@ -4,6 +4,7 @@ import com.shoplab.common.ApiException;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.MessageSourceResolvable;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.data.core.PropertyReferenceException;
@@ -15,10 +16,12 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.UncategorizedSQLException;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.validation.FieldError;
+import org.springframework.validation.method.ParameterValidationResult;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 import java.net.URI;
@@ -154,6 +157,28 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         pd.setType(URI.create(TYPE_BASE + "validation"));
         pd.setTitle("Validation Failed");
         pd.setDetail("Dữ liệu gửi lên không hợp lệ");
+        pd.setProperty("errors", errors);
+        return handleExceptionInternal(ex, pd, headers, status, request);
+    }
+
+    /** Ràng buộc trên tham số của controller (vd @Min / @Max trên ?size=) → cùng dạng 400 validation như body. */
+    @Override
+    protected ResponseEntity<Object> handleHandlerMethodValidationException(
+            HandlerMethodValidationException ex, HttpHeaders headers,
+            HttpStatusCode status, WebRequest request) {
+
+        Map<String, String> errors = new LinkedHashMap<>();
+        for (ParameterValidationResult result : ex.getParameterValidationResults()) {
+            for (MessageSourceResolvable error : result.getResolvableErrors()) {
+                errors.putIfAbsent(result.getMethodParameter().getParameterName(),
+                        error.getDefaultMessage() != null ? error.getDefaultMessage() : "không hợp lệ");
+            }
+        }
+
+        ProblemDetail pd = ex.getBody();
+        pd.setType(URI.create(TYPE_BASE + "validation"));
+        pd.setTitle("Validation Failed");
+        pd.setDetail("Tham số không hợp lệ");
         pd.setProperty("errors", errors);
         return handleExceptionInternal(ex, pd, headers, status, request);
     }

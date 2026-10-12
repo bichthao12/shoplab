@@ -6,6 +6,7 @@ import com.shoplab.product.ReservedItem;
 import com.shoplab.user.UserDirectory;
 import com.shoplab.user.UserSummary;
 import com.shoplab.user.UserUnavailableException;
+import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -70,10 +71,31 @@ public class OrderService {
                 .orElseThrow(() -> new OrderNotFoundException(id));
     }
 
-    /** Đơn của một người dùng, không nạp dòng hàng (danh sách chỉ cần thông tin tóm tắt). */
+    /**
+     * Một trang danh sách đơn, mới nhất trước, phân trang cursor (keyset): trang sau bắt đầu ngay sau đơn cuối của
+     * trang trước, nên trang thứ bao nhiêu cũng chỉ đọc chừng ấy dòng như trang đầu, và đơn mới đặt giữa hai lần gọi
+     * không làm lặp hay sót đơn. Không đếm tổng số đơn (đếm 10 triệu đơn tốn hơn cả trang), không nhảy tới trang số N.
+     * Không nạp dòng hàng (danh sách chỉ cần thông tin tóm tắt).
+     * @param userId chỉ lấy đơn của người dùng này; null: mọi đơn
+     * @param after  vị trí của đơn cuối trang trước (OrderSlice.next); null: trang đầu
+     * @param size   số đơn mỗi trang
+     */
     @Transactional(readOnly = true)
-    public Page<Order> listByUser(long userId, Pageable pageable) {
-        return orderRepo.findByUserId(userId, pageable);
+    public OrderSlice listOrders(Long userId, OrderPosition after, int size) {
+        Limit limit = Limit.of(size + 1);   // lấy thừa một đơn: có đơn đó thì còn trang sau
+        List<Order> rows;
+        if (userId == null) {
+            rows = after == null ? orderRepo.findNewest(limit)
+                    : orderRepo.findNewestAfter(after.createdAt(), after.id(), limit);
+        } else {
+            rows = after == null ? orderRepo.findNewestByUserId(userId, limit)
+                    : orderRepo.findNewestByUserIdAfter(userId, after.createdAt(), after.id(), limit);
+        }
+        if (rows.size() <= size) {
+            return new OrderSlice(rows, null);
+        }
+        List<Order> page = rows.subList(0, size);
+        return new OrderSlice(page, OrderPosition.of(page.getLast()));
     }
 
     /**

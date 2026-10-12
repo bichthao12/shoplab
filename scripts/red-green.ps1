@@ -15,7 +15,7 @@
   -Attempts lần (mặc định 3), đỏ ở bất kỳ lần nào là đạt.
 
   Cần git và Docker (test dựng PostgreSQL bằng Testcontainers), như khi chạy test. Mỗi kịch bản một lượt Maven,
-  cả 13 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
+  cả 14 kịch bản mất khoảng 5–10 phút. Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu mọi kịch bản xanh với bản sửa và đỏ với bản lỗi; 1 nếu không; 2 nếu không chạy được.
 
 .EXAMPLE
@@ -94,6 +94,10 @@ $all = @(
        Title = 'N+1: danh sách đơn kèm dòng hàng'
        Bug = 'mỗi đơn tự nạp dòng hàng của nó (order.getItems().size() trong vòng lặp)'
        Tests = @('OrderListWithItemsTests') }
+    @{ Id = 'cursor-ties'; Patch = '14-cursor-ties.patch'
+       Title = 'Phân trang cursor: đơn trùng created_at'
+       Bug = 'cursor chỉ so created_at, không so id'
+       Tests = @('OrderCursorPaginationTests#ordersWithSameCreatedAt_acrossPageBoundary') }
 )
 
 # powershell -File truyền "-Scenario a,b" thành MỘT chuỗi "a,b": tự tách theo dấu phẩy

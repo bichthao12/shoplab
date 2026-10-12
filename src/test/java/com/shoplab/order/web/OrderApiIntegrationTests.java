@@ -131,7 +131,7 @@ class OrderApiIntegrationTests extends IntegrationTestBase {
     // =====================================================================
 
     @Test
-    @DisplayName("GET ?userId= → chỉ đơn của người đó, mới nhất trước, có phân trang, không kèm dòng hàng")
+    @DisplayName("GET ?userId= → chỉ đơn của người đó, mới nhất trước, trang sau theo nextCursor, không kèm dòng hàng")
     void listByUser_returnsOnlyThatUsersOrdersNewestFirst() {
         long productId = createProduct("LIST-001", 100_000, 100);
         long other = createUser("b@example.com", "Trần Thị B", "b.tran", "ACTIVE");
@@ -142,23 +142,31 @@ class OrderApiIntegrationTests extends IntegrationTestBase {
         assertThat(postOrder(newKey(), orderJson(other, productId, 1)).statusCode()).isEqualTo(201);
 
         Map<String, Object> firstPage = json(send("GET", "/api/orders?userId=" + customerId() + "&size=2", null, null));
-        Map<String, Object> secondPage = json(send("GET", "/api/orders?userId=" + customerId() + "&size=2&page=1", null, null));
+        Map<String, Object> secondPage = json(send("GET", "/api/orders?userId=" + customerId() + "&size=2&cursor="
+                + firstPage.get("nextCursor"), null, null));
 
         assertThat(ids(firstPage)).containsExactly(mine.get(2), mine.get(1));
         assertThat(ids(secondPage)).containsExactly(mine.get(0));
-        assertThat(firstPage.get("page")).asInstanceOf(InstanceOfAssertFactories.MAP)
-                .containsEntry("totalElements", 3).containsEntry("totalPages", 2);
+        assertThat(firstPage.get("nextCursor")).isNotNull();
+        assertThat(secondPage).containsEntry("nextCursor", null);
+        assertThat(firstPage).containsOnlyKeys("content", "nextCursor");   // không có tổng số đơn, số trang
         assertThat(((Number) content(firstPage).getFirst().get("userId")).longValue()).isEqualTo(customerId());
         assertThat(content(firstPage).getFirst()).doesNotContainKey("items");
     }
 
     @Test
-    @DisplayName("GET danh sách: thiếu userId → 400; người dùng chưa có đơn → trang rỗng")
-    void listByUser_missingOrUnknownUser() {
-        assertProblem(send("GET", "/api/orders", null, null), 400);
+    @DisplayName("GET danh sách: không có userId → mọi đơn; người dùng chưa có đơn → trang rỗng, nextCursor null")
+    void listByUser_withoutOrUnknownUser() {
+        long productId = createProduct("LIST-002", 100_000, 100);
+        long other = createUser("b@example.com", "Trần Thị B", "b.tran", "ACTIVE");
+        long mine = idOf(json(postOrder(newKey(), orderJson(productId, 1))));
+        long theirs = idOf(json(postOrder(newKey(), orderJson(other, productId, 1))));
+
+        assertThat(ids(json(send("GET", "/api/orders", null, null)))).containsExactly(theirs, mine);
 
         Map<String, Object> empty = json(send("GET", "/api/orders?userId=999999999", null, null));
         assertThat(content(empty)).isEmpty();
+        assertThat(empty).containsEntry("nextCursor", null);
     }
 
     @SuppressWarnings("unchecked")
