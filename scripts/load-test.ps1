@@ -544,6 +544,20 @@ if ($platform -and $virtualRun) {
     Write-Host ("Dòng 3, p95 dưới tải k6 (ms, cùng hai lượt trên):  TRƯỚC {0}   SAU {1}" -f
                 (Format-Num $platform.P95 '0.0'), (Format-Num $virtualRun.P95 '0.0')) -ForegroundColor Cyan
 }
+# Chỉ chạy một trong hai lượt (-Case platform / virtual): in số của lượt đó, nói rõ thiếu số nào
+if ([bool]$platform -ne [bool]$virtualRun) {
+    $only = $platform
+    $side = 'TRƯỚC (luồng thường)'
+    $missing = 'SAU (luồng ảo): -Case virtual'
+    if ($virtualRun) {
+        $only = $virtualRun
+        $side = 'SAU (luồng ảo)'
+        $missing = 'TRƯỚC (luồng thường): -Case platform'
+    }
+    Write-Host ("Chỉ có lượt {0}: {1} req/s (dòng 2), p95 {2} ms (dòng 3)." -f $side, (Format-Num $only.Rps '0.0'),
+                (Format-Num $only.P95 '0.0')) -ForegroundColor Cyan
+    Write-Host ("  Sổ đo cần TRƯỚC và SAU của cùng một lần chạy: chạy không có -Case (đủ 3 lượt). Thiếu {0}." -f $missing) -ForegroundColor Cyan
+}
 if ($pool5) {
     Write-Host ("Pool {0} kết nối (luồng ảo, {1} VU; không có dòng riêng trong sổ): {2} req/s, p95 {3} ms; pending lớn nhất {4}, TB {5}; chờ lấy kết nối TB {6} ms" -f
                 $pool5.Pool, $Vus, (Format-Num $pool5.Rps '0.0'), (Format-Num $pool5.P95 '0.0'), (Format-Num $pool5.PendingMax '0'),
