@@ -25,7 +25,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Sửa N+1 bằng @EntityGraph, JOIN FETCH hoặc nạp theo lô: cùng một trang (trang 2, 20 đơn, mới nhất trước) của người
  * dùng có 100 đơn, mỗi đơn 2 dòng hàng. Mỗi cách đếm: số câu SQL, số đơn và số dòng hàng Hibernate đã nạp vào bộ nhớ
- * (thống kê Hibernate). Trang đúng thì chỉ cần nạp 20 đơn, 40 dòng hàng.
+ * (thống kê Hibernate). Trang đúng thì chỉ cần nạp 20 đơn, 40 dòng hàng. Trang 100 đơn (thẻ "API 100 đơn kèm sản
+ * phẩm" của sổ đo, scripts/before-after.ps1 -Case api-100): N+1 lên 102 câu, các cách sửa giữ nguyên số câu.
  * Hibernate 7 đặt phân trang của câu có fetch collection vào một subquery trên orders, nên @EntityGraph / JOIN FETCH
  * trên câu phân trang vẫn chỉ nạp đúng một trang. Hibernate 5, 6 thì nạp mọi đơn rồi cắt trang trong bộ nhớ, log cảnh
  * báo HHH90003004: test kiểm tra không có cảnh báo đó.
@@ -34,15 +35,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NPlusOneFixesTests extends IntegrationTestBase {
 
     private static final Logger log = LoggerFactory.getLogger(NPlusOneFixesTests.class);
-    private static final Pageable SECOND_PAGE =
-            PageRequest.of(1, 20, Sort.by(Sort.Direction.DESC, "createdAt").and(Sort.by(Sort.Direction.DESC, "id")));
+    private static final Sort NEWEST_FIRST = Sort.by(Sort.Direction.DESC, "createdAt").and(Sort.by(Sort.Direction.DESC, "id"));
+    private static final Pageable SECOND_PAGE = PageRequest.of(1, 20, NEWEST_FIRST);
+    private static final Pageable FIRST_HUNDRED = PageRequest.of(0, 100, NEWEST_FIRST);
     private static final String IN_MEMORY_PAGING = "HHH90003004";   // firstResult/maxResults ... applying in memory
 
     @Autowired OrderFetchVariants variants;
     @Autowired EntityManagerFactory emf;
 
     private long userId;
-    private List<Long> expectedIds;
 
     record Measured(long statements, long ordersLoaded, long itemsLoaded) {}
 
@@ -52,11 +53,6 @@ class NPlusOneFixesTests extends IntegrationTestBase {
         createProduct("NP-1", 100_000, 1_000);
         createProduct("NP-2", 50_000, 1_000);
         createOrdersWithItems(userId, 100);
-        expectedIds = jdbc.sql("""
-                        SELECT id FROM orders WHERE user_id = :userId
-                        ORDER BY created_at DESC, id DESC OFFSET 20 LIMIT 20
-                        """)
-                .param("userId", userId).query(Long.class).list();
     }
 
     @Test
@@ -98,14 +94,47 @@ class NPlusOneFixesTests extends IntegrationTestBase {
         assertThat(output).doesNotContain(IN_MEMORY_PAGING);
     }
 
-    /**
-     * Chạy một cách, đếm bằng thống kê Hibernate. Kiểm tra luôn kết quả: đúng 20 đơn của trang 2, đúng thứ tự, đơn nào
-     * cũng đủ 2 dòng hàng (đọc items ngoài transaction: chưa nạp thì LazyInitializationException).
-     */
+    @Test
+    @DisplayName("Trang 100 đơn: N+1 → 102 câu (tăng theo số đơn), các cách sửa giữ nguyên số câu như trang 20 đơn")
+    void hundredOrdersOnePage_fixesDoNotGrowWithPageSize() {
+        Measured nPlusOne = measure("N+1, trang 100 đơn", variants::nPlusOne, FIRST_HUNDRED);
+        Measured entityGraph = measure("@EntityGraph (app), trang 100 đơn", variants::entityGraphOnPage, FIRST_HUNDRED);
+        Measured joinFetch = measure("JOIN FETCH, trang 100 đơn", variants::joinFetchOnPage, FIRST_HUNDRED);
+        Measured batch = measure("Nạp theo lô, trang 100 đơn", variants::batchFetch, FIRST_HUNDRED);
+        Measured twoStep = measure("Hai bước, trang 100 đơn", variants::twoStepJoinFetch, FIRST_HUNDRED);
+        // Dòng cho scripts/before-after.ps1 -Case api-100 đọc
+        log.info("[so-do] api-100 n-plus-one={} entity-graph={} join-fetch={} batch={} two-step={}",
+                nPlusOne.statements(), entityGraph.statements(), joinFetch.statements(), batch.statements(),
+                twoStep.statements());
+
+        // trang đơn + câu đếm + 100 lần nạp dòng hàng
+        assertThat(nPlusOne).isEqualTo(new Measured(102, 100, 200));
+        // như trang 20 đơn: không tăng theo số đơn
+        assertThat(entityGraph).isEqualTo(new Measured(2, 100, 200));
+        assertThat(joinFetch).isEqualTo(new Measured(2, 100, 200));
+        assertThat(batch).isEqualTo(new Measured(3, 100, 200));
+        assertThat(twoStep).isEqualTo(new Measured(3, 100, 200));
+    }
+
     private Measured measure(String name, BiFunction<Long, Pageable, List<Order>> fetch) {
+        return measure(name, fetch, SECOND_PAGE);
+    }
+
+    /**
+     * Chạy một cách, đếm bằng thống kê Hibernate. Kiểm tra luôn kết quả: đúng các đơn của trang, đúng thứ tự (so với
+     * cùng trang lấy bằng SQL), đơn nào cũng đủ 2 dòng hàng (đọc items ngoài transaction: chưa nạp thì
+     * LazyInitializationException).
+     */
+    private Measured measure(String name, BiFunction<Long, Pageable, List<Order>> fetch, Pageable pageable) {
+        List<Long> expectedIds = jdbc.sql("""
+                        SELECT id FROM orders WHERE user_id = :userId
+                        ORDER BY created_at DESC, id DESC OFFSET :offset LIMIT :limit
+                        """)
+                .param("userId", userId).param("offset", pageable.getOffset()).param("limit", pageable.getPageSize())
+                .query(Long.class).list();
         Statistics stats = emf.unwrap(SessionFactory.class).getStatistics();
         stats.clear();
-        List<Order> page = fetch.apply(userId, SECOND_PAGE);
+        List<Order> page = fetch.apply(userId, pageable);
         Measured m = new Measured(stats.getPrepareStatementCount(),
                 stats.getEntityStatistics(Order.class.getName()).getLoadCount(),
                 stats.getEntityStatistics(OrderItem.class.getName()).getLoadCount());

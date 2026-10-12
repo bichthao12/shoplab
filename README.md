@@ -223,7 +223,7 @@ Kết quả đo (dữ liệu đã nằm sẵn trong bộ nhớ, thời gian là 
 - **Kết luận: giữ index C (V11), không thêm index đơn.** Index ghép dùng được cho cả điều kiện chỉ có `user_id = ?` (cột đầu của index), nên có thêm A chỉ tốn chỗ và làm mỗi lần ghi đơn phải cập nhật thêm một index.
 - **Phần còn lại là trang của bảng.** Ngay với C, 10 dòng vẫn tốn 14 trang: khoảng 4 trang index, còn lại mỗi đơn một trang bảng, vì đơn của một user nằm rải khắp bảng. Index chỉ quyết định đọc ít hay nhiều **dòng**; muốn giảm trang của bảng thì cần cách khác, vd index chứa sẵn mọi cột câu cần (covering index), hay xếp lại bảng theo user.
 
-**Sổ đo trước / sau** (`scripts/before-after.ps1`): đo các thẻ của sổ đo theo đúng cách của sổ, rồi in sẵn số để nhập, với dấu phẩy thập phân. Cách đo: `EXPLAIN (ANALYZE, BUFFERS)`, mỗi truy vấn 3 lần, ghi lần cuối. Script cũng kiểm tra plan có đúng như thẻ ghi không. Không gọi API, không chạy test, không đổi DB.
+**Sổ đo trước / sau** (`scripts/before-after.ps1`): đo 6 thẻ của sổ đo theo đúng cách của sổ, rồi in sẵn số để nhập, với dấu phẩy thập phân. Cách đo: `EXPLAIN (ANALYZE, BUFFERS)`, mỗi truy vấn 3 lần, ghi lần cuối. Script cũng kiểm tra plan có đúng như thẻ ghi không. Không gọi API, không đổi DB. Năm thẻ đầu chỉ chạy SQL; thẻ `api-100` chạy một test (Maven, Testcontainers). Chạy cả 6 thẻ mất khoảng 40 giây.
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1                          # mọi thẻ, kèm bảng tóm tắt
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case user-orders -UserId 1
@@ -231,6 +231,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case day-or
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case user-total
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case page-10000
+powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case api-100      # chạy test, không cần DB của docker compose
 ```
 
 | Thẻ (`-Case`) | Trước | Sau | Kết quả với 2 triệu đơn (lần cuối) |
@@ -240,6 +241,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case page-1
 | `pending`: đơn đang chờ xử lý | `SELECT * FROM orders WHERE status = 'PENDING' ORDER BY created_at LIMIT 50`, **không có** `idx_orders_created_at`, `idx_orders_status` (như thẻ: không index nào dùng được) | cùng câu đó, **thêm** partial index `ON orders (created_at) WHERE status = 'PENDING'` | trước: `Parallel Seq Scan` + `Sort`, 126 ms. Sau: `Index Scan` trên partial index (928 kB), đọc 50 dòng, 0,073 ms. Tham khảo, DB hiện tại: 0,43 ms |
 | `user-total`: tổng tiền đã mua của một user | `SELECT sum(total_amount) FROM orders WHERE user_id = :uid` (thẻ ghi `total`), index hiện có | cùng câu đó, `idx_orders_user_id_created_at` dựng lại thêm `INCLUDE (total_amount)` | user 1 (832 đơn). Trước: `Bitmap Heap Scan`, ghé 826 trang bảng, 2,04 ms. Sau: `Index Only Scan`, Heap Fetches 0, 9 trang, 0,235 ms. Index 77 → 95 MB |
 | `page-10000`: trang 10.000 của danh sách đơn | `ORDER BY created_at DESC, id DESC OFFSET 199980 LIMIT 20` | `WHERE (created_at, id) < (:lastCreatedAt, :lastId) ORDER BY created_at DESC, id DESC LIMIT 20` (như `GET /api/orders`) | trước: `Index Scan` đọc 200.001 dòng (3.851 trang), 68 ms. Sau: đọc 22 dòng (4 trang), 0,069 ms. Hai câu trả cùng 20 đơn. Tham khảo, với index `(created_at DESC, id DESC)` như thẻ: đọc đúng 20 dòng, 0,092 ms |
+| `api-100`: API 100 đơn kèm sản phẩm (**số câu SQL**) | bản N+1: lấy trang 100 đơn, rồi từng đơn tự nạp dòng hàng (chỉ có trong test) | `@EntityGraph` trên câu phân trang, cách app dùng cho `GET /api/orders/with-items?size=100` | trước: **102 câu** (trang đơn + câu đếm + 100 lần nạp dòng hàng). Sau: **2 câu**. Tham khảo: `JOIN FETCH` 2, nạp theo lô 3, hai bước 3 |
 
 - **`user-orders`, trạng thái "trước":** script bỏ index ghép **trong một transaction** rồi `ROLLBACK`, nên index trở lại nguyên vẹn, không phải dựng lại. Trong mấy giây đo, bảng bị khoá. Nếu một transaction khác đang dùng `orders`, script báo lỗi sau 5 giây (`lock_timeout`) thay vì treo.
 - **`user-orders`, chọn `:uid`:** mặc định là một user có 8–12 đơn. Với user nhiều đơn (user 1: 832 đơn), plan "trước" không phải `Seq Scan`: PostgreSQL đi theo `idx_orders_created_at` từ đơn mới nhất và lọc `user_id`, bỏ 54.904 dòng, 11,8 ms. Script khi đó báo "KHÁC THẺ" (mã thoát 1).
@@ -250,6 +252,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case page-1
   - `:uid` mặc định là user nhiều đơn nhất. Mỗi đơn của một user nằm ở một trang khác nhau của bảng, nên `INCLUDE` bớt được một lần ghé bảng cho mỗi đơn. User 10 đơn thì trước và sau gần bằng nhau (13 so với 4 trang, đều khoảng 0,15 ms).
   - "Trước" với user nhiều đơn là `Bitmap Heap Scan` thay vì `Index Scan` như thẻ ghi. Cả hai cùng đọc index rồi ghé bảng, nên script chấp nhận cả hai.
   - Heap Fetches chỉ gần 0 khi VACUUM đã đánh dấu all-visible các trang có đơn. Đơn mới tạo sau lần VACUUM cuối thì vẫn phải ghé bảng; chạy `VACUUM orders` rồi đo lại.
+- **`api-100`:** đơn vị là số câu SQL, không phải ms.
+  - Bản N+1 không nằm trong code của app; theo quy ước, bản lỗi chỉ có trong test hay patch. Vì vậy thẻ này chạy `order.internal.NPlusOneFixesTests`: 100 đơn, mỗi đơn 2 dòng hàng, đếm số câu SQL của trang 100 đơn bằng thống kê Hibernate, cho bản N+1 và từng cách sửa. Test ghi kết quả trên một dòng `[so-do] api-100 ...` để script đọc.
+  - Ra 102 chứ không phải "khoảng 101" như thẻ: trang đầy 100 đơn nên `Page` chạy thêm câu đếm.
+  - Thẻ ghi "kèm order_items và product", nhưng dòng hàng đã chụp sẵn sku, tên, giá sản phẩm lúc đặt, nên không phải nạp thêm bảng `products` cho từng dòng.
 - **`page-10000`:**
   - Cursor là `(created_at, id)` của đơn thứ 199.980, tức đơn cuối trang 9.999 (đúng `nextCursor` API trả ở trang đó). Script kiểm tra hai câu trả cùng 20 đơn, cùng thứ tự.
   - Thẻ ghi index `(created_at, id)`, nhưng app không có index này: số "sau" là cách app chạy thật, với `idx_orders_created_at (created_at DESC)` có sẵn. PostgreSQL đi tới `created_at <= ?`, bỏ 1–2 dòng, rồi `Incremental Sort` xếp các đơn trùng `created_at` theo `id` (xem mục *Phân trang cursor*).
@@ -926,7 +932,7 @@ Hibernate 5, 6 không làm vậy: gặp phân trang trên câu có fetch collect
 | Nạp theo lô (batch size 100): code y như N+1 | 3 | 20 / 40 | lần đầu chạm `items` của một đơn, Hibernate nạp `items` của mọi đơn trong session bằng một câu `... where order_id = any (?)` |
 | Hai bước: trang đơn, rồi `JOIN FETCH` dòng hàng `where o.id in :ids` | 3 | 20 / 40 | cách sửa quen thuộc trên Hibernate 5, 6 |
 
-Không cách sửa nào có cảnh báo `HHH90003004` (test kiểm tra điều đó).
+Không cách sửa nào có cảnh báo `HHH90003004` (test kiểm tra điều đó). Với trang 100 đơn, cùng test đo được: N+1 **102 câu**, `@EntityGraph` 2, `JOIN FETCH` 2, nạp theo lô 3, hai bước 3. Số câu của các cách sửa không đổi khi trang to lên, còn N+1 tăng theo số đơn.
 
 - **`@EntityGraph` và `JOIN FETCH`** cho ít câu nhất. `@EntityGraph` không phải viết JPQL, câu đếm Spring Data tự sinh. Hợp với một màn hình cụ thể cần dữ liệu đi kèm.
 - **Nạp theo lô** không đổi code gọi, sửa N+1 cho **mọi** chỗ chạm vào quan hệ đó. Bật bằng `@BatchSize(size = 100)` trên `Order.items`, hoặc `spring.jpa.properties.hibernate.default_batch_fetch_size=100` cho mọi quan hệ. Nạp dòng hàng cho N đơn tốn ⌈N/100⌉ câu (trang 20 đơn: 1 câu). Phần chạm vào `items` vẫn phải nằm trong transaction (app tắt `open-in-view`). App chưa bật nạp theo lô: nếu bật toàn cục, bản N+1 trong patch 13 cũng sẽ chỉ còn 3 câu, và test bảo vệ không còn bắt được N+1.

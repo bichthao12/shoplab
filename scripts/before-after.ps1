@@ -4,7 +4,8 @@
   để nhập vào sổ (dấu phẩy thập phân) và kiểm tra plan có đúng như thẻ ghi không.
 
 .DESCRIPTION
-  Chỉ chạy SQL qua docker exec psql (không gọi API, không chạy test). Không đổi DB. Trạng thái nào cần bỏ hay thêm
+  Chạy SQL qua docker exec psql, không gọi API. Riêng thẻ api-100 chạy một test (Maven, Testcontainers dựng
+  PostgreSQL riêng, khoảng 1 phút). Không đổi DB. Trạng thái nào cần bỏ hay thêm
   index thì làm việc đó TRONG một transaction rồi ROLLBACK: index trở lại đúng như cũ, không phải dựng lại; lỗi hay
   Ctrl+C giữa chừng thì kết nối đóng và PostgreSQL tự rollback. Trong mấy giây đo phần đó, bảng bị khoá (request của
   app phải chờ); nếu một transaction khác đang dùng bảng, script chờ tối đa 5 giây rồi báo lỗi thay vì treo.
@@ -51,12 +52,21 @@
                  9.999). Script kiểm tra hai câu trả cùng 20 đơn. "Sau" chạy trên DB hiện tại, như app: app không có
                  index (created_at, id), dùng idx_orders_created_at (created_at DESC) có sẵn. Script đo thêm, để tham
                  khảo, với index (created_at DESC, id DESC) như thẻ ghi (tạo trong transaction).
+    api-100      API 100 đơn kèm sản phẩm (đơn vị: số câu SQL, không phải ms)
+                 GET /api/orders/with-items?size=100: mỗi đơn kèm dòng hàng (sku, tên, giá sản phẩm chụp lúc đặt)
+                 Cách sửa: @EntityGraph (app đang dùng), JOIN FETCH, hoặc nạp theo lô
+                 Kế hoạch: khoảng 101 câu → 1 đến 3 câu, không tăng theo số đơn
+                 Bản N+1 ("trước") không nằm trong code của app, chỉ có trong test, nên thẻ này chạy test
+                 order.internal.NPlusOneFixesTests: 100 đơn, mỗi đơn 2 dòng hàng, đếm số câu SQL của trang 100 đơn
+                 bằng thống kê Hibernate cho N+1 và từng cách sửa. "Sau" là @EntityGraph mà app dùng.
+                 102 chứ không phải 101: trang đầy nên Page chạy thêm câu đếm. Dòng hàng đã chụp sẵn thông tin sản
+                 phẩm, không phải nạp thêm bảng products cho từng dòng.
 
   Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu đo xong và mọi plan đúng như thẻ, 1 nếu có plan khác thẻ, 2 nếu không chạy được.
 
 .PARAMETER Case
-  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending, user-total, page-10000.
+  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending, user-total, page-10000, api-100.
 
 .PARAMETER UserId
   :uid cho thẻ user-orders và user-total. Bỏ trống: mỗi thẻ tự chọn (user-orders: một user có 8–12 đơn; user-total:
@@ -75,7 +85,7 @@
   powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 #>
 param(
-    [ValidateSet('all', 'user-orders', 'day-orders', 'pending', 'user-total', 'page-10000')][string]$Case = 'all',
+    [ValidateSet('all', 'user-orders', 'day-orders', 'pending', 'user-total', 'page-10000', 'api-100')][string]$Case = 'all',
     [long]$UserId = 0,
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$Day = '2026-10-01',
     [ValidateRange(1, 20)][int]$Runs = 3
@@ -84,6 +94,8 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+$root = Split-Path -Parent $PSScriptRoot
+$onWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or $IsWindows
 $container = 'shoplab-postgres'
 $psql = @('exec', $container, 'psql', '-X', '-U', 'shoplab', '-d', 'shoplab')
 $vi = [System.Globalization.CultureInfo]::GetCultureInfo('vi-VN')
@@ -476,14 +488,82 @@ function Measure-Card($card) {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# Thẻ api-100: chạy NPlusOneFixesTests, đọc dòng "[so-do] api-100 ..." test ghi ra (chỉ ký tự ASCII: console của Java
+# trên Windows có thể không in được tiếng Việt)
+
+function Measure-Api100Card {
+    Write-Host '== API 100 đơn kèm sản phẩm (đơn vị: số câu SQL)' -ForegroundColor Cyan
+    Write-Host '  GET /api/orders/with-items?size=100: 100 đơn, mỗi đơn kèm dòng hàng (sku, tên, giá sản phẩm chụp lúc đặt)'
+    Write-Host '  Trước: bản N+1 (lấy trang đơn, rồi từng đơn tự nạp dòng hàng), chỉ có trong test'
+    Write-Host '  Sau: @EntityGraph trên câu phân trang, cách app đang dùng (OrderRepository.findWithItemsByUserId)'
+    Write-Host '  Kế hoạch theo thẻ: khoảng 101 câu → 1 đến 3 câu, không tăng theo số đơn'
+    Write-Host '  Chạy test order.internal.NPlusOneFixesTests (Maven, Testcontainers: cần Docker, khoảng 1 phút)...'
+
+    $mavenArgs = @('-q', 'test', '-Dtest=NPlusOneFixesTests', '-Dsurefire.failIfNoSpecifiedTests=false')
+    Push-Location $root
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'   # Java có thể in ra stderr; Windows PowerShell coi đó là lỗi nếu để 'Stop'
+    try {
+        if ($onWindows) {
+            $output = & .\mvnw.cmd @mavenArgs 2>&1 | ForEach-Object { "$_" }
+        } else {
+            $output = & sh ./mvnw @mavenArgs 2>&1 | ForEach-Object { "$_" }
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+        Pop-Location
+    }
+    $line = @($output | Where-Object { $_ -match '\[so-do\] api-100 ' }) | Select-Object -Last 1
+    if ($code -ne 0 -or -not $line) {
+        Stop-Script ("Test không chạy xong (mã $code). 30 dòng cuối:`n  " + ((@($output) | Select-Object -Last 30) -join "`n  "))
+    }
+    $counts = @{}
+    foreach ($m in [regex]::Matches($line, '([a-z-]+)=(\d+)')) { $counts[$m.Groups[1].Value] = [int]$m.Groups[2].Value }
+
+    @(
+        [pscustomobject]@{ 'Cách' = 'N+1: lấy trang, rồi order.getItems() từng đơn'; 'Câu SQL' = $counts['n-plus-one']; 'Ghi chú' = 'trang đơn + câu đếm + 100 lần nạp dòng hàng' }
+        [pscustomobject]@{ 'Cách' = '@EntityGraph trên câu phân trang (app)'; 'Câu SQL' = $counts['entity-graph']; 'Ghi chú' = 'trang đơn kèm dòng hàng + câu đếm' }
+        [pscustomobject]@{ 'Cách' = 'JOIN FETCH trong câu phân trang'; 'Câu SQL' = $counts['join-fetch']; 'Ghi chú' = 'như @EntityGraph' }
+        [pscustomobject]@{ 'Cách' = 'Nạp theo lô (batch size 100)'; 'Câu SQL' = $counts['batch']; 'Ghi chú' = 'trang đơn + câu đếm + một lô dòng hàng' }
+        [pscustomobject]@{ 'Cách' = 'Hai bước: trang đơn, rồi JOIN FETCH theo id'; 'Câu SQL' = $counts['two-step']; 'Ghi chú' = '' }
+    ) | Format-Table -AutoSize | Out-String -Width 160 | Write-Host
+
+    $before = $counts['n-plus-one']
+    $after = $counts['entity-graph']
+    $ok = ($before -ge 100) -and ($after -le 3)
+    $verdict = 'khớp thẻ'
+    if (-not $ok) {
+        $verdict = 'KHÁC THẺ'
+        Write-Host '  KHÁC THẺ: mong đợi trước khoảng 101 câu, sau 1 đến 3 câu.' -ForegroundColor Yellow
+    }
+    Write-Host '  102 chứ không phải 101: trang đầy 100 đơn nên Page của Spring Data chạy thêm câu đếm.'
+    Write-Host ("  Nhập vào sổ: TRƯỚC {0}   SAU {1}   ({2})" -f $before, $after, $verdict) -ForegroundColor Cyan
+    Write-Host ''
+    return [pscustomobject]@{
+        'Thẻ'                    = 'API 100 đơn kèm sản phẩm (số câu SQL)'
+        'TRƯỚC'                  = "$before"
+        'SAU'                    = "$after"
+        'Plan'                   = $verdict
+        'Tham khảo (không nhập)' = "JOIN FETCH $($counts['join-fetch']), nạp theo lô $($counts['batch'])"
+        Ok                       = $ok
+    }
+}
+
+# ---------------------------------------------------------------------------------------------------------------
 # 3. Đo các thẻ được chọn
 
-$health = Invoke-Docker @('inspect', '-f', '{{.State.Health.Status}}', $container)
-if ($health.ExitCode -ne 0 -or ($health.Lines -join '') -ne 'healthy') {
-    Stop-Script "Container $container chưa chạy (hoặc chưa healthy). Chạy: docker compose up -d"
+# Thẻ api-100 không dùng DB của docker compose (Testcontainers dựng PostgreSQL riêng)
+if ($Case -ne 'api-100') {
+    $health = Invoke-Docker @('inspect', '-f', '{{.State.Health.Status}}', $container)
+    if ($health.ExitCode -ne 0 -or ($health.Lines -join '') -ne 'healthy') {
+        Stop-Script "Container $container chưa chạy (hoặc chưa healthy). Chạy: docker compose up -d"
+    }
 }
-Write-Host "Mỗi truy vấn chạy $Runs lần bằng EXPLAIN (ANALYZE, BUFFERS), sổ ghi lần cuối."
-Write-Host ''
+if ($Case -ne 'api-100') {
+    Write-Host "Mỗi truy vấn chạy $Runs lần bằng EXPLAIN (ANALYZE, BUFFERS), sổ ghi lần cuối."
+    Write-Host ''
+}
 
 $summary = @()
 if ($Case -in @('all', 'user-orders')) { $summary += Measure-Card (New-UserOrdersCard) }
@@ -491,8 +571,9 @@ if ($Case -in @('all', 'day-orders')) { $summary += Measure-Card (New-DayOrdersC
 if ($Case -in @('all', 'pending')) { $summary += Measure-Card (New-PendingCard) }
 if ($Case -in @('all', 'user-total')) { $summary += Measure-Card (New-UserTotalCard) }
 if ($Case -in @('all', 'page-10000')) { $summary += Measure-Card (New-Page10000Card) }
+if ($Case -in @('all', 'api-100')) { $summary += Measure-Api100Card }
 
-Write-Host 'Nhập vào sổ đo (lần cuối, dấu phẩy thập phân):' -ForegroundColor Cyan
+Write-Host 'Nhập vào sổ đo (ms: lần cuối, dấu phẩy thập phân; thẻ API 100 đơn: số câu SQL):' -ForegroundColor Cyan
 $summary | Select-Object 'Thẻ', 'TRƯỚC', 'SAU', 'Plan', 'Tham khảo (không nhập)' | Format-Table -AutoSize |
     Out-String -Width 160 | Write-Host
 
