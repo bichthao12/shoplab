@@ -4,8 +4,8 @@
   để nhập vào sổ (dấu phẩy thập phân) và kiểm tra plan có đúng như thẻ ghi không.
 
 .DESCRIPTION
-  Chạy SQL qua docker exec psql, không gọi API. Riêng thẻ api-100 chạy một test (Maven, Testcontainers dựng
-  PostgreSQL riêng, khoảng 1 phút). Không đổi DB. Trạng thái nào cần bỏ hay thêm
+  Chạy SQL qua docker exec psql, không gọi API. Riêng thẻ api-100 và order-detail chạy test (Maven, Testcontainers dựng
+  PostgreSQL riêng, khoảng 1 phút; đo cả hai thì chạy Maven một lần). Không đổi DB. Trạng thái nào cần bỏ hay thêm
   index thì làm việc đó TRONG một transaction rồi ROLLBACK: index trở lại đúng như cũ, không phải dựng lại; lỗi hay
   Ctrl+C giữa chừng thì kết nối đóng và PostgreSQL tự rollback. Trong mấy giây đo phần đó, bảng bị khoá (request của
   app phải chờ); nếu một transaction khác đang dùng bảng, script chờ tối đa 5 giây rồi báo lỗi thay vì treo.
@@ -61,12 +61,18 @@
                  bằng thống kê Hibernate cho N+1 và từng cách sửa. "Sau" là @EntityGraph mà app dùng.
                  102 chứ không phải 101: trang đầy nên Page chạy thêm câu đếm. Dòng hàng đã chụp sẵn thông tin sản
                  phẩm, không phải nạp thêm bảng products cho từng dòng.
+    order-detail Trang chi tiết đơn, 4 nguồn (GET /api/orders/{id}/detail)
+                 trước: gọi lần lượt; sau: gọi song song (OrderDetailService của app)
+                 Mong đợi: tổng thời gian gần bằng nguồn chậm nhất (gợi ý giả lập 400 ms), không còn là tổng 4 nguồn
+                 (đơn, sản phẩm, lịch sử thanh toán giả lập 300 ms, gợi ý 400 ms)
+                 Bản gọi lần lượt không nằm trong code của app, chỉ có trong test (SequentialOrderDetail), nên thẻ này
+                 chạy test order.internal.OrderDetailTimingTests: cùng 4 nguồn, mỗi cách 3 lần, ghi lần cuối.
 
   Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu đo xong và mọi plan đúng như thẻ, 1 nếu có plan khác thẻ, 2 nếu không chạy được.
 
 .PARAMETER Case
-  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending, user-total, page-10000, api-100.
+  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending, user-total, page-10000, api-100, order-detail.
 
 .PARAMETER UserId
   :uid cho thẻ user-orders và user-total. Bỏ trống: mỗi thẻ tự chọn (user-orders: một user có 8–12 đơn; user-total:
@@ -85,7 +91,7 @@
   powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 #>
 param(
-    [ValidateSet('all', 'user-orders', 'day-orders', 'pending', 'user-total', 'page-10000', 'api-100')][string]$Case = 'all',
+    [ValidateSet('all', 'user-orders', 'day-orders', 'pending', 'user-total', 'page-10000', 'api-100', 'order-detail')][string]$Case = 'all',
     [long]$UserId = 0,
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$Day = '2026-10-01',
     [ValidateRange(1, 20)][int]$Runs = 3
@@ -491,15 +497,15 @@ function Measure-Card($card) {
 # Thẻ api-100: chạy NPlusOneFixesTests, đọc dòng "[so-do] api-100 ..." test ghi ra (chỉ ký tự ASCII: console của Java
 # trên Windows có thể không in được tiếng Việt)
 
-function Measure-Api100Card {
-    Write-Host '== API 100 đơn kèm sản phẩm (đơn vị: số câu SQL)' -ForegroundColor Cyan
-    Write-Host '  GET /api/orders/with-items?size=100: 100 đơn, mỗi đơn kèm dòng hàng (sku, tên, giá sản phẩm chụp lúc đặt)'
-    Write-Host '  Trước: bản N+1 (lấy trang đơn, rồi từng đơn tự nạp dòng hàng), chỉ có trong test'
-    Write-Host '  Sau: @EntityGraph trên câu phân trang, cách app đang dùng (OrderRepository.findWithItemsByUserId)'
-    Write-Host '  Kế hoạch theo thẻ: khoảng 101 câu → 1 đến 3 câu, không tăng theo số đơn'
-    Write-Host '  Chạy test order.internal.NPlusOneFixesTests (Maven, Testcontainers: cần Docker, khoảng 1 phút)...'
-
-    $mavenArgs = @('-q', 'test', '-Dtest=NPlusOneFixesTests', '-Dsurefire.failIfNoSpecifiedTests=false')
+# Chạy các test của những thẻ cần test (api-100, order-detail) bằng MỘT lượt Maven, giữ output cho các thẻ đọc
+$script:testOutput = $null
+function Get-TestOutput {
+    if ($null -ne $script:testOutput) { return $script:testOutput }
+    $tests = @()
+    if ($Case -in @('all', 'api-100')) { $tests += 'NPlusOneFixesTests' }
+    if ($Case -in @('all', 'order-detail')) { $tests += 'OrderDetailTimingTests' }
+    Write-Host "  Chạy test $($tests -join ', ') (Maven, Testcontainers: cần Docker, khoảng 1 phút)..."
+    $mavenArgs = @('-q', 'test', "-Dtest=$($tests -join ',')", '-Dsurefire.failIfNoSpecifiedTests=false')
     Push-Location $root
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'   # Java có thể in ra stderr; Windows PowerShell coi đó là lỗi nếu để 'Stop'
@@ -514,10 +520,32 @@ function Measure-Api100Card {
         $ErrorActionPreference = $previous
         Pop-Location
     }
-    $line = @($output | Where-Object { $_ -match '\[so-do\] api-100 ' }) | Select-Object -Last 1
-    if ($code -ne 0 -or -not $line) {
+    if ($code -ne 0) {
         Stop-Script ("Test không chạy xong (mã $code). 30 dòng cuối:`n  " + ((@($output) | Select-Object -Last 30) -join "`n  "))
     }
+    $script:testOutput = @($output)
+    return $script:testOutput
+}
+
+# Dòng "[so-do] <thẻ> ..." test ghi ra (chỉ ký tự ASCII: console của Java trên Windows có thể không in được tiếng Việt)
+function Get-SoDoLine([string]$card) {
+    $output = Get-TestOutput
+    $line = @($output | Where-Object { $_ -match "\[so-do\] $card " }) | Select-Object -Last 1
+    if (-not $line) {
+        Stop-Script ("Không thấy dòng [so-do] $card trong output của test. 30 dòng cuối:`n  " +
+                     ((@($output) | Select-Object -Last 30) -join "`n  "))
+    }
+    return $line
+}
+
+function Measure-Api100Card {
+    Write-Host '== API 100 đơn kèm sản phẩm (đơn vị: số câu SQL)' -ForegroundColor Cyan
+    Write-Host '  GET /api/orders/with-items?size=100: 100 đơn, mỗi đơn kèm dòng hàng (sku, tên, giá sản phẩm chụp lúc đặt)'
+    Write-Host '  Trước: bản N+1 (lấy trang đơn, rồi từng đơn tự nạp dòng hàng), chỉ có trong test'
+    Write-Host '  Sau: @EntityGraph trên câu phân trang, cách app đang dùng (OrderRepository.findWithItemsByUserId)'
+    Write-Host '  Kế hoạch theo thẻ: khoảng 101 câu → 1 đến 3 câu, không tăng theo số đơn'
+    Write-Host '  Đo bằng test order.internal.NPlusOneFixesTests'
+    $line = Get-SoDoLine 'api-100'
     $counts = @{}
     foreach ($m in [regex]::Matches($line, '([a-z-]+)=(\d+)')) { $counts[$m.Groups[1].Value] = [int]$m.Groups[2].Value }
 
@@ -550,17 +578,52 @@ function Measure-Api100Card {
     }
 }
 
+function Measure-OrderDetailCard {
+    Write-Host '== Trang chi tiết đơn, 4 nguồn (GET /api/orders/{id}/detail)' -ForegroundColor Cyan
+    Write-Host '  4 nguồn: đơn hàng, sản phẩm, lịch sử thanh toán (giả lập 300 ms), gợi ý (giả lập 400 ms)'
+    Write-Host '  Trước: gọi lần lượt, nguồn sau chờ nguồn trước (SequentialOrderDetail, chỉ có trong test)'
+    Write-Host '  Sau: gọi song song, cách app đang dùng (OrderDetailService: CompletableFuture trên luồng ảo, mỗi lời gọi có orTimeout)'
+    Write-Host '  Mong đợi theo thẻ: tổng thời gian gần bằng nguồn chậm nhất, không còn là tổng 4 nguồn'
+    Write-Host '  Đo bằng test order.internal.OrderDetailTimingTests (mỗi cách 3 lần sau một lần chạy trước, ghi lần cuối)'
+    $line = Get-SoDoLine 'order-detail'
+    $values = @{}
+    foreach ($m in [regex]::Matches($line, '([a-z]+)=([0-9.]+)')) {
+        $values[$m.Groups[1].Value] = [double]::Parse($m.Groups[2].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    $before = $values['sequential']
+    $after = $values['parallel']
+    # Song song: ít nhất bằng nguồn chậm nhất (400 ms), và nhanh hơn hẳn gọi lần lượt (≈ 300 + 400 ms + đơn, sản phẩm)
+    $ok = ($after -ge 400) -and ($after -lt $before - 200)
+    $verdict = 'khớp thẻ'
+    if (-not $ok) {
+        $verdict = 'KHÁC THẺ'
+        Write-Host '  KHÁC THẺ: gọi song song không nhanh hơn gọi lần lượt như mong đợi.' -ForegroundColor Yellow
+    }
+    Write-Host ("  Gọi lần lượt {0} ms (300 + 400 ms của hai nguồn chậm, cộng đơn và sản phẩm); song song {1} ms (nguồn chậm nhất 400 ms)" -f
+                (Format-Ms $before), (Format-Ms $after))
+    Write-Host ("  Nhập vào sổ: TRƯỚC {0}   SAU {1}   ({2})" -f (Format-Ms $before), (Format-Ms $after), $verdict) -ForegroundColor Cyan
+    Write-Host ''
+    return [pscustomobject]@{
+        'Thẻ'                    = 'Trang chi tiết đơn, 4 nguồn'
+        'TRƯỚC'                  = Format-Ms $before
+        'SAU'                    = Format-Ms $after
+        'Plan'                   = $verdict
+        'Tham khảo (không nhập)' = ''
+        Ok                       = $ok
+    }
+}
+
 # ---------------------------------------------------------------------------------------------------------------
 # 3. Đo các thẻ được chọn
 
-# Thẻ api-100 không dùng DB của docker compose (Testcontainers dựng PostgreSQL riêng)
-if ($Case -ne 'api-100') {
+# Thẻ api-100, order-detail không dùng DB của docker compose (Testcontainers dựng PostgreSQL riêng)
+if ($Case -notin @('api-100', 'order-detail')) {
     $health = Invoke-Docker @('inspect', '-f', '{{.State.Health.Status}}', $container)
     if ($health.ExitCode -ne 0 -or ($health.Lines -join '') -ne 'healthy') {
         Stop-Script "Container $container chưa chạy (hoặc chưa healthy). Chạy: docker compose up -d"
     }
 }
-if ($Case -ne 'api-100') {
+if ($Case -notin @('api-100', 'order-detail')) {
     Write-Host "Mỗi truy vấn chạy $Runs lần bằng EXPLAIN (ANALYZE, BUFFERS), sổ ghi lần cuối."
     Write-Host ''
 }
@@ -572,6 +635,7 @@ if ($Case -in @('all', 'pending')) { $summary += Measure-Card (New-PendingCard) 
 if ($Case -in @('all', 'user-total')) { $summary += Measure-Card (New-UserTotalCard) }
 if ($Case -in @('all', 'page-10000')) { $summary += Measure-Card (New-Page10000Card) }
 if ($Case -in @('all', 'api-100')) { $summary += Measure-Api100Card }
+if ($Case -in @('all', 'order-detail')) { $summary += Measure-OrderDetailCard }
 
 Write-Host 'Nhập vào sổ đo (ms: lần cuối, dấu phẩy thập phân; thẻ API 100 đơn: số câu SQL):' -ForegroundColor Cyan
 $summary | Select-Object 'Thẻ', 'TRƯỚC', 'SAU', 'Plan', 'Tham khảo (không nhập)' | Format-Table -AutoSize |

@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * GET /api/orders/{id}/detail: 4 nguồn chạy song song (OrderDetailService). Hai nguồn giả lập chậm 300 ms (lịch sử
  * thanh toán) và 400 ms (gợi ý), cấu hình mặc định. Bản gọi lần lượt: scripts/bugs/15-order-detail-sequential.patch.
- * Nguồn phụ quá hạn: OrderDetailTimeoutTests.
+ * Nguồn hỏng (lỗi, quá hạn): order.internal.OrderDetailDegradedTests. Đo cho sổ: order.internal.OrderDetailTimingTests.
  */
 @ExtendWith(OutputCaptureExtension.class)
 class OrderDetailApiTests extends IntegrationTestBase {

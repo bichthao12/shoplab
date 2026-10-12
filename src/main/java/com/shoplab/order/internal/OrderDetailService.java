@@ -12,10 +12,10 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -23,16 +23,19 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /**
- * Trang chi tiết đơn: gom 4 nguồn, chạy SONG SONG trên orderDetailExecutor, nên cả trang mất khoảng thời gian của nhánh
- * chậm nhất (khoảng 400 ms) thay vì tổng các nguồn (khoảng 710 ms nếu gọi lần lượt).
+ * Trang chi tiết đơn: gom 4 nguồn, chạy SONG SONG bằng CompletableFuture trên orderDetailExecutor (luồng ảo), nên cả
+ * trang mất khoảng thời gian của nhánh chậm nhất (khoảng 400 ms) thay vì tổng các nguồn (khoảng 720 ms nếu gọi lần
+ * lượt).
  *
  *   nhánh 1: đơn hàng (DB) rồi sản phẩm (module product): sản phẩm cần productId của các dòng hàng, nên chạy sau đơn
  *   nhánh 2: lịch sử thanh toán (giả lập chậm 300 ms), chỉ cần id đơn
  *   nhánh 3: gợi ý (giả lập chậm 400 ms), chỉ cần id đơn
  *
- * Đơn và sản phẩm là bắt buộc: lỗi thì cả trang lỗi (đơn không tồn tại → 404), và hai nguồn phụ đang chạy bị huỷ ngay,
- * không bắt request chờ thêm. Hai nguồn phụ thì không: quá shoplab.order-detail.optional-timeout (tính từ đầu request)
- * hay lỗi thì trang vẫn trả về, phần đó để trống và ghi tên vào unavailable.
+ * Mỗi lời gọi có orTimeout riêng, tính từ lúc lời gọi đó bắt đầu; quá hạn thì luồng đang chạy lời gọi bị ngắt:
+ *   - đơn, sản phẩm: bắt buộc, hạn shoplab.order-detail.required-timeout. Lỗi thì cả trang lỗi (đơn không tồn tại →
+ *     404, quá hạn → 503 order-detail-timeout), hai nguồn phụ đang chạy bị huỷ ngay, không bắt request chờ thêm.
+ *   - lịch sử thanh toán, gợi ý: không bắt buộc, hạn shoplab.order-detail.optional-timeout. Quá hạn hay lỗi thì trang
+ *     vẫn trả về, phần đó để trống và ghi tên vào unavailable.
  * Mỗi nguồn chạy trong transaction riêng của nó (nếu có), trên luồng riêng: không có transaction chung cho cả trang.
  */
 @Service
@@ -45,6 +48,7 @@ public class OrderDetailService {
     private final PaymentHistorySource paymentHistory;
     private final RecommendationSource recommendations;
     private final ExecutorService executor;
+    private final Duration requiredTimeout;
     private final Duration optionalTimeout;
 
     OrderDetailService(OrderService orders, ProductCatalog catalog, PaymentHistorySource paymentHistory,
@@ -55,6 +59,7 @@ public class OrderDetailService {
         this.paymentHistory = paymentHistory;
         this.recommendations = recommendations;
         this.executor = executor;
+        this.requiredTimeout = properties.requiredTimeout();
         this.optionalTimeout = properties.optionalTimeout();
     }
 
@@ -62,13 +67,13 @@ public class OrderDetailService {
         long started = System.nanoTime();
         Map<String, Duration> timings = new ConcurrentHashMap<>();
 
-        // Bắt đầu cả ba nhánh ngay, không chờ nhau
-        CompletableFuture<Order> order = submit("order", timings, () -> orders.getById(orderId));
-        CompletableFuture<List<ProductInfo>> products = order.thenApply(o -> timed("products", timings,
+        // Bắt đầu cả ba nhánh ngay, không chờ nhau. Sản phẩm bắt đầu (và tính hạn) khi đã có đơn.
+        CompletableFuture<Order> order = call("order", timings, requiredTimeout, () -> orders.getById(orderId));
+        CompletableFuture<List<ProductInfo>> products = order.thenCompose(o -> call("products", timings, requiredTimeout,
                 () -> catalog.findByIds(o.getItems().stream().map(OrderItem::getProductId).distinct().toList())));
-        CompletableFuture<List<PaymentEvent>> payments = submit("paymentHistory", timings,
+        CompletableFuture<List<PaymentEvent>> payments = call("paymentHistory", timings, optionalTimeout,
                 () -> paymentHistory.findByOrderId(orderId));
-        CompletableFuture<List<Recommendation>> suggestions = submit("recommendations", timings,
+        CompletableFuture<List<Recommendation>> suggestions = call("recommendations", timings, optionalTimeout,
                 () -> recommendations.forOrder(orderId));
 
         // Nhánh bắt buộc
@@ -80,14 +85,13 @@ public class OrderDetailService {
         } catch (CompletionException ex) {
             payments.cancel(true);
             suggestions.cancel(true);
-            throw unwrap(ex);
+            throw requiredFailure(ex);
         }
 
-        // Hai nhánh phụ: chờ tới hết hạn tính từ đầu request
-        long deadline = started + optionalTimeout.toNanos();
+        // Hai nhánh phụ: mỗi lời gọi tự hết hạn (orTimeout), ở đây chỉ chờ kết quả hoặc lỗi
         List<String> unavailable = new ArrayList<>();
-        List<PaymentEvent> loadedPayments = awaitOptional("paymentHistory", payments, deadline, unavailable);
-        List<Recommendation> loadedSuggestions = awaitOptional("recommendations", suggestions, deadline, unavailable);
+        List<PaymentEvent> loadedPayments = optional("paymentHistory", payments, unavailable);
+        List<Recommendation> loadedSuggestions = optional("recommendations", suggestions, unavailable);
 
         Map<String, Duration> ordered = new LinkedHashMap<>();
         for (String source : List.of("order", "products", "paymentHistory", "recommendations")) {
@@ -101,10 +105,11 @@ public class OrderDetailService {
     }
 
     /**
-     * Chạy task trên executor. Huỷ CompletableFuture trả về (cancel(true)) thì ngắt luôn luồng đang chạy task:
-     * CompletableFuture.cancel tự nó chỉ đánh dấu huỷ, task vẫn chạy tiếp tới hết.
+     * Một lời gọi trên executor, hết hạn sau timeout (orTimeout: CompletableFuture kết thúc bằng TimeoutException).
+     * Quá hạn hay bị huỷ (cancel) thì ngắt luôn luồng đang chạy lời gọi: tự CompletableFuture không làm việc đó, nó chỉ
+     * đánh dấu kết thúc, còn việc vẫn chạy tiếp tới hết.
      */
-    private <T> CompletableFuture<T> submit(String source, Map<String, Duration> timings, Supplier<T> task) {
+    private <T> CompletableFuture<T> call(String source, Map<String, Duration> timings, Duration timeout, Supplier<T> task) {
         CompletableFuture<T> result = new CompletableFuture<>();
         Future<?> running = executor.submit(() -> {
             try {
@@ -113,8 +118,8 @@ public class OrderDetailService {
                 result.completeExceptionally(ex);
             }
         });
-        result.whenComplete((value, ex) -> {
-            if (result.isCancelled()) {
+        result.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS).whenComplete((value, ex) -> {
+            if (ex instanceof TimeoutException || result.isCancelled()) {
                 running.cancel(true);
             }
         });
@@ -130,25 +135,26 @@ public class OrderDetailService {
         }
     }
 
-    /** Kết quả nguồn phụ, hoặc null (và tên nguồn vào unavailable) nếu quá hạn hay lỗi. Quá hạn thì huỷ nguồn đó. */
-    private static <T> T awaitOptional(String source, CompletableFuture<T> future, long deadline, List<String> unavailable) {
+    /** Kết quả nguồn phụ, hoặc null (và tên nguồn vào unavailable) nếu quá hạn hay lỗi. */
+    private <T> T optional(String source, CompletableFuture<T> future, List<String> unavailable) {
         try {
-            return future.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
-        } catch (TimeoutException ex) {
-            future.cancel(true);
-            log.warn("Trang chi tiết đơn: {} không trả kịp, bỏ qua phần này", source);
-        } catch (ExecutionException ex) {
-            log.warn("Trang chi tiết đơn: {} lỗi, bỏ qua phần này: {}", source, ex.getCause().toString());
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            future.cancel(true);
+            return future.join();
+        } catch (CompletionException | CancellationException ex) {
+            if (ex.getCause() instanceof TimeoutException) {
+                log.warn("Trang chi tiết đơn: {} quá {}, bỏ qua phần này", source, optionalTimeout);
+            } else {
+                log.warn("Trang chi tiết đơn: {} lỗi, bỏ qua phần này: {}", source, String.valueOf(ex.getCause()));
+            }
+            unavailable.add(source);
+            return null;
         }
-        unavailable.add(source);
-        return null;
     }
 
-    /** Lỗi của nhánh bắt buộc: ném lại đúng exception gốc (vd OrderNotFoundException → 404). */
-    private static RuntimeException unwrap(CompletionException ex) {
+    /** Lỗi của nhánh bắt buộc: quá hạn → 503; còn lại ném đúng exception gốc (vd OrderNotFoundException → 404). */
+    private RuntimeException requiredFailure(CompletionException ex) {
+        if (ex.getCause() instanceof TimeoutException) {
+            return new OrderDetailTimeoutException(requiredTimeout);
+        }
         if (ex.getCause() instanceof RuntimeException cause) {
             return cause;
         }
