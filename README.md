@@ -452,6 +452,13 @@ Không đi qua API, không cần app. App chạy cùng lúc cũng được, như
   - Vì cùng lý do đó, V0 so với V1 không khác nhau quá mức nhiễu.
 - **WAL tăng 2,3 lần ở cả hai cách** (120 → 279 MB, 131 → 301 MB): mỗi đơn mới phải ghi thêm vào 5 index. WAL nhiều thì checkpoint dày hơn, và backup hay replica phải chép nhiều hơn.
 - **Dung lượng:** index từ 177 lên 378 MB, tức thêm 201 MB không phục vụ câu đọc nào. Chúng còn chiếm chỗ trong `shared_buffers`, đẩy dữ liệu có ích ra khỏi bộ nhớ.
+- **Thời gian phụ thuộc máy, WAL và kích thước index thì không.** Trên Docker Desktop (Windows):
+  - `pgbench` chậm khoảng 3 lần so với số trên (1.685 so với 5.081 đơn/giây ở V1), vì ghi WAL xuống đĩa chậm hơn;
+  - thời gian các lần đo dao động mạnh: cùng V1, `INSERT` từ 1,8 tới 3,4 giây;
+  - V2 vẫn chậm hơn V1: `INSERT` ×2,0, `pgbench` ×1,23;
+  - V0 cũng nhanh hơn V1 rõ rệt (×0,87): đĩa càng chậm, WAL thừa càng đắt.
+
+  WAL (22 / 120 / 278 MB) và kích thước từng index thì trùng tới từng MB với số trên, vì chúng chỉ phụ thuộc dữ liệu. Muốn so hai máy hay hai lần chạy, xem WAL trước.
 
 **Index phình khi chèn** (V2, sau khi chèn 600.000 đơn, bảng tăng 30%):
 
