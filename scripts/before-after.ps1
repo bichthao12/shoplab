@@ -41,12 +41,22 @@
                  nhau của bảng. User vài đơn thì trước / sau gần như bằng nhau. "Trước" với user nhiều đơn thường là
                  Bitmap Heap Scan thay vì Index Scan: cũng là đọc index rồi ghé bảng, script chấp nhận cả hai. Heap
                  Fetches chỉ gần 0 khi VACUUM đã đánh dấu các trang all-visible; nhiều thì chạy VACUUM orders.
+    page-10000   Trang 10.000 của danh sách đơn (20 đơn mỗi trang)
+                 trước: SELECT * FROM orders ORDER BY created_at DESC, id DESC OFFSET 199980 LIMIT 20
+                 sau:   SELECT * FROM orders WHERE (created_at, id) < (:lastCreatedAt, :lastId)
+                        ORDER BY created_at DESC, id DESC LIMIT 20
+                 Cách sửa: phân trang cursor (GET /api/orders), index (created_at, id)
+                 Kế hoạch: đọc rồi bỏ gần 200.000 dòng → đọc đúng 20 dòng, nhanh như trang 1
+                 Cursor = (created_at, id) của đơn thứ 199.980 (đơn cuối trang 9.999, đúng nextCursor API trả ở trang
+                 9.999). Script kiểm tra hai câu trả cùng 20 đơn. "Sau" chạy trên DB hiện tại, như app: app không có
+                 index (created_at, id), dùng idx_orders_created_at (created_at DESC) có sẵn. Script đo thêm, để tham
+                 khảo, với index (created_at DESC, id DESC) như thẻ ghi (tạo trong transaction).
 
   Chạy được trên Windows PowerShell 5.1 và PowerShell 7+.
   Thoát với mã 0 nếu đo xong và mọi plan đúng như thẻ, 1 nếu có plan khác thẻ, 2 nếu không chạy được.
 
 .PARAMETER Case
-  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending, user-total.
+  Thẻ cần đo: all (mặc định), user-orders, day-orders, pending, user-total, page-10000.
 
 .PARAMETER UserId
   :uid cho thẻ user-orders và user-total. Bỏ trống: mỗi thẻ tự chọn (user-orders: một user có 8–12 đơn; user-total:
@@ -65,7 +75,7 @@
   powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 #>
 param(
-    [ValidateSet('all', 'user-orders', 'day-orders', 'pending', 'user-total')][string]$Case = 'all',
+    [ValidateSet('all', 'user-orders', 'day-orders', 'pending', 'user-total', 'page-10000')][string]$Case = 'all',
     [long]$UserId = 0,
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$Day = '2026-10-01',
     [ValidateRange(1, 20)][int]$Runs = 3
@@ -130,9 +140,18 @@ function Test-UsesIndex($nodes, [string]$index) {
     return [bool]($nodes | Where-Object { $_.'Index Name' -eq $index })
 }
 
+# Số dòng các nút đọc bảng / index đã đọc: dòng trả ra + dòng đọc rồi lọc bỏ. Nút chạy song song: số dòng là trung bình
+# mỗi tiến trình, nhân số lần chạy (loops) ra tổng
+function Get-RowsRead($nodes) {
+    $scans = @($nodes | Where-Object { $_.'Node Type' -like '*Scan' -and $_.'Node Type' -ne 'Bitmap Index Scan' })
+    return [long](($scans | ForEach-Object {
+        ([long]$_.'Actual Rows' + [long]$_.'Rows Removed by Filter' + [long]$_.'Rows Removed by Index Recheck') * [long]$_.'Actual Loops'
+    } | Measure-Object -Sum).Sum)
+}
+
 # ---------------------------------------------------------------------------------------------------------------
-# 1. Các thẻ. Mỗi thẻ có các pha: before (số "trước" của sổ), after (số "sau"), và có thể thêm current (DB hiện tại,
-# để tham khảo). Pha có Setup thì chạy trong transaction: Setup, đo, ROLLBACK. Info: câu SQL in thêm thông tin, chạy
+# 1. Các thẻ. Mỗi thẻ có các pha: before (số "trước" của sổ), after (số "sau"), và có thể thêm extra (đo thêm để tham
+# khảo, không nhập vào sổ). Pha có Setup thì chạy trong transaction: Setup, đo, ROLLBACK. Info: câu SQL in thêm thông tin, chạy
 # cuối pha (trước ROLLBACK). MustExist / MustNotExist: trạng thái index sau khi đo, kiểm tra DB không đổi.
 
 function New-UserOrdersCard {
@@ -215,7 +234,7 @@ function New-PendingCard {
                Setup = @("CREATE INDEX $partial ON orders (created_at) WHERE status = 'PENDING'")
                Info = "SELECT 'info|Partial index: ' || pg_size_pretty(pg_relation_size('$partial')) || ', chỉ chứa đơn PENDING'"
                Describe = 'tạo partial index (trong transaction)' }
-            @{ Key = 'current'; Label = 'DB hiện tại'; Query = $query; Setup = @()
+            @{ Key = 'extra'; Label = 'DB hiện tại'; Query = $query; Setup = @()
                Describe = 'để tham khảo: còn idx_orders_created_at, idx_orders_status, chưa có partial index' }
         )
         MustExist    = @('idx_orders_created_at', 'idx_orders_status')
@@ -276,6 +295,49 @@ function New-UserTotalCard {
     }
 }
 
+function New-Page10000Card {
+    $size = 20
+    $offset = (10000 - 1) * $size
+    $order = 'ORDER BY created_at DESC, id DESC'
+    $total = [long]@(Invoke-Sql 'SELECT count(*) FROM orders')[0]
+    if ($total -lt $offset + $size) {
+        Stop-Script "Cần ít nhất $($offset + $size) đơn cho trang 10.000 (đang có $total). Nạp dữ liệu: scripts/seed-big-data.ps1"
+    }
+    $extraIndex = 'idx_orders_created_at_id'
+    if (Test-IndexExists $extraIndex) {
+        Stop-Script "Index $extraIndex đã có trong DB: bỏ nó trước (DROP INDEX $extraIndex) để đo như app."
+    }
+    # Cursor của trang 10.000 = vị trí đơn cuối trang 9.999 (đúng nextCursor API trả ở trang 9.999)
+    $cursor = @(Invoke-Sql "SELECT created_at::text || '|' || id FROM orders $order OFFSET $($offset - 1) LIMIT 1")[0] -split '\|'
+    $before = "SELECT * FROM orders $order OFFSET $offset LIMIT $size"
+    $after = "SELECT * FROM orders WHERE (created_at, id) < ('$($cursor[0])', $($cursor[1])) $order LIMIT $size"
+    # Hai cách phải trả cùng 20 đơn, cùng thứ tự
+    $same = @(Invoke-Sql ("SELECT (SELECT array_agg(id) FROM ($before) b) = (SELECT array_agg(id) FROM ($after) a)"))[0]
+    if ($same -ne 't') {
+        Stop-Script 'SAI: OFFSET và cursor trả các đơn khác nhau (có đơn mới đặt giữa hai câu? chạy lại).'
+    }
+    return @{
+        Title        = 'Trang 10.000 của danh sách đơn'
+        Note         = "$total đơn; cursor = đơn thứ ${offset}: ($($cursor[0]), $($cursor[1])); hai cách trả cùng 20 đơn"
+        Fix          = 'phân trang cursor (GET /api/orders), index (created_at, id)'
+        Expect       = 'đọc rồi bỏ gần 200.000 dòng → đọc đúng 20 dòng, nhanh như trang 1'
+        Phases       = @(
+            @{ Key = 'before'; Label = 'Trước'; Query = $before; Setup = @(); Describe = 'OFFSET' }
+            @{ Key = 'after'; Label = 'Sau'; Query = $after; Setup = @()
+               Describe = 'cursor, như app: dùng idx_orders_created_at (created_at DESC) có sẵn' }
+            @{ Key = 'extra'; Label = 'Index (created_at, id)'; Query = $after
+               Setup = @("CREATE INDEX $extraIndex ON orders (created_at DESC, id DESC)")
+               Describe = 'cursor, thêm index (created_at DESC, id DESC) như thẻ ghi (trong transaction, vài giây)' }
+        )
+        MustExist    = @('idx_orders_created_at')
+        MustNotExist = @($extraIndex)
+        # Trước: đọc gần hết các dòng đứng trước trang; sau: chỉ khoảng 20 dòng
+        BeforeOk     = { param($n) (Get-RowsRead $n) -ge 199980 }
+        AfterOk      = { param($n) (Get-RowsRead $n) -le 50 }
+        Hint         = ''
+    }
+}
+
 # ---------------------------------------------------------------------------------------------------------------
 # 2. Đo một thẻ trong MỘT phiên psql. Hàm tạm trả kết quả EXPLAIN dạng JSON trên một dòng để đọc lại.
 
@@ -332,7 +394,6 @@ function Measure-Card($card) {
         $key, $json = $line -split '\|', 2
         $explainResult = @($json | ConvertFrom-Json)[0]
         $nodes = @(Get-PlanNodes $explainResult.Plan)
-        $scans = @($nodes | Where-Object { $_.'Node Type' -like '*Scan' -and $_.'Node Type' -ne 'Bitmap Index Scan' })
         [pscustomobject]@{
             Key   = $key
             Ms    = [double]$explainResult.'Execution Time'
@@ -343,11 +404,7 @@ function Measure-Card($card) {
                         if ($_.'Index Name') { $n += " using $($_.'Index Name')" }
                         $n
                     }) -join ' → ')
-            # Nút đọc bảng / index: dòng trả ra + dòng đọc rồi lọc bỏ. Nút chạy song song: số dòng là trung bình mỗi
-            # tiến trình, nhân số lần chạy (loops) ra tổng
-            Rows  = ($scans | ForEach-Object {
-                        ([long]$_.'Actual Rows' + [long]$_.'Rows Removed by Filter' + [long]$_.'Rows Removed by Index Recheck') * [long]$_.'Actual Loops'
-                    } | Measure-Object -Sum).Sum
+            Rows  = Get-RowsRead $nodes
             Pages = [long]$explainResult.Plan.'Shared Hit Blocks' + [long]$explainResult.Plan.'Shared Read Blocks'
             # Index Only Scan: số lần vẫn phải ghé bảng (trang chưa all-visible)
             HeapFetches = ($nodes | Where-Object { $_.'Node Type' -eq 'Index Only Scan' } |
@@ -402,9 +459,10 @@ function Measure-Card($card) {
     }
     Write-Host ("  Nhập vào sổ: TRƯỚC {0}   SAU {1}   ({2})" -f (Format-Ms $before.Ms), (Format-Ms $after.Ms), $verdict) -ForegroundColor Cyan
     $extra = ''
-    if ($byPhase.ContainsKey('current')) {
-        $extra = Format-Ms $byPhase['current'][$last].Ms
-        Write-Host "  (Tham khảo, không nhập vào sổ: DB hiện tại $extra)"
+    $extraPhase = $card.Phases | Where-Object { $_.Key -eq 'extra' } | Select-Object -First 1
+    if ($extraPhase) {
+        $extra = "$($extraPhase.Label): $(Format-Ms $byPhase['extra'][$last].Ms)"
+        Write-Host "  (Tham khảo, không nhập vào sổ: $extra)"
     }
     Write-Host ''
     return [pscustomobject]@{
@@ -412,7 +470,7 @@ function Measure-Card($card) {
         'TRƯỚC'                = Format-Ms $before.Ms
         'SAU'                  = Format-Ms $after.Ms
         'Plan'                 = $verdict
-        'DB hiện tại (tham khảo)' = $extra
+        'Tham khảo (không nhập)' = $extra
         Ok                     = ($beforeOk -and $afterOk)
     }
 }
@@ -432,9 +490,10 @@ if ($Case -in @('all', 'user-orders')) { $summary += Measure-Card (New-UserOrder
 if ($Case -in @('all', 'day-orders')) { $summary += Measure-Card (New-DayOrdersCard) }
 if ($Case -in @('all', 'pending')) { $summary += Measure-Card (New-PendingCard) }
 if ($Case -in @('all', 'user-total')) { $summary += Measure-Card (New-UserTotalCard) }
+if ($Case -in @('all', 'page-10000')) { $summary += Measure-Card (New-Page10000Card) }
 
 Write-Host 'Nhập vào sổ đo (lần cuối, dấu phẩy thập phân):' -ForegroundColor Cyan
-$summary | Select-Object 'Thẻ', 'TRƯỚC', 'SAU', 'Plan', 'DB hiện tại (tham khảo)' | Format-Table -AutoSize |
+$summary | Select-Object 'Thẻ', 'TRƯỚC', 'SAU', 'Plan', 'Tham khảo (không nhập)' | Format-Table -AutoSize |
     Out-String -Width 160 | Write-Host
 
 if (@($summary | Where-Object { -not $_.Ok }).Count -eq 0) {

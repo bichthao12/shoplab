@@ -230,14 +230,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case user-o
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case day-orders -Day 2026-09-15
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case pending
 powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case user-total
+powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case page-10000
 ```
 
 | Thẻ (`-Case`) | Trước | Sau | Kết quả với 2 triệu đơn (lần cuối) |
 |---|---|---|---|
 | `user-orders`: đơn mới nhất của một user | `SELECT * FROM orders WHERE user_id = :uid ORDER BY created_at DESC LIMIT 20`, **không có** `idx_orders_user_id_created_at` | cùng câu đó, có index ghép | trước: `Parallel Seq Scan` + `Sort`, đọc 2 triệu dòng, 97 ms. Sau: `Index Scan using idx_orders_user_id_created_at`, không còn `Sort`, đọc 8 dòng, 0,053 ms |
 | `day-orders`: đơn trong một ngày | `WHERE DATE(created_at) = '2026-10-01'` | `WHERE created_at >= '2026-10-01' AND created_at < '2026-10-02'` | trước: `Parallel Seq Scan`, đọc 2 triệu dòng, 195 ms. Sau: `Index Scan using idx_orders_created_at`, đọc 2.739 dòng (58 trang), 0,59 ms. Hai câu trả cùng 2.739 đơn |
-| `pending`: đơn đang chờ xử lý | `SELECT * FROM orders WHERE status = 'PENDING' ORDER BY created_at LIMIT 50`, **không có** `idx_orders_created_at`, `idx_orders_status` (như thẻ: không index nào dùng được) | cùng câu đó, **thêm** partial index `ON orders (created_at) WHERE status = 'PENDING'` | trước: `Parallel Seq Scan` + `Sort`, 126 ms. Sau: `Index Scan` trên partial index (928 kB), đọc 50 dòng, 0,073 ms. DB hiện tại (tham khảo): 0,43 ms |
+| `pending`: đơn đang chờ xử lý | `SELECT * FROM orders WHERE status = 'PENDING' ORDER BY created_at LIMIT 50`, **không có** `idx_orders_created_at`, `idx_orders_status` (như thẻ: không index nào dùng được) | cùng câu đó, **thêm** partial index `ON orders (created_at) WHERE status = 'PENDING'` | trước: `Parallel Seq Scan` + `Sort`, 126 ms. Sau: `Index Scan` trên partial index (928 kB), đọc 50 dòng, 0,073 ms. Tham khảo, DB hiện tại: 0,43 ms |
 | `user-total`: tổng tiền đã mua của một user | `SELECT sum(total_amount) FROM orders WHERE user_id = :uid` (thẻ ghi `total`), index hiện có | cùng câu đó, `idx_orders_user_id_created_at` dựng lại thêm `INCLUDE (total_amount)` | user 1 (832 đơn). Trước: `Bitmap Heap Scan`, ghé 826 trang bảng, 2,04 ms. Sau: `Index Only Scan`, Heap Fetches 0, 9 trang, 0,235 ms. Index 77 → 95 MB |
+| `page-10000`: trang 10.000 của danh sách đơn | `ORDER BY created_at DESC, id DESC OFFSET 199980 LIMIT 20` | `WHERE (created_at, id) < (:lastCreatedAt, :lastId) ORDER BY created_at DESC, id DESC LIMIT 20` (như `GET /api/orders`) | trước: `Index Scan` đọc 200.001 dòng (3.851 trang), 68 ms. Sau: đọc 22 dòng (4 trang), 0,069 ms. Hai câu trả cùng 20 đơn. Tham khảo, với index `(created_at DESC, id DESC)` như thẻ: đọc đúng 20 dòng, 0,092 ms |
 
 - **`user-orders`, trạng thái "trước":** script bỏ index ghép **trong một transaction** rồi `ROLLBACK`, nên index trở lại nguyên vẹn, không phải dựng lại. Trong mấy giây đo, bảng bị khoá. Nếu một transaction khác đang dùng `orders`, script báo lỗi sau 5 giây (`lock_timeout`) thay vì treo.
 - **`user-orders`, chọn `:uid`:** mặc định là một user có 8–12 đơn. Với user nhiều đơn (user 1: 832 đơn), plan "trước" không phải `Seq Scan`: PostgreSQL đi theo `idx_orders_created_at` từ đơn mới nhất và lọc `user_id`, bỏ 54.904 dòng, 11,8 ms. Script khi đó báo "KHÁC THẺ" (mã thoát 1).
@@ -248,6 +250,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\before-after.ps1 -Case user-t
   - `:uid` mặc định là user nhiều đơn nhất. Mỗi đơn của một user nằm ở một trang khác nhau của bảng, nên `INCLUDE` bớt được một lần ghé bảng cho mỗi đơn. User 10 đơn thì trước và sau gần bằng nhau (13 so với 4 trang, đều khoảng 0,15 ms).
   - "Trước" với user nhiều đơn là `Bitmap Heap Scan` thay vì `Index Scan` như thẻ ghi. Cả hai cùng đọc index rồi ghé bảng, nên script chấp nhận cả hai.
   - Heap Fetches chỉ gần 0 khi VACUUM đã đánh dấu all-visible các trang có đơn. Đơn mới tạo sau lần VACUUM cuối thì vẫn phải ghé bảng; chạy `VACUUM orders` rồi đo lại.
+- **`page-10000`:**
+  - Cursor là `(created_at, id)` của đơn thứ 199.980, tức đơn cuối trang 9.999 (đúng `nextCursor` API trả ở trang đó). Script kiểm tra hai câu trả cùng 20 đơn, cùng thứ tự.
+  - Thẻ ghi index `(created_at, id)`, nhưng app không có index này: số "sau" là cách app chạy thật, với `idx_orders_created_at (created_at DESC)` có sẵn. PostgreSQL đi tới `created_at <= ?`, bỏ 1–2 dòng, rồi `Incremental Sort` xếp các đơn trùng `created_at` theo `id` (xem mục *Phân trang cursor*).
+  - Pha tham khảo tạo index `(created_at DESC, id DESC)` trong transaction: đọc đúng 20 dòng, không còn `Incremental Sort`, nhưng thời gian ngang bằng. Index đó chỉ đáng thêm khi nhiều đơn trùng `created_at`.
 - **`day-orders`:** hai câu chạy trên cùng DB, vì index `created_at` vẫn ở đó, chỉ là câu bọc `DATE()` không dùng được nó. Script kiểm tra hai câu trả cùng số đơn. Ngày tính theo TimeZone của phiên (UTC trong docker compose) cho cả hai câu; muốn tính theo giờ Việt Nam, xem mục bên dưới.
 
 ### Viết lại `DATE(created_at) = …` thành khoảng thời gian (`scripts/date-range-lab.sql`)
